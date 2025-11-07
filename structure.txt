@@ -1,0 +1,13 @@
+Penzer-CLI/
+  ├─ cli.py                 # takes user commands and starts sessions
+  ├─ agent/
+  │     ├─ __init__.py
+  │     └─ agent.py         # LLM reasoning, plans next steps
+  ├─ session/
+  │     ├─ __init__.py
+  │     └─ session.py       # tracks task state, memory, progress
+  ├─ tools/
+  │     ├─ __init__.py
+  │     ├─ tools.py         # unified tool manager (load, run, metadata)
+  │     └─ search.py        # discovers available local tools
+  └─ __init__.py            # package init
