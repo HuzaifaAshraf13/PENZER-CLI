@@ -1,2 +1,0 @@
-#!/bin/bash
-python /media/eric/sdb4/Penzer-CLI/cli.py "$@"
