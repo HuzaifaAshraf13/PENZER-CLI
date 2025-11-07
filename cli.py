@@ -16,19 +16,23 @@ def display_logo():
 def main():
     """Main function to run the CLI."""
     parser = argparse.ArgumentParser(description="Penzer-CLI: An intelligent assistant.")
-    parser.add_argument("task", type=str, nargs='?', default="No task provided", help="The task for Penzer to perform.")
-
     args = parser.parse_args()
 
     display_logo()
-    print(f"Executing task: {args.task}")
-    # Placeholder for session and agent logic
-    # from session.session import Session
-    # from agent.agent import Agent
-    #
-    # session = Session(args.task)
-    # agent = Agent()
-    # agent.run(session)
+    print("Welcome to Penzer-CLI! Type 'exit' or 'quit' to end the session.")
+
+    from session.session import Session
+    from agent.agent import Agent
+
+    session = Session(None) # Session will now manage continuous input
+    agent = Agent()
+
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() in ['exit', 'quit']:
+            print("Exiting Penzer-CLI. Goodbye!")
+            break
+        agent.run(session, user_input)
 
 if __name__ == "__main__":
     main()
