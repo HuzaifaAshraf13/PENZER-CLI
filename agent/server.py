@@ -4,7 +4,7 @@ from fastmcp import FastMCP
 # Initialize MCP server
 mcp = FastMCP(name="PenzerMCP")
 
-# Example tool: echoes back message
+# Example tool: echoes input
 @mcp.tool()
 def echo(message: str) -> str:
     return f"ECHO: {message}"
@@ -14,8 +14,8 @@ def echo(message: str) -> str:
 def add(a: int, b: int) -> int:
     return a + b
 
-# Function to start the server (blocking)
 def start_server():
     print("Starting MCP server on 127.0.0.1:8000 …")
+    # http transport exposes /mcp for clients
     mcp.run(transport="http", host="127.0.0.1", port=8000)
 
