@@ -4,6 +4,7 @@ Penzer-CLI/
   │     ├─ __init__.py
   │     └─ agent.py         # LLM reasoning, plans next steps
   │     └─ server.py         # FASTMCP server file 
+  |     └─ llm.py          # load the llm so agent.py can use
   ├─ session/
   │     ├─ __init__.py
   │     └─ session.py       # tracks task state, memory, progress

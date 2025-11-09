@@ -1,19 +1,11 @@
 # agent/agent.py
-import os
-from dotenv import load_dotenv
 from fastmcp import Client
-from google import genai
+from agent.llm import LLM
 
 class Agent:
     def __init__(self):
-        # Load Gemini API key
-        load_dotenv()
-        self.gemini_api_key = os.getenv("GEMINI_API_KEY")
-        if not self.gemini_api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment variables.")
-
         # Initialize Gemini LLM client
-        self.client = genai.Client(api_key=self.gemini_api_key)
+        self.llm = LLM()
 
         # Initialize MCP client (connects to local MCP server)
         self.mcp_client = Client("http://127.0.0.1:8000/mcp")
@@ -42,8 +34,5 @@ class Agent:
                 print("Agent: Please provide exactly two numbers for add.")
         else:
             # Fallback to LLM for free-form input
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[user_input]
-            )
-            print(f"Agent: {response.text}")
+            response = self.llm.generate_content(user_input)
+            print(f"Agent: {response}")
