@@ -18,4 +18,4 @@ def start_server():
     print("Starting MCP server on 127.0.0.1:8000 …")
     # http transport exposes /mcp for clients
     mcp.run(transport="http", host="127.0.0.1", port=8000)
-
+    
