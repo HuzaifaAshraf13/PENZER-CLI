@@ -34,3 +34,4 @@ Thumbs.db
 *.sqlite3
 *.db
 session/__pycache__/
+.env.env
