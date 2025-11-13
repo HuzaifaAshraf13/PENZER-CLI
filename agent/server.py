@@ -1,12 +1,10 @@
 # agent/server.py
 from fastmcp import FastMCP
 
-# Create MCP server (no HTTP, no localhost)
-mcp = FastMCP(
-    name="PenzerMCP"
-)
+# Create MCP server
+mcp = FastMCP(name="PenzerMCP")
 
-# Example tool
+# Example internal tools
 @mcp.tool()
 def echo(message: str) -> str:
     return f"ECHO: {message}"
@@ -15,10 +13,10 @@ def echo(message: str) -> str:
 def add(a: int, b: int) -> int:
     return a + b
 
+# Import Penzer tools so MCP can access them
+import tools.tools  # registers nmap_scan and run_msfconsole_command
 
 def start_server():
     print("Starting in-process MCP server…")
-    # No host, no port, no threads needed
-
     print("MCP running internally.")
-    return mcp              # return server instance for Agent
+    return mcp
