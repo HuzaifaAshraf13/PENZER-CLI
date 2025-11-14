@@ -1,11 +1,11 @@
 # agent/server.py
 
 from fastmcp import FastMCP
+import asyncio # <-- REQUIRED for running async methods in synchronous start_server
 
 # 1. Create the MCP server instance
 # This 'mcp' object is what the tools in tools/tools.py reference and register to.
-mcp = FastMCP(name="PenzerMCP", 
-              description="A security analysis server providing Nmap, Metasploit, GitHub Policy, and Exploit DB search capabilities.")
+mcp = FastMCP(name="PenzerMCP")
 
 # --- Example Internal Tools (These register directly here) ---
 @mcp.tool()
@@ -19,10 +19,7 @@ def add(a: int, b: int) -> int:
     return a + b
 
 # 2. Import the tools module
-# This single line is the mechanism that automatically registers all 
-# tools and resources (nmap_scan, run_msfconsole_command, get_security_policy, 
-# search_exploit_db) decorated with @mcp.tool() or @mcp.resource() from tools/tools.py 
-# into the 'mcp' object above.
+# This registers all external tools and resources with the 'mcp' object.
 try:
     import tools.tools
 except ImportError as e:
@@ -37,18 +34,36 @@ def start_server():
     """Initializes and returns the configured MCP server instance."""
     print("Starting in-process PenzerMCP server…")
     print(f"Server Name: {mcp.name}")
-    print(f"Registered Tools: {len(mcp.get_tools())}")
-    print(f"Registered Resources: {len(mcp.get_resources())}")
+    
+    # --- FIX: Use asyncio.run() to correctly execute the async methods ---
+    try:
+        # Get the actual list of tools by running the coroutine synchronously
+        tools_list = asyncio.run(mcp.get_tools())
+        resources_list = asyncio.run(mcp.get_resources())
+        
+        print(f"Registered Tools: {len(tools_list)}")
+        print(f"Registered Resources: {len(resources_list)}")
+    except Exception as e:
+        # This catch handles threading issues or other async loop conflicts gracefully
+        print(f"Warning: Could not get counts synchronously due to: {e}")
+        print("Registered Tools: UNKNOWN (Error in counting)")
+        print("Registered Resources: UNKNOWN (Error in counting)")
     
     # Return the configured MCP object
     return mcp
 
 # Optional: Add a main block to run the server directly
 if __name__ == "__main__":
+    # Ensure the main thread has an event loop set up for synchronous coroutine execution
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Only set a new loop if one isn't running
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     server = start_server()
     print("\nServer is running and listening for MCP clients...")
     print("Press Ctrl+C to stop.")
     
-    # The mcp.run() function starts the server listening on the default transport (usually stdio)
-    # This is required for a client (like an LLM sandbox) to connect.
+    # The mcp.run() function starts the server listening on the default transport
     server.run()

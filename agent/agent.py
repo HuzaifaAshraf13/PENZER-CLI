@@ -1,18 +1,13 @@
 # agent/agent.py
 
-# --- ADD THIS LINE ---
+import json
+import asyncio # REQUIRED to run async MCP methods in sync code
 from typing import List, Dict, Any, Optional
-# ---------------------
-
-from agent.llm import LLM
-from agent.server import mcp  # in-process MCP instance
 
 from agent.llm import LLM
 # Import the configured MCP instance from the server module
 from agent.server import mcp 
-import json
-from typing import Dict, Any, Optional
-
+# Assuming you have a file named agent/prompts.py
 from agent.prompts import SYSTEM_PROMPT
 
 
@@ -24,62 +19,92 @@ class Agent:
         self.mcp_client = mcp
         
         # Prepare the MCP context for the LLM
-        self.tool_schema = self._get_tool_schema()
-        self.resource_uris = self._get_resource_uris()
+        # Use asyncio.run() to execute the async methods in the sync __init__
+        self.tool_schema = asyncio.run(self._get_tool_schema_async())
+        self.resource_uris = asyncio.run(self._get_resource_uris_async())
+        
         self.formatted_system_prompt = SYSTEM_PROMPT.format(
             tool_schema=json.dumps(self.tool_schema, indent=2),
             resource_uris="\n".join(self.resource_uris)
         )
 
-    def _get_tool_schema(self) -> Dict[str, Any]:
+    # --- Async Helpers for Initialization (FIXED AWAIT SYNTAX) ---
+
+    # agent/agent.py (Corrected _get_tool_schema_async method)
+
+    # ... (Other methods above) ...
+
+    # agent/agent.py (The definitive fix for 'str' object error)
+
+    # agent/agent.py (Corrected _get_tool_schema_async method)
+
+    async def _get_tool_schema_async(self) -> Dict[str, Any]:
         """Collects the schema for all registered MCP tools."""
         schema = {}
-        for tool in self.mcp_client.get_tools():
-            # Get the tool signature/description, which the LLM uses to understand arguments
-            schema[tool.name] = {
-                "description": tool.description,
-                "parameters": tool.parameters
-            }
+        
+        # 1. Await the coroutine to get the list of tool NAMES (strings).
+        tool_names = await self.mcp_client.get_tools()
+        
+        # 2. Iterate over the NAMES (strings).
+        for tool_name in tool_names:
+            # 3. FIX: AWAIT the get_tool method to get the actual Tool object.
+            tool = await self.mcp_client.get_tool(tool_name) 
+            
+            if tool:
+                schema[tool_name] = {
+                    "description": tool.description,
+                    "parameters": tool.parameters 
+                }
+            # Note: The "else" block (omitted here for brevity) is still good practice.
+                 
         return schema
     
-    def _get_resource_uris(self) -> List[str]:
-        """Collects the URIs for all registered MCP resources."""
-        return [resource.uri for resource in self.mcp_client.get_resources()]
+    # ... (Other methods below) ...
+    
+    async def _get_resource_uris_async(self) -> List[str]:
+        """Collects the URIs for all registered MCP resources (must be awaited)."""
+        
+        # FIX: Await the coroutine to get the list of URI strings, then return it directly.
+        resources_list = await self.mcp_client.get_resources()
+        
+        # Since the list contains strings (the URIs), we just return it.
+        return resources_list
+
+    # --- Tool Execution (Requires synchronous wrapping for process_input) ---
+
+    def _run_mcp_operation_sync(self, coroutine):
+        """Helper to run an async operation synchronously, handling the event loop."""
+        try:
+            return asyncio.run(coroutine)
+        except Exception as e:
+            return f"ERROR executing MCP operation: {e}"
 
     def run_tool(self, tool_name: str, args: dict):
-        """Call an MCP tool by name with arguments."""
-        # Note: Asynchronous tools require a slight change here to be awaited,
-        # but for this simple sync structure, we rely on the MCP client handling execution.
+        """Call an MCP tool by name with arguments (uses sync wrapper)."""
         print(f"-> Calling MCP Tool: {tool_name} with args: {args}")
-        try:
-            return self.mcp_client.call_tool(tool_name, args)
-        except Exception as e:
-            return f"ERROR executing tool {tool_name}: {e}"
+        coroutine = self.mcp_client.call_tool(tool_name, args)
+        return self._run_mcp_operation_sync(coroutine)
         
     def get_resource_content(self, uri: str) -> Optional[str]:
-        """Accesses an MCP resource by URI."""
+        """Accesses an MCP resource by URI (uses sync wrapper)."""
         print(f"-> Accessing MCP Resource: {uri}")
-        try:
-            return self.mcp_client.get_resource(uri)
-        except Exception as e:
-            return f"ERROR accessing resource {uri}: {e}"
+        coroutine = self.mcp_client.get_resource(uri)
+        return self._run_mcp_operation_sync(coroutine)
+
+    # --- Main Processing Loop ---
 
     def process_input(self, user_input: str):
         """
         Lets the LLM decide whether to call a tool, access a resource, or respond.
         """
-        # The prompt is simplified here since the main logic is encoded in the SYSTEM_PROMPT.
         full_prompt = f"User input: {user_input}\n\nBased on the available tools and resources, what action should be taken? Provide ONLY the JSON dictionary."
         
-        # The LLM receives the full context via the system prompt
         decision = self.llm.generate_content(
             system_instruction=self.formatted_system_prompt,
             prompt=full_prompt
         )
 
-        # Try to parse LLM output
         try:
-            # We assume the LLM returns valid JSON based on the system prompt instruction
             decision_dict = json.loads(decision)
         except Exception:
             print(f"\n--- LLM Decision Parse Error ---\nRaw LLM Output:\n{decision}\n------------------------------")
@@ -93,41 +118,32 @@ class Agent:
         # --- Action Execution ---
         
         if tool_name:
-            # Check for resource URI first (e.g., 'git://security-policy')
+            # Check for resource URI first 
             if tool_name.startswith("resource://") or tool_name in self.resource_uris:
-                # The LLM chose to access a resource
                 result = self.get_resource_content(tool_name)
                 print(f"Agent (Resource {tool_name}):\n{result}")
-                
-                # OPTIONAL: Pass the resource content back to the LLM for summarization
-                # If you need the LLM to interpret the resource, you'd call generate_content again here.
-
             else:
-                # The LLM chose to call a functional tool (Nmap, Metasploit, Exploit DB Search)
                 result = self.run_tool(tool_name, args)
                 print(f"Agent (Tool {tool_name}): {result}")
                 
-                # OPTIONAL: Pass the tool result back to the LLM for summarization
-                # (Same as above, a second LLM call would be used for interpretation)
-                
         elif response:
-            # The LLM chose to respond directly
             print(f"Agent: {response}")
         else:
-            # Fallback if the JSON structure was unexpected
             print("Agent: Invalid decision structure from LLM.")
 
 
 if __name__ == "__main__":
-    # NOTE: You need to implement the LLM class (e.g., wrap Gemini API calls)
-    # The setup below is the correct way to run your agent locally.
-    
     print("Initializing Penzer Security Agent...")
     try:
+        # Check if an event loop is already running before trying to create a new one
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            
         agent = Agent()
         print(f"Agent initialized with {len(agent.tool_schema)} tools and {len(agent.resource_uris)} resources.")
         
-        # Start main interaction loop
         while True:
             query = input("\nUser: ")
             if query.lower() in ["quit", "exit"]:
