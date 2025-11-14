@@ -1,4 +1,7 @@
 # tools/ToolsPrompts.py
+
+# --- Existing Prompts ---
+
 NMAP_SCAN_PROMPT = """
 Run a controlled, authorized nmap scan against an allowed target.
 
@@ -117,4 +120,55 @@ Human-in-the-loop & approvals:
   - For high-risk commands (exploit/privilege modules), require an out-of-band approvals token or an elevated authorization scope; store the approver identity.
 
 NOTE: msfconsole execution is powerful. Ensure strict access controls, explicit authorization, and thorough logging. Use only on systems you are authorized to test.
+"""
+
+# --- New Data Source Prompts ---
+
+# For the GitHub Resource (git://security-policy)
+# This prompt instructs the LLM on how to interpret and use the content from the Resource.
+GITHUB_SECURITY_POLICY_RESOURCE_PROMPT = """
+Resource URI: resource://git://security-policy
+Content Type: Plain Text (Markdown)
+
+Purpose:
+  - Provides the current, authorized SECURITY.md content for internal policy reference.
+  - Gives the LLM contextual information about allowed security testing scope, reporting procedures, and responsible disclosure guidelines for the organization.
+
+Usage:
+  - **Reference this content directly** if the user asks about the organization's security policy, allowed vulnerability disclosure channels, or scope of authorized testing.
+  - **Do NOT** assume this document grants permission to run tests (use authorization tokens for tools).
+  - Summarize the relevant sections clearly in your response, quoting key text when necessary.
+
+Data Validation & Safety:
+  - The resource content is considered read-only and authoritative for policy.
+  - Do not attempt to modify or write to this resource.
+"""
+
+# For the Exploit DB Tool (search_exploit_db)
+# This prompt instructs the LLM on when and how to call the search tool.
+SEARCH_EXPLOIT_DB_TOOL_PROMPT = """
+Tool Name: search_exploit_db
+Function: Searches the Exploit Database for exploits matching a query and platform.
+
+Purpose:
+  - Find publicly known vulnerabilities (CVEs) and associated exploits.
+  - Use results to cross-reference Nmap findings (service versions) or target analysis.
+
+Inputs (required):
+  - query: string — The primary search term (e.g., "Apache Struts 2.3", "Wordpress", or a specific CVE ID like "CVE-2023-xxxx").
+  - platform: string (optional) — Filter by platform (e.g., "windows", "linux", "webapps", "hardware").
+
+Preconditions for Invocation:
+  - **Only call this tool** when the user or internal logic requires information about a *known* vulnerability or exploit potential.
+  - **DO NOT** call this tool if the intent is to run the exploit; only use it for *information gathering*.
+  - You must have a clear **target service or software version** to provide an effective query.
+
+Output & Post-processing:
+  - The tool returns a list of dictionaries (JSON) containing 'id', 'description', and 'cve'.
+  - Analyze the results, looking for exploits with a matching platform and high relevance to the current analysis.
+  - If results are found, cite the relevant **CVE ID** and **Description** in your advice, but **never** reproduce the exploit code itself.
+
+Example Call:
+  - To cross-reference an Nmap result showing 'Microsoft IIS 7.5':
+    <tool_name>search_exploit_db</tool_name> <arguments>{"query": "Microsoft IIS 7.5", "platform": "windows"}</arguments>
 """
