@@ -3,14 +3,16 @@ Penzer-CLI/
   ├─ agent/
   │     ├─ __init__.py
   │     └─ agent.py         # LLM reasoning, plans next steps
-  │     └─ server.py         # FASTMCP server file 
+  │     └─ server.py         # FASTMCP server file
+        └─ propmts.py       # agent propmts  
   |     └─ llm.py          # load the llm so agent.py can use
   ├─ session/
   │     ├─ __init__.py
   │     └─ session.py       # tracks task state, memory, progress
   ├─ tools/
   │     ├─ __init__.py
-  │     ├─ tools.py         # unified tool manager (load, run, metadata)
+  │     ├─ tools.py         # unified tool manager (load, run, data sources)
+        └─ ToolsPropmts.py   # tools and data sources propmts   
   │     └─ search.py        # discovers available local tools
   └─ __init__.py            # package init
 
