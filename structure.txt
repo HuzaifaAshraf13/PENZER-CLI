@@ -3,7 +3,8 @@ Penzer-CLI/
   ├─ agent/
   │     ├─ __init__.py
   │     └─ agent.py         # LLM reasoning, plans next steps
-  │     └─ server.py         # FASTMCP server file
+  │     └─ server.py         # MCP tool and datasouces registry 
+  │     └─ core.py           # FASTMCP startup 
         └─ propmts.py       # agent propmts  
   |     └─ llm.py          # load the llm so agent.py can use
   ├─ session/
