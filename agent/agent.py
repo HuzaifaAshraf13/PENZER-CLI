@@ -2,22 +2,21 @@
 
 import json
 import asyncio
-from typing import List, Dict, Any, Optional
-
+from typing import Dict, Any
 from agent.llm import LLM
-from agent.server import mcp
+from agent.server import mcp          # <-- USE THE MCP FROM SERVER ONLY
 from agent.prompts import SYSTEM_PROMPT
 
 
 class Agent:
     def __init__(self):
-        # 1. Initialize LLM client
+        # 1. Initialize LLM
         self.llm = LLM()
 
-        # 2. MCP instance
+        # 2. Use shared MCP instance
         self.mcp_client = mcp
 
-        # 3. Load tools + resources safely (non-crashing)
+        # 3. Load tools/resources safely
         try:
             self.tool_schema = asyncio.run(self._load_tool_schema())
             self.resource_uris = asyncio.run(self._load_resource_uris())
@@ -26,28 +25,24 @@ class Agent:
             self.tool_schema = {}
             self.resource_uris = []
 
-        # 4. Format System Prompt
+        # 4. Build system prompt
         self.formatted_system_prompt = SYSTEM_PROMPT.format(
             tool_schema=json.dumps(self.tool_schema, indent=2),
             resource_uris="\n".join(self.resource_uris)
         )
 
     # -----------------------------------------------------------
-    # SAFE TOOL + RESOURCE LOADERS
+    # SAFE LOADERS
     # -----------------------------------------------------------
-
     async def _load_tool_schema(self):
-        """Return MCP tool schema safely (dict name → object)."""
         return getattr(self.mcp_client, "tools", {})
 
     async def _load_resource_uris(self):
-        """Return MCP resource URIs."""
         return list(getattr(self.mcp_client, "resources", {}).keys())
 
     # -----------------------------------------------------------
-    # TOOL EXECUTION (Supports async + sync tools)
+    # TOOL EXECUTION
     # -----------------------------------------------------------
-
     def run_tool(self, tool_name: str, args: Dict):
         tool = self.mcp_client.tools.get(tool_name)
         if not tool:
@@ -55,19 +50,15 @@ class Agent:
 
         try:
             if asyncio.iscoroutinefunction(tool):
-                # Async tool → run it safely
                 return asyncio.run(tool(**args))
             else:
-                # Sync tool
                 return tool(**args)
-
         except Exception as e:
             return {"error": f"Tool execution failed: {e}"}
 
     # -----------------------------------------------------------
-    # MAIN LOOP DECISION PROCESSING
+    # MAIN DECISION HANDLER
     # -----------------------------------------------------------
-
     def process_input(self, user_input: str):
         full_prompt = (
             f"User input: {user_input}\n\n"
@@ -80,9 +71,7 @@ class Agent:
             prompt=full_prompt
         )
 
-        # -------------------------------------------------------
-        # Clean LLM JSON output
-        # -------------------------------------------------------
+        # Parse LLM JSON output
         try:
             decision_str = decision.strip()
 
@@ -98,20 +87,16 @@ class Agent:
             print("--------------------------------------")
             return
 
-        # -------------------------------------------------------
-        # Execute Tool / Resource / or Respond Normally
-        # -------------------------------------------------------
         tool_name = decision_dict.get("tool")
         args = decision_dict.get("args", {})
         response = decision_dict.get("response")
 
+        # Tool execution
         if tool_name:
-            # Resource
             if tool_name.startswith("resource://") or tool_name in self.resource_uris:
                 print(f"Agent (Resource {tool_name}): NOT IMPLEMENTED")
                 return
 
-            # Tool
             result = self.run_tool(tool_name, args)
 
             if isinstance(result, (dict, list)):
@@ -128,7 +113,6 @@ class Agent:
 # -----------------------------------------------------------
 # ENTRY POINT
 # -----------------------------------------------------------
-
 if __name__ == "__main__":
     print("Initializing Penzer Security Agent...")
 
