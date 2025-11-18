@@ -1,124 +1,152 @@
-# tools/tools.py
-
 import os
-import httpx
-import subprocess
 import shlex
 import tempfile
+import subprocess
 from typing import List, Optional, Dict
+
+import httpx
 from agent.server import mcp
-# Ensure these prompt files are available in tools/ToolsPrompts.py
+
+# Prompts
 from tools.ToolsPrompts import (
-    NMAP_SCAN_PROMPT, 
+    NMAP_SCAN_PROMPT,
     RUN_MSFCONSOLE_COMMAND_PROMPT,
-    GITHUB_SECURITY_POLICY_RESOURCE_PROMPT,
+    SEARCH_GITHUB_TOOL_PROMPT,
     SEARCH_EXPLOIT_DB_TOOL_PROMPT
 )
 
-# --- Configuration ---
-# NOTE: Set this environment variable before running the server!
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+# Global config
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+EXPLOIT_DB_API = "https://www.exploit-db.com/api/search"
 
-# ----------------------------------------
-# 1. Command-Line Execution Tools (Blocking)
-# ----------------------------------------
 
+# ======================================================
+# 1) NMAP SCAN TOOL
+# ======================================================
 @mcp.tool()
-def nmap_scan(target: str, args: Optional[str] = "-sV -Pn", authorization: Optional[str] = None) -> str:
-    """Executes an Nmap scan against a target with specified arguments."""
-    _ = NMAP_SCAN_PROMPT  # reference prompt for LLM reasoning
+def nmap_scan(target: str, args: Optional[str] = "-sV -Pn") -> Dict:
+    """Execute an Nmap scan with safe, structured output."""
+    _ = NMAP_SCAN_PROMPT
+
     try:
-        # Shlex.split safely handles command line arguments string
         cmd = ["nmap"] + shlex.split(args) + [target]
-        
-        # subprocess.run executes the command
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
-        # Return output, preferring stdout, then stderr, or an empty string
-        return proc.stdout or proc.stderr or ""
-    except Exception as e:
-        return f"ERROR: Failed to run Nmap command: {e}"
 
+        return {
+            "status": "success",
+            "command": " ".join(cmd),
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": f"Nmap execution failed: {e}"}
+
+
+# ======================================================
+# 2) MSFCONSOLE NON‑INTERACTIVE TOOL
+# ======================================================
 @mcp.tool()
-def run_msfconsole_command(commands: List[str], authorization: Optional[str] = None) -> str:
-    """Executes a list of commands sequentially within the msfconsole shell."""
+def run_msfconsole_command(commands: List[str]) -> Dict:
+    """Runs msfconsole in scripted mode using a temp file."""
     _ = RUN_MSFCONSOLE_COMMAND_PROMPT
     cmdfile = None
+
     try:
-        # 1. Write commands to a temporary file
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             for c in commands:
-                tf.write(c.rstrip("\r\n") + "\n")
-            cmdfile = tf.name # Store the path to the temporary file
-        
-        # 2. Run msfconsole using the temporary file as a resource script (-r)
-        proc = subprocess.run(["msfconsole", "-q", "-r", cmdfile], capture_output=True, text=True, timeout=300)
-        
-        return proc.stdout or proc.stderr or ""
+                tf.write(c.rstrip("\n") + "\n")
+            cmdfile = tf.name
+
+        proc = subprocess.run(
+            ["msfconsole", "-q", "-r", cmdfile],
+            capture_output=True, text=True, timeout=300
+        )
+
+        return {
+            "status": "success",
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "commands_run": commands,
+        }
+
     except Exception as e:
-        return f"ERROR: Failed to run msfconsole: {e}"
+        return {"status": "error", "message": f"MSFconsole failed: {e}"}
+
     finally:
-        # 3. Clean up: Delete the temporary command file
         if cmdfile and os.path.exists(cmdfile):
-            try: 
+            try:
                 os.remove(cmdfile)
-            except Exception as cleanup_e: 
-                print(f"Warning: Failed to clean up temp file {cmdfile}: {cleanup_e}")
+            except:
+                pass
 
-# ----------------------------------------
-# 2. Data Sources (Asynchronous)
-# ----------------------------------------
 
-@mcp.resource("git://security-policy")
-async def get_security_policy() -> str:
-    """
-    Exposes the raw content of the SECURITY.md file from a specific GitHub repository 
-    as a read-only context resource.
-    """
-    _ = GITHUB_SECURITY_POLICY_RESOURCE_PROMPT # reference prompt
+# ======================================================
+# 3) GITHUB SEARCH TOOL
+# ======================================================
+@mcp.tool()
+async def search_github_repository(owner: str, repo: str, query: str) -> List[Dict]:
+    """Search for code within a specific GitHub repository."""
+    _ = SEARCH_GITHUB_TOOL_PROMPT
+
     if not GITHUB_TOKEN:
-        return "Error: GITHUB_TOKEN environment variable is not set."
+        return [{"error": "GITHUB_TOKEN environment variable is not set."}]
 
-    # >>> REPLACE with your actual GitHub repository details <<<
-    url = "https://raw.githubusercontent.com/owner/repo/main/SECURITY.md"
-    
+    url = f"https://api.github.com/search/code?q={query}+in:file+repo:{owner}/{repo}"
     headers = {
-        "Authorization": f"token {GITHUB_TOKEN}", 
-        "Accept": "application/vnd.github.v3.raw"
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
     }
 
     try:
-        # Use httpx.AsyncClient for non-blocking HTTP requests
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status() # Raise exception for bad status codes
-            return response.text
-    except httpx.HTTPStatusError as e:
-        return f"Error fetching GitHub resource: HTTP {e.response.status_code}. File/repo or token issue."
-    except Exception as e:
-        return f"An unexpected error occurred while fetching GitHub data: {e}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
 
+        return [
+            {"path": i.get("path"), "url": i.get("html_url"), "score": i.get("score")}
+            for i in data.get("items", [])
+        ]
+
+    except httpx.HTTPStatusError as e:
+        return [{"error": f"HTTP Error {e.response.status_code} fetching GitHub data."}]
+    except Exception as e:
+        return [{"error": f"Unexpected error: {e}"}]
+
+
+# ======================================================
+# 4) EXPLOIT-DB SEARCH TOOL
+# ======================================================
 @mcp.tool()
 async def search_exploit_db(query: str, platform: str = "") -> List[Dict]:
-    """
-    Searches a conceptual Exploit Database API for exploits matching a query.
-    This is an action (Tool) that the LLM can execute with parameters.
-    """
-    _ = SEARCH_EXPLOIT_DB_TOOL_PROMPT # reference prompt
-    
-    # --- MOCKUP LOGIC START ---
-    # This section needs to be replaced with actual API calls to a public Exploit DB API 
-    # or an internal service that wraps SearchSploit.
-    if "wordpress" in query.lower():
-        results = [
-            {"id": 50000, "description": "WordPress Plugin X - SQL Injection", "cve": "CVE-2023-1234"},
+    """Query the official Exploit-DB JSON search API."""
+    _ = SEARCH_EXPLOIT_DB_TOOL_PROMPT
+    params = {"query": query}
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(EXPLOIT_DB_API, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        exploits = data.get("data", [])
+        if platform:
+            pl = platform.lower()
+            exploits = [e for e in exploits if pl in (e.get("platform") or "").lower()]
+
+        return [
+            {
+                "id": e.get("id"),
+                "description": e.get("description") or e.get("title"),
+                "cve": e.get("code") or e.get("cve") or "N/A",
+                "platform": e.get("platform", "unknown"),
+                "author": e.get("author", "unknown"),
+            }
+            for e in exploits
         ]
-    elif "windows" in platform.lower():
-        results = [
-            {"id": 49000, "description": "Windows LPE - Service Handle Abuse", "cve": "CVE-2022-9999"},
-        ]
-    else:
-        results = [{"id": 0, "description": f"No exploits found matching '{query}'.", "cve": "N/A"}]
-        
-    return results
-    # --- MOCKUP LOGIC END ---
+
+    except Exception as e:
+        return [{"error": f"Exploit-DB query failed: {e}"}]
