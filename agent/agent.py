@@ -1,149 +1,184 @@
-# agent/agent.py (Cleaned and Refactored)
-
+# agent/agent.py
 import json
 import asyncio
+import inspect
 from typing import Dict, Any, List, Optional
 
-# Import mcp from the core module (assuming fix applied in agent/server.py)
 from agent.server import mcp
 from agent.llm import LLM
 from agent.prompts import SYSTEM_PROMPT
 
+from tools.ToolsPrompts import (
+    NMAP_SCAN_PROMPT,
+    RUN_MSFCONSOLE_COMMAND_PROMPT,
+    SEARCH_GITHUB_TOOL_PROMPT,
+    SEARCH_EXPLOIT_DB_TOOL_PROMPT,
+)
+
 
 class Agent:
     def __init__(self):
-        # 1. Initialize LLM instance
         self.llm = LLM()
-
-        # 2. Use shared MCP instance
         self.mcp_client = mcp
 
-        # 3. Load tool schema and resources synchronously (FIXED from previous versions)
-        try:
-            self.tool_schema: Dict[str, Any] = self._load_tool_schema()
-            self.resource_uris: List[str] = self._load_resource_uris()
-        except Exception as e:
-            print(f"FATAL SETUP ERROR during MCP configuration: {e}")
-            self.tool_schema = {}
-            self.resource_uris = []
+        # Load schema & resources (FastMCP may expose async get_tools)
+        self.tool_schema: Dict[str, Any] = asyncio.run(self._load_tool_schema())
+        self.resource_uris: List[str] = self._load_resource_uris()
 
-        # 4. Build system prompt using loaded info
+        # Build system prompt
         self.formatted_system_prompt: str = self._build_system_prompt()
 
     # -----------------------------------------------------------
-    # SETUP & LOADERS
+    # LOADERS
     # -----------------------------------------------------------
-
-    def _load_tool_schema(self) -> Dict[str, Any]:
-        """Loads registered tools from the shared MCP instance."""
-        return getattr(self.mcp_client, "tools", {})
+    async def _load_tool_schema(self) -> Dict[str, Any]:
+        """FastMCP exposes get_tools(), not .tools on some versions."""
+        try:
+            if hasattr(self.mcp_client, "get_tools"):
+                return await self.mcp_client.get_tools()
+            return getattr(self.mcp_client, "tools", {})
+        except Exception as e:
+            print("Error loading tool schema:", e)
+            return {}
 
     def _load_resource_uris(self) -> List[str]:
-        """Loads registered resource URIs from the shared MCP instance."""
         return list(getattr(self.mcp_client, "resources", {}).keys())
-    
+
+    def _serialize_tools_for_prompt(self, tools_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Convert FastMCP tool objects into a JSON-serializable dict that contains
+        only tool names and parameter lists (no function objects).
+        """
+        serial = {}
+        for name, tool_obj in tools_dict.items():
+            # try to find the underlying callable
+            fn = getattr(tool_obj, "fn", tool_obj)
+            # try common wrappers
+            if hasattr(fn, "__wrapped__"):
+                fn = fn.__wrapped__
+            params = []
+            try:
+                sig = inspect.signature(fn)
+                params = [p for p in sig.parameters.keys()]
+            except Exception:
+                # fallback: look for annotations if available
+                ann = getattr(fn, "__annotations__", {}) or {}
+                params = list(ann.keys())
+            serial[name] = {"args": params}
+        return serial
+
     def _build_system_prompt(self) -> str:
-        """Formats the system prompt with the current tool schema and resources."""
-        return SYSTEM_PROMPT.format(
-            tool_schema=json.dumps(self.tool_schema, indent=2),
-            resource_uris="\n".join(self.resource_uris)
+        """SYSTEM_PROMPT + merged tool prompts + registered tools + resources."""
+        combined_tool_guide = "\n\n".join(
+            [
+                NMAP_SCAN_PROMPT,
+                RUN_MSFCONSOLE_COMMAND_PROMPT,
+                SEARCH_GITHUB_TOOL_PROMPT,
+                SEARCH_EXPLOIT_DB_TOOL_PROMPT,
+            ]
         )
 
-    # -----------------------------------------------------------
-    # TOOL EXECUTION
-    # -----------------------------------------------------------
+        # create a safe, JSON-serializable summary of registered tools
+        tools_info = self._serialize_tools_for_prompt(self.tool_schema or {})
 
+        merged = f"""
+{SYSTEM_PROMPT}
+
+# === TOOL INSTRUCTIONS ===
+{combined_tool_guide}
+
+# === REGISTERED TOOLS (names + args) ===
+{json.dumps(tools_info, indent=2)}
+
+# === RESOURCES ===
+{chr(10).join(self.resource_uris)}
+"""
+        return merged.strip()
+
+    # -----------------------------------------------------------
+    # TOOL EXECUTION (supports FastMCP.get_tools())
+    # -----------------------------------------------------------
     def run_tool(self, tool_name: str, args: Dict) -> Dict:
-        """Executes a tool, handling both sync and async functions."""
-        tool = self.mcp_client.tools.get(tool_name)
+        """Fetch tools safely from FastMCP and execute the requested tool."""
+        try:
+            if hasattr(self.mcp_client, "get_tools"):
+                tools_dict = asyncio.run(self.mcp_client.get_tools())
+            else:
+                tools_dict = getattr(self.mcp_client, "tools", {})
+        except Exception as e:
+            return {"error": f"Cannot fetch MCP tools: {e}"}
+
+        tool = tools_dict.get(tool_name)
         if not tool:
-            return {"error": f"Tool '{tool_name}' not found."}
+            return {"error": f"Unknown tool: {tool_name}"}
+
+        # If the tool object wraps a function, try getting the callable
+        callable_obj = getattr(tool, "fn", tool)
 
         try:
-            if asyncio.iscoroutinefunction(tool):
-                # Execute async tool synchronously (requires an event loop running)
-                return asyncio.run(tool(**args)) 
-            else:
-                return tool(**args)
+            if asyncio.iscoroutinefunction(callable_obj):
+                return asyncio.run(callable_obj(**args))
+            return callable_obj(**args)
+        except TypeError as e:
+            # Likely wrong arg shape; return useful message for debugging
+            return {"error": f"Tool invocation failed (TypeError): {e}", "provided_args": args}
         except Exception as e:
             return {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
 
     # -----------------------------------------------------------
-    # DECISION LOGIC
+    # LLM DECISION PARSER
     # -----------------------------------------------------------
-
-    def _parse_llm_decision(self, decision_raw: str) -> Optional[Dict]:
-        """Parses the raw JSON output from the LLM, cleaning up surrounding markdown."""
+    def _parse_llm_decision(self, raw: str) -> Optional[Dict]:
         try:
-            decision_str = decision_raw.strip()
-
-            # Clean markdown code block wraps (```json ... ```)
-            if decision_str.startswith("```"):
-                lines = decision_str.split("\n")
-                # Remove first line (```[json]) and last line (```)
-                decision_str = "\n".join(lines[1:-1]).strip()
-
-            return json.loads(decision_str)
-
-        except Exception as e:
-            print(f"\n--- LLM Decision Parse Error ({e}) ---")
-            print("Raw Output:\n", decision_raw)
-            print("--------------------------------------")
+            txt = raw.strip()
+            if txt.startswith("```"):
+                lines = txt.split("\n")
+                txt = "\n".join(lines[1:-1]).strip()
+            return json.loads(txt)
+        except Exception:
+            print("\nLLM decision parse failed. Raw output:\n", raw)
             return None
 
+    # -----------------------------------------------------------
+    # MAIN INPUT PROCESSOR
+    # -----------------------------------------------------------
     def process_input(self, user_input: str):
-        """Generates a decision from the LLM and executes the resulting tool/action."""
-        
-        # 1. Construct the prompt
         full_prompt = (
             f"User input: {user_input}\n\n"
-            f"Based on the available tools and resources, "
-            f"what action should be taken? Provide ONLY the JSON dictionary."
+            f"Think and decide the correct action strictly using JSON."
         )
 
-        # 2. Get LLM decision
         decision_raw = self.llm.generate_content(
-            system_instruction=self.formatted_system_prompt,
-            prompt=full_prompt
+            system_instruction=self.formatted_system_prompt, prompt=full_prompt
         )
 
-        # 3. Parse and validate decision
-        decision_dict = self._parse_llm_decision(decision_raw)
-        if not decision_dict:
+        decision = self._parse_llm_decision(decision_raw)
+        if not decision:
+            print("Agent: Could not parse tool decision.")
             return
 
-        tool_name = decision_dict.get("tool")
-        args = decision_dict.get("args", {})
-        response = decision_dict.get("response")
+        tool_name = decision.get("tool")
+        args = decision.get("args", {}) or {}
+        response = decision.get("response")
 
-        # 4. Handle tool/resource execution or direct response
         if tool_name:
-            if tool_name.startswith("resource://") or tool_name in self.resource_uris:
-                # Placeholder for resource interaction logic
-                print(f"Agent (Resource {tool_name}): NOT IMPLEMENTED")
-                return
-
-            # Execute tool
             result = self.run_tool(tool_name, args)
+            print(f"\nAgent (Tool: {tool_name}):\n{json.dumps(result, indent=2)}")
+            return
 
-            # Output result
-            output = json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result)
-            print(f"Agent (Tool {tool_name}):\n{output}")
+        if response:
+            print(f"\nAgent: {response}")
+            return
 
-        elif response:
-            print(f"Agent: {response}")
-
-        else:
-            print("Agent: Invalid decision structure or missing 'tool'/'response' field.")
+        print("Agent: Invalid decision structure.")
 
 
 # -----------------------------------------------------------
 # ENTRY POINT
 # -----------------------------------------------------------
 if __name__ == "__main__":
-    print("Initializing Penzer Security Agent...")
+    print("Starting Penzer Security Agent...")
 
-    # Set up the event loop needed for asyncio.run() calls inside Agent.run_tool
     try:
         try:
             asyncio.get_running_loop()
@@ -151,18 +186,17 @@ if __name__ == "__main__":
             asyncio.set_event_loop(asyncio.new_event_loop())
 
         agent = Agent()
-        
-        # This print statement assumes all fixes (including agent/core.py) are applied
-        print(f"Agent initialized with {len(agent.tool_schema)} tools and {len(agent.resource_uris)} resources.") 
+        print(
+            f"Agent ready with {len(agent.tool_schema)} tools "
+            f"and {len(agent.resource_uris)} resources."
+        )
 
         while True:
-            query = input("\nUser: ")
-            if query.lower() in ["quit", "exit"]:
-                print("Agent shutting down.")
+            q = input("\nUser: ")
+            if q.lower() in ("quit", "exit"):
+                print("Shutting down.")
                 break
-            agent.process_input(query)
+            agent.process_input(q)
 
-    except NameError:
-        print("\nFATAL ERROR: The 'LLM' class is missing. Ensure it is defined.")
     except Exception as e:
-        print(f"\nFATAL ERROR during agent initialization: {e}")
+        print("Fatal startup error:", e)

@@ -13,7 +13,7 @@ Penzer-CLI/
   ├─ tools/
   │     ├─ __init__.py
   │     ├─ tools.py         # unified tool manager (load, run, data sources)
-        └─ ToolsPropmts.py   # tools and data sources propmts   
+        └─ ToolsPropmts.py   # tools and data sources propmts propmts are for for agent.py to use 
   │     └─ search.py        # discovers available local tools
   └─ __init__.py            # package init
 
