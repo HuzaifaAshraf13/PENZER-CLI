@@ -1,19 +1,14 @@
-# tools/tools.py (FIXED: Importing mcp from agent.core)
+# tools/tools.py
 
 import os
 import json
 import datetime
+import subprocess
+import requests
+from bs4 import BeautifulSoup
 
-# ======================================================================
-#  CRITICAL FIX: Import mcp from the dedicated core module
-# ======================================================================
 from agent.core import mcp
-# ======================================================================
 
-# ======================================================================
-#  PROMPT IMPORT
-# ======================================================================
-# Importing the prompt constants from the separate file
 from tools.ToolsPrompts import (
     NMAP_SCAN_PROMPT,
     RUN_MSFCONSOLE_COMMAND_PROMPT,
@@ -21,128 +16,152 @@ from tools.ToolsPrompts import (
     SEARCH_EXPLOIT_DB_TOOL_PROMPT
 )
 
+
 # ======================================================================
-#  NMAP TOOL — placeholder (NO external execution)
+#  NMAP — Real terminal execution
 # ======================================================================
-@mcp.tool()
-def nmap_scan(target: str, args: str = "-sV -Pn", authorization: str = "", requester_id: str = "", reason: str = "") -> dict:
-    """Mock Nmap scan (no real nmap execution)."""
+@mcp.tool(prompt=NMAP_SCAN_PROMPT)
+def nmap_scan(target: str, args: str = "-sV -Pn") -> dict:
+    cmd = ["nmap"] + args.split() + [target]
+
+    start = datetime.datetime.utcnow().isoformat()
+
+    try:
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "target": target,
+            "args": args
+        }
+
+    end = datetime.datetime.utcnow().isoformat()
+
     return {
-        "status": "mock",
-        "reason": "Nmap execution disabled. Returning placeholder.",
+        "status": "ok",
         "target": target,
         "args": args,
-        "started_at": datetime.datetime.utcnow().isoformat(),
-        "finished_at": datetime.datetime.utcnow().isoformat(),
-        "raw_output": "<mock output>",
-        "summary": {
-            "open_ports": [22, 80],
-            "services": ["ssh", "http"]
-        }
+        "started_at": start,
+        "finished_at": end,
+        "raw_output": output,
     }
 
+
+
+
 # ======================================================================
-#  MSFCONSOLE TOOL — placeholder
+#  METASPLOIT — Real msfconsole script execution
 # ======================================================================
-@mcp.tool()
-def run_msfconsole(commands: list, authorization: str = "", target_list: list = None,
-                   requester_id: str = "", reason: str = "") -> dict:
-    """Mock MSF execution."""
+@mcp.tool(prompt=RUN_MSFCONSOLE_COMMAND_PROMPT)
+def run_msfconsole(commands: list) -> dict:
+    """
+    Executes commands like:
+      ['use auxiliary/scanner/ssh/ssh_version', 'set RHOSTS 10.0.0.0/24', 'run']
+    """
+
+    script = "\n".join(commands) + "\nexit\n"
+
+    temp_path = "/tmp/pz_msf.rc"
+    with open(temp_path, "w") as f:
+        f.write(script)
+
+    try:
+        start = datetime.datetime.utcnow().isoformat()
+        output = subprocess.check_output(
+            ["msfconsole", "-r", temp_path],
+            stderr=subprocess.STDOUT
+        ).decode()
+        end = datetime.datetime.utcnow().isoformat()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
     return {
-        "status": "mock",
+        "status": "ok",
         "commands_run": commands,
-        "per_command": [
-            {"command": cmd, "status": "mock", "output_snippet": "<mock output>"}
-            for cmd in commands
-        ],
-        "started_at": datetime.datetime.utcnow().isoformat(),
-        "finished_at": datetime.datetime.utcnow().isoformat(),
+        "started_at": start,
+        "finished_at": end,
+        "raw_output": output[:15000]  # truncated
     }
 
-# ======================================================================
-#  SIMPLE LOCAL SEARCH UTIL
-# ======================================================================
-def search_in_files(base_dir: str, query: str):
-    """Search inside local text/code files."""
-    results = []
 
-    if not os.path.isdir(base_dir):
-        return results
 
-    for root, dirs, files in os.walk(base_dir):
-        for file in files:
-            filepath = os.path.join(root, file)
-
-            # only check text-like files
-            try:
-                with open(filepath, "r", errors="ignore") as f:
-                    text = f.read()
-
-                if query.lower() in text.lower():
-                    results.append({
-                        "path": filepath.replace(base_dir + "/", ""),
-                        "score": 1.0,
-                        "snippet": text[:200]
-                    })
-            except:
-                continue
-
-    return results
 
 # ======================================================================
-#  GITHUB SEARCH TOOL (LOCAL DIRECTORY VERSION)
+#  GITHUB SEARCH — Real Online GitHub API Search
 # ======================================================================
-@mcp.tool()
+@mcp.tool(prompt=SEARCH_GITHUB_TOOL_PROMPT)
 def search_github_repository(owner: str, repo: str, query: str) -> list:
-    """
-    Searches a LOCAL repo folder:
-        ./data/github/<owner>/<repo>/
-    """
-    base = f"data/github/{owner}/{repo}"
+    url = f"https://api.github.com/search/code?q={query}+repo:{owner}/{repo}"
 
-    results = search_in_files(base, query)
+    headers = {"Accept": "application/vnd.github.v3+json"}
 
-    return [
-        {
-            "path": r["path"],
-            "url": f"https://github.com/{owner}/{repo}/blob/main/{r['path']}",
-            "score": r["score"],
-            "snippet": r["snippet"],
-        }
-        for r in results
-    ]
+    if "GITHUB_TOKEN" in os.environ:
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
 
-# ======================================================================
-#  EXPLOIT-DB SEARCH TOOL (LOCAL VERSION)
-# ======================================================================
-@mcp.tool()
-def search_exploit_db(query: str, platform: str = "") -> list:
-    """
-    Searches a LOCAL copy of exploit-db folder:
-        ./data/exploit-db/
-    Each exploit stored as:
-        <id>.txt   or   <id>.json
-    """
-    base = "data/exploit-db"
+    r = requests.get(url, headers=headers)
 
-    raw = search_in_files(base, query)
+    if r.status_code != 200:
+        return [{"error": "GitHub API error", "status_code": r.status_code}]
+
+    data = r.json().get("items", [])
 
     final = []
-    for r in raw:
-        exploit_id = os.path.splitext(os.path.basename(r["path"]))[0]
+    for item in data:
         final.append({
-            "id": exploit_id,
-            "description": f"Match found in {r['path']}",
-            "cve": "Unknown",
-            "platform": platform or "unknown",
-            "author": "Local-DB",
-            "snippet": r["snippet"],
+            "path": item["path"],
+            "url": item["html_url"],
+            "score": item.get("score", 1.0)
         })
 
     return final
 
+
+
+
 # ======================================================================
-#  DEBUG TOOL — list what is registered
+#  EXPLOIT-DB SEARCH — Scrape Live Website (REAL)
+# ======================================================================
+@mcp.tool(prompt=SEARCH_EXPLOIT_DB_TOOL_PROMPT)
+def search_exploit_db(query: str, platform: str = "") -> list:
+
+    url = f"https://www.exploit-db.com/search?text={query}"
+
+    r = requests.get(url, headers={"User-Agent": "Mozilla"})
+
+    if r.status_code != 200:
+        return [{"error": "Exploit-DB website unreachable"}]
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    rows = soup.select("table tbody tr")
+
+    output = []
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 7:
+            continue
+
+        exploit_id = cols[0].text.strip()
+        description = cols[2].text.strip()
+        cve = cols[3].text.strip() or "None"
+        author = cols[6].text.strip()
+
+        output.append({
+            "id": exploit_id,
+            "description": description,
+            "cve": cve,
+            "platform": platform or "unknown",
+            "author": author
+        })
+
+    return output
+
+
+
+
+# ======================================================================
+#  DEBUG TOOL
 # ======================================================================
 @mcp.tool()
 def list_registered_tools() -> list:

@@ -1,150 +1,115 @@
-#ToolsPropmts.py
+# ToolsPrompts.py
+# Unified, strict, tool‑specific instruction set for Penzer MCP tools.
+# These prompts teach the LLM EXACTLY how each tool should be triggered.
 
-# --- Existing Prompts with Example Outputs ---
-
+# ------------------------------------------------------------
+# NMAP — Network Scanning
+# ------------------------------------------------------------
 NMAP_SCAN_PROMPT = """
-Run a controlled, authorized nmap scan against an allowed target.
-
+Tool: nmap_scan
 Purpose:
-  - Perform discovery/inspection only for systems explicitly authorized for testing.
-  - Return parsed/stdout results for diagnostic use (truncated if large).
+  Perform host discovery, port scanning, or service enumeration on a user-specified target.
+  Any user request involving "scan", "ping sweep", "discover devices", "enumerate ports",
+  or "check services" should map directly to this tool.
 
-Inputs:
-  - target: string — IP address or hostname. MUST be present in the server allowlist.
-  - args: string (optional) — additional nmap CLI args. Default: "-sV -Pn". Only allow a safe, whitelisted subset.
-  - authorization: string — token/proof of permission.
-  - requester_id: string — user or process identifier.
-  - reason: string — justification for the scan.
+Routing Rules:
+  - Always call nmap_scan when user intent is scanning or discovery.
+  - Use the exact target string the user provides, even if it's a subnet.
+  - Accept optional 'args' only if the user explicitly mentions flags.
+  - Never fabricate flags. If none given, leave args empty.
+  - Do not apply allowlist, authorization, or validation logic yourself — MCP handles that.
 
-Preconditions & validation:
-  - Reject if authorization invalid, expired, or missing scope.
-  - Validate target against allowlist.
-  - Validate args against whitelist; deny dangerous flags.
+Arguments:
+  - target: string (required)
+  - args: string (optional; default empty)
 
-Execution environment:
-  - Run in sandboxed environment; no network access except to validated target.
-  - Timeout: 5 minutes max.
-
-Output & post-processing:
-  - Structured JSON with stdout, stderr, summary of open ports and services.
-
-Example Output:
-{
-  "status": "success",
-  "reason": "",
-  "target": "10.0.0.1",
-  "args": "-sV -Pn",
-  "started_at": "2025-11-18T12:00:00Z",
-  "finished_at": "2025-11-18T12:01:00Z",
-  "raw_output_truncated": false,
-  "raw_output": "<nmap stdout here>",
-  "summary": {
-      "open_ports": [22, 80],
-      "services": ["ssh", "http"]
-  }
-}
+Output Expectation:
+  - The agent only returns the tool call JSON; the tool returns actual scan output.
 """
 
+
+# ------------------------------------------------------------
+# METASPLOIT — Non-interactive Command Execution
+# ------------------------------------------------------------
 RUN_MSFCONSOLE_COMMAND_PROMPT = """
-Execute a scripted, non-interactive msfconsole session in a tightly controlled, audited environment.
-
+Tool: run_msfconsole
 Purpose:
-  - Automate msfconsole tasks explicitly authorized by policy.
+  Execute a sequence of Metasploit commands in non-interactive, scripted form.
+  Use this tool for any user request asking to:
+    - run Metasploit modules
+    - automate auxiliary scanners
+    - execute exploit modules in a scripted workflow
+    - check vulnerabilities with Metasploit
+    - fingerprint services using MSF
 
-Inputs:
-  - commands: list[string] — ordered commands to run.
-  - authorization: string — token/proof of permission.
-  - target_list: list[string] — explicit authorized targets.
-  - requester_id: string — identity for audit logs.
-  - reason: string — justification.
+Routing Rules:
+  - Only call when the user explicitly asks for Metasploit/MSF-related actions.
+  - Convert the user request into a list of msfconsole commands EXACTLY as stated.
+  - Do not guess module names or create missing parameters.
+  - The caller provides required target(s) if needed; do not invent.
 
-Output:
-  - Structured JSON per command, overall status, start/stop timestamps.
+Arguments:
+  - commands: list[string] (required)
+  - authorization: string (optional; leave empty unless user provides)
+  - target_list: list[string] (optional; only populate if explicitly given)
+  - requester_id: string (optional; leave empty unless user gives)
+  - reason: string (optional; user intent in simple words)
 
-Example Output:
-{
-  "status": "success",
-  "reason": "",
-  "commands_run": ["use auxiliary/scanner/ssh/ssh_version", "set RHOSTS 10.0.0.1", "run"],
-  "per_command": [
-      {"command": "use auxiliary/scanner/ssh/ssh_version", "status": "success", "output_truncated": false, "output_snippet": "<output>"},
-      {"command": "set RHOSTS 10.0.0.1", "status": "success", "output_truncated": false, "output_snippet": "<output>"},
-      {"command": "run", "status": "success", "output_truncated": false, "output_snippet": "<output>"}
-  ],
-  "started_at": "2025-11-18T12:00:00Z",
-  "finished_at": "2025-11-18T12:05:00Z"
-}
+Output Expectation:
+  - Tool will return structured per-command execution results.
 """
 
+
+# ------------------------------------------------------------
+# GITHUB SEARCH — Repository Code Search
+# ------------------------------------------------------------
 SEARCH_GITHUB_TOOL_PROMPT = """
-Tool Name: search_github_repository
-Function: Searches for code within a specific GitHub repository.
-
+Tool: search_github_repository
 Purpose:
-  - Find files, code snippets, or configuration details within a given repository.
-  - Useful for reconnaissance and understanding a target's codebase.
+  Search for code, files, secrets, or patterns inside a PUBLIC GitHub repository.
+  Use this tool when user requests:
+    - "search this repo"
+    - "find code for X in owner/repo"
+    - "look up secrets/api keys/files in a GitHub repo"
+    - "search GitHub for keyword inside a repo"
 
-Inputs:
-  - owner: string — The owner of the GitHub repository.
-  - repo: string — The name of the GitHub repository.
-  - query: string — The search term (e.g., "password", "api_key", "config.json").
+Routing Rules:
+  - Trigger only when user SPECIFIES a repo owner + repo name.
+  - Do NOT guess the repo name.
+  - Extract 'query' EXACTLY as the user says.
 
-Preconditions:
-  - Requires a valid GITHUB_TOKEN to be set in the environment.
-  - Use targeted queries to avoid noisy results.
+Arguments:
+  - owner: string (required)
+  - repo: string (required)
+  - query: string (required)
 
-Output:
-  - A list of dictionaries, each containing the path, URL, and search score of a result.
-
-Example Output:
-[
-  {
-    "path": "config/database.yml",
-    "url": "https://github.com/owner/repo/blob/main/config/database.yml",
-    "score": 1.0
-  },
-  {
-    "path": "src/main/java/com/example/App.java",
-    "url": "https://github.com/owner/repo/blob/main/src/main/java/com/example/App.java",
-    "score": 0.89
-  }
-]
+Output Expectation:
+  - Tool will return list of matches with path + URL.
 """
 
+
+# ------------------------------------------------------------
+# EXPLOIT-DB SEARCH — Find Public Exploits
+# ------------------------------------------------------------
 SEARCH_EXPLOIT_DB_TOOL_PROMPT = """
-Tool Name: search_exploit_db
-Function: Searches the Exploit Database for exploits matching a query and platform.
-
+Tool: search_exploit_db
 Purpose:
-  - Find public CVEs and associated exploits.
-  - Cross-reference Nmap service/version results.
+  Search the Exploit‑DB index for exploits or CVEs that match a query.
+  Use this tool when user asks:
+    - "search CVE ..."
+    - "find exploit for ..."
+    - "exploit-db query ..."
+    - "find exploit for version/service"
 
-Inputs:
-  - query: string — primary search term or CVE ID.
-  - platform: string (optional) — e.g., "windows", "linux", "webapps".
+Routing Rules:
+  - Map only when user intent clearly refers to vulnerabilities, CVEs, or exploits.
+  - Extract query EXACTLY as given.
+  - Platform is optional; include only if user explicitly states one.
 
-Preconditions:
-  - Only call for known vulnerabilities or service version matching.
-  - Never attempt to run exploits; info only.
+Arguments:
+  - query: string (required)
+  - platform: string (optional)
 
-Output:
-  - List of dictionaries with 'id', 'description', 'cve', 'platform', 'author'.
-
-Example Output:
-[
-  {
-      "id": 50000,
-      "description": "WordPress Plugin X - SQL Injection",
-      "cve": "CVE-2023-1234",
-      "platform": "webapps",
-      "author": "Exploit-DB"
-  },
-  {
-      "id": 49000,
-      "description": "Windows LPE - Service Handle Abuse",
-      "cve": "CVE-2022-9999",
-      "platform": "windows",
-      "author": "Exploit-DB"
-  }
-]
+Output Expectation:
+  - Tool returns structured exploit entries (id, description, cve, platform).
 """
