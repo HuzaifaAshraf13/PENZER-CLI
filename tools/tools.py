@@ -1,5 +1,5 @@
 # tools/tools.py
-
+# source env/bin/activate
 import os
 import json
 import datetime
