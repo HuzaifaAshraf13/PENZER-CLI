@@ -1,0 +1,23 @@
+[
+  {
+    "content": "Port 22 SSH open on 192.168.1.100",
+    "timestamp": "2026-01-24T08:00:03.683771+00:00",
+    "metadata": {
+      "ts": "2026-01-24T08:00:03.683746+00:00"
+    }
+  },
+  {
+    "content": "Apache 2.4.49 vulnerable to CVE-2021-41773",
+    "timestamp": "2026-01-24T08:00:03.684733+00:00",
+    "metadata": {
+      "ts": "2026-01-24T08:00:03.684718+00:00"
+    }
+  },
+  {
+    "content": "Database credentials: admin/password123",
+    "timestamp": "2026-01-24T08:00:03.685395+00:00",
+    "metadata": {
+      "ts": "2026-01-24T08:00:03.685370+00:00"
+    }
+  }
+]

@@ -1,0 +1,23 @@
+[
+  {
+    "content": "Nmap scan completed: found 10 open ports",
+    "timestamp": "2026-01-24T08:00:03.773295+00:00",
+    "metadata": {
+      "ts": "2026-01-24T08:00:03.773265+00:00"
+    }
+  },
+  {
+    "content": "Service enumeration: Apache, OpenSSH, MySQL",
+    "timestamp": "2026-01-24T08:00:03.774573+00:00",
+    "metadata": {
+      "ts": "2026-01-24T08:00:03.774554+00:00"
+    }
+  },
+  {
+    "content": "Vulnerability assessment: 3 critical issues",
+    "timestamp": "2026-01-24T08:00:03.775152+00:00",
+    "metadata": {
+      "ts": "2026-01-24T08:00:03.775134+00:00"
+    }
+  }
+]
