@@ -26,6 +26,21 @@ Arguments:
 Output Expectation:
   - The agent only returns the tool call JSON; the tool returns actual scan output.
 """
+# tools/ToolsPrompts.py
+
+# ---------------- TOOL PROMPTS TEMPLATE ----------------
+
+MEM_LOG_FINDING_PROMPT = """
+You have access to a tool called `mem_log_finding`:
+
+- Purpose: Log a discovery or finding from the pentest session.
+- Arguments:
+    - workspace_id (str): The workspace ID of the current session.
+    - finding (str): The text describing the discovery.
+    - severity (str, optional): One of 'info', 'low', 'medium', 'high', 'critical'. Default is 'info'.
+- Returns: Confirmation that the finding was logged.
+- Notes: Use this tool to keep a permanent record of findings in long-term memory.
+"""
 
 
 # ------------------------------------------------------------

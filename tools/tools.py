@@ -9,6 +9,18 @@ from bs4 import BeautifulSoup
 
 from agent.core import mcp
 
+# session tools
+from agent.core import mcp, reme_app
+
+@mcp.tool("mem_log_finding")
+async def log_finding(workspace_id: str, finding: str, severity: str = "info"):
+    """Log a finding to long-term memory."""
+    async with reme_app as app:
+        return await app.async_execute(
+            "summary_task_memory",
+            workspace_id=workspace_id,
+            trajectories=[{"role": "assistant", "content": f"[{severity.upper()}] {finding}"}]
+        )
 
 # ======================================================================
 #  NMAP — Real terminal execution

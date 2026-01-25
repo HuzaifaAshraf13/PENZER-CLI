@@ -10,6 +10,7 @@ Penzer-CLI/
   ├─ session/
   │     ├─ __init__.py
   │     └─ session.py       # tracks task state, memory, progress
+  │     └─ sessionprompts.py       # sessionprompts
   ├─ tools/
   │     ├─ __init__.py
   │     ├─ tools.py         # unified tool manager (load, run, data sources)

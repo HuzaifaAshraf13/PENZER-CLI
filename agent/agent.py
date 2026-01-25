@@ -13,6 +13,18 @@ from tools.ToolsPrompts import (
     RUN_MSFCONSOLE_COMMAND_PROMPT,
     SEARCH_GITHUB_TOOL_PROMPT,
     SEARCH_EXPLOIT_DB_TOOL_PROMPT,
+    MEM_LOG_FINDING_PROMPT,  # <-- add this
+)
+
+# Import session tools and resources
+import session.session  # registers memory resources and tools
+
+# Import session prompts
+from session.sessionprompts import (
+    SCOPE_PROMPT,
+    SESSION_SUMMARY_PROMPT,
+    OPERATOR_PREF_PROMPT,
+    MEMORY_QUERY_TEMPLATE
 )
 
 
@@ -75,6 +87,7 @@ class Agent:
                 RUN_MSFCONSOLE_COMMAND_PROMPT,
                 SEARCH_GITHUB_TOOL_PROMPT,
                 SEARCH_EXPLOIT_DB_TOOL_PROMPT,
+                MEM_LOG_FINDING_PROMPT,  # <-- include this
             ]
         )
 
@@ -83,6 +96,11 @@ class Agent:
 
         merged = f"""
 {SYSTEM_PROMPT}
+
+# === SESSION CONTEXT ===
+{SCOPE_PROMPT}
+{SESSION_SUMMARY_PROMPT}
+{OPERATOR_PREF_PROMPT}
 
 # === TOOL INSTRUCTIONS ===
 {combined_tool_guide}

@@ -36,4 +36,6 @@ Thumbs.db
 session/__pycache__/
 .env
 
-
+logs/
+memory_store/
+data/
