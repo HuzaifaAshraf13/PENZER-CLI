@@ -24,7 +24,8 @@ from session.sessionprompts import (
     SCOPE_PROMPT,
     SESSION_SUMMARY_PROMPT,
     OPERATOR_PREF_PROMPT,
-    MEMORY_QUERY_TEMPLATE
+    MEMORY_QUERY_TEMPLATE,
+    SHORT_TERM_MEMORY_PROMPT,
 )
 
 
@@ -101,6 +102,8 @@ class Agent:
 {SCOPE_PROMPT}
 {SESSION_SUMMARY_PROMPT}
 {OPERATOR_PREF_PROMPT}
+{MEMORY_QUERY_TEMPLATE}
+{SHORT_TERM_MEMORY_PROMPT}
 
 # === TOOL INSTRUCTIONS ===
 {combined_tool_guide}
@@ -118,6 +121,10 @@ class Agent:
     # -----------------------------------------------------------
     def run_tool(self, tool_name: str, args: Dict) -> Dict:
         """Fetch tools safely from FastMCP and execute the requested tool."""
+        # Auto-inject workspace if the LLM forgets it
+        if "workspace_id" not in args:
+            args["workspace_id"] = "pentest_1"
+
         try:
             if hasattr(self.mcp_client, "get_tools"):
                 tools_dict = asyncio.run(self.mcp_client.get_tools())
@@ -161,35 +168,48 @@ class Agent:
     # MAIN INPUT PROCESSOR
     # -----------------------------------------------------------
     def process_input(self, user_input: str):
-        full_prompt = (
-            f"User input: {user_input}\n\n"
-            f"Think and decide the correct action strictly using JSON."
+        workspace_id = "pentest_1"  # or dynamically pass it
+
+        # --- Inject memory automatically ---
+        short_mem = self.run_tool("mem_get_short", {"workspace_id": workspace_id})
+        long_mem = self.run_tool("mem_get_long", {"workspace_id": workspace_id})
+
+
+
+        chain_context = (
+            f"[SHORT MEMORY]: {json.dumps(short_mem)}\n"
+            f"[LONG MEMORY]: {json.dumps(long_mem)}\n"
+            f"User Request: {user_input}"
         )
 
-        decision_raw = self.llm.generate_content(
-            system_instruction=self.formatted_system_prompt, prompt=full_prompt
-        )
+        # Max 4 iterations to prevent infinite loops
+        for i in range(4):
+            decision_raw = self.llm.generate_content(
+                system_instruction=self.formatted_system_prompt, 
+                prompt=f"{chain_context}\n\nNext Action (JSON):"
+            )
 
-        decision = self._parse_llm_decision(decision_raw)
-        if not decision:
-            print("Agent: Could not parse tool decision.")
-            return
+            decision = self._parse_llm_decision(decision_raw)
+            if not decision:
+                print("Agent: Logic error.")
+                break
 
-        tool_name = decision.get("tool")
-        args = decision.get("args", {}) or {}
-        response = decision.get("response")
+            tool_name = decision.get("tool")
+            args = decision.get("args", {}) or {}
+            response = decision.get("response")
 
-        if tool_name:
-            result = self.run_tool(tool_name, args)
-            print(f"\nAgent (Tool: {tool_name}):\n{json.dumps(result, indent=2)}")
-            return
+            if tool_name:
+                # RUN TOOL
+                result = self.run_tool(tool_name, args)
+                print(f"\n[ACTION] {tool_name} executed.")
 
-        if response:
-            print(f"\nAgent: {response}")
-            return
+                # Append results to chain context for next iteration
+                chain_context += f"\nObservation from {tool_name}: {json.dumps(result)}"
+                continue
 
-        print("Agent: Invalid decision structure.")
-
+            if response:
+                print(f"\nAgent: {response}")
+                break
 
 # -----------------------------------------------------------
 # ENTRY POINT

@@ -7,25 +7,39 @@
 # ------------------------------------------------------------
 NMAP_SCAN_PROMPT = """
 Tool: nmap_scan
-Purpose:
-  Perform host discovery, port scanning, or service enumeration on a user-specified target.
-  Any user request involving "scan", "ping sweep", "discover devices", "enumerate ports",
-  or "check services" should map directly to this tool.
 
-Routing Rules:
-  - Always call nmap_scan when user intent is scanning or discovery.
-  - Use the exact target string the user provides, even if it's a subnet.
-  - Accept optional 'args' only if the user explicitly mentions flags.
-  - Never fabricate flags. If none given, leave args empty.
-  - Do not apply allowlist, authorization, or validation logic yourself — MCP handles that.
+Intent:
+  Use this tool for any network scanning or discovery task.
+  This includes port scanning, host discovery, service enumeration,
+  OS detection, or ping sweeps.
+
+When to Call:
+  - Call nmap_scan whenever the user intent involves:
+    "scan", "nmap", "discover hosts", "ping sweep",
+    "enumerate ports", "check open ports", "identify services".
+  - Do NOT perform scanning logic yourself.
 
 Arguments:
-  - target: string (required)
-  - args: string (optional; default empty)
+  - target (required):
+      Use the exact target string provided by the user.
+      This may be a single host, IP, domain, or subnet.
+  - args (optional):
+      Only include flags explicitly requested by the user
+      (e.g. "-sV", "-p-").
+      If the user does not mention flags, pass an empty string.
+      Never invent or assume flags.
 
-Output Expectation:
-  - The agent only returns the tool call JSON; the tool returns actual scan output.
+Rules:
+  - The agent decides *what* to scan.
+  - The tool executes and parses the scan.
+  - Do not add validation, authorization, or safety checks.
+  - Do not modify the target or arguments.
+
+Output:
+  - Return only the tool call with arguments.
+  - Do not summarize, explain, or interpret scan results.
 """
+
 # tools/ToolsPrompts.py
 
 # ---------------- TOOL PROMPTS TEMPLATE ----------------
@@ -48,31 +62,42 @@ You have access to a tool called `mem_log_finding`:
 # ------------------------------------------------------------
 RUN_MSFCONSOLE_COMMAND_PROMPT = """
 Tool: run_msfconsole
-Purpose:
-  Execute a sequence of Metasploit commands in non-interactive, scripted form.
-  Use this tool for any user request asking to:
-    - run Metasploit modules
-    - automate auxiliary scanners
-    - execute exploit modules in a scripted workflow
-    - check vulnerabilities with Metasploit
-    - fingerprint services using MSF
 
-Routing Rules:
-  - Only call when the user explicitly asks for Metasploit/MSF-related actions.
-  - Convert the user request into a list of msfconsole commands EXACTLY as stated.
-  - Do not guess module names or create missing parameters.
-  - The caller provides required target(s) if needed; do not invent.
+Intent:
+  Use this tool to execute Metasploit (msfconsole) commands in a scripted,
+  non-interactive manner.
+
+When to Call:
+  - Call this tool only when the user explicitly requests Metasploit / MSF actions.
+  - Examples include:
+      - running auxiliary scanners
+      - executing exploit or post modules
+      - checking vulnerabilities via Metasploit
+      - fingerprinting services using MSF modules
+
+Command Construction Rules:
+  - Convert the user request into a list of msfconsole commands.
+  - Use only commands, modules, and parameters explicitly mentioned by the user.
+  - Do NOT guess module paths, options, payloads, or targets.
+  - Do NOT invent missing values or infer defaults.
+  - Preserve the user’s intent exactly.
 
 Arguments:
-  - commands: list[string] (required)
-  - authorization: string (optional; leave empty unless user provides)
-  - target_list: list[string] (optional; only populate if explicitly given)
-  - requester_id: string (optional; leave empty unless user gives)
-  - reason: string (optional; user intent in simple words)
+  - commands (required):
+      Ordered list of msfconsole commands to execute.
+  - All other fields must be omitted unless explicitly provided by the user.
 
-Output Expectation:
-  - Tool will return structured per-command execution results.
+Rules:
+  - The agent translates intent → commands.
+  - The tool executes commands as-is.
+  - Do not perform validation, safety checks, or optimization.
+  - Do not explain Metasploit behavior or results.
+
+Output:
+  - Return only the tool call with arguments.
+  - Do not summarize or interpret the results.
 """
+
 
 
 # ------------------------------------------------------------
@@ -80,26 +105,40 @@ Output Expectation:
 # ------------------------------------------------------------
 SEARCH_GITHUB_TOOL_PROMPT = """
 Tool: search_github_repository
-Purpose:
-  Search for code, files, secrets, or patterns inside a PUBLIC GitHub repository.
-  Use this tool when user requests:
-    - "search this repo"
-    - "find code for X in owner/repo"
-    - "look up secrets/api keys/files in a GitHub repo"
-    - "search GitHub for keyword inside a repo"
 
-Routing Rules:
-  - Trigger only when user SPECIFIES a repo owner + repo name.
-  - Do NOT guess the repo name.
-  - Extract 'query' EXACTLY as the user says.
+Intent:
+  Use this tool to search code within a specific public GitHub repository.
+
+When to Call:
+  - Call this tool only when the user explicitly specifies:
+      - a repository owner AND
+      - a repository name
+  - Examples:
+      - "search owner/repo for X"
+      - "find X in owner/repo"
+      - "look for secrets in owner/repo"
+
+Query Rules:
+  - Extract the search query exactly as stated by the user.
+  - Do NOT expand, rewrite, or infer additional keywords.
+  - Do NOT search outside the specified repository.
 
 Arguments:
-  - owner: string (required)
-  - repo: string (required)
-  - query: string (required)
+  - owner (required):
+      Repository owner provided by the user.
+  - repo (required):
+      Repository name provided by the user.
+  - query (required):
+      Exact keyword or pattern provided by the user.
 
-Output Expectation:
-  - Tool will return list of matches with path + URL.
+Rules:
+  - The agent performs intent → argument extraction only.
+  - The tool executes the search and normalizes results.
+  - Do not add filters, ranking logic, or assumptions.
+
+Output:
+  - Return only the tool call with arguments.
+  - Do not summarize or interpret search results.
 """
 
 
@@ -108,23 +147,36 @@ Output Expectation:
 # ------------------------------------------------------------
 SEARCH_EXPLOIT_DB_TOOL_PROMPT = """
 Tool: search_exploit_db
-Purpose:
-  Search the Exploit‑DB index for exploits or CVEs that match a query.
-  Use this tool when user asks:
-    - "search CVE ..."
-    - "find exploit for ..."
-    - "exploit-db query ..."
-    - "find exploit for version/service"
 
-Routing Rules:
-  - Map only when user intent clearly refers to vulnerabilities, CVEs, or exploits.
-  - Extract query EXACTLY as given.
-  - Platform is optional; include only if user explicitly states one.
+Intent:
+  Use this tool to search Exploit‑DB for publicly known exploits or CVE entries.
+
+When to Call:
+  - Call this tool only when the user intent explicitly involves:
+      - exploits
+      - vulnerabilities
+      - CVEs
+      - Exploit‑DB
+  - Do NOT call for general security questions or mitigations.
+
+Query Rules:
+  - Extract the search query exactly as stated by the user.
+  - Do NOT expand, rewrite, normalize, or infer keywords.
+  - Do NOT add version numbers or service names unless explicitly provided.
 
 Arguments:
-  - query: string (required)
-  - platform: string (optional)
+  - query (required):
+      Exact query string provided by the user.
+  - platform (optional):
+      Include only if the user explicitly mentions a platform or OS.
 
-Output Expectation:
-  - Tool returns structured exploit entries (id, description, cve, platform).
+Rules:
+  - The agent performs intent → argument extraction only.
+  - The tool performs the search and parses results.
+  - Do not rank, filter, or assess exploit severity.
+
+Output:
+  - Return only the tool call with arguments.
+  - Do not summarize or interpret exploit results.
 """
+
