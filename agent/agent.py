@@ -120,16 +120,19 @@ class Agent:
     # TOOL EXECUTION (supports FastMCP.get_tools())
     # -----------------------------------------------------------
     def run_tool(self, tool_name: str, args: Dict) -> Dict:
-        """Fetch tools safely from FastMCP and execute the requested tool."""
-        # Auto-inject workspace if the LLM forgets it
+        # Default workspace (agent-level context)
+        workspace_id = "pentest_1"
+
+        # Inject workspace if agent has it
         if "workspace_id" not in args:
-            args["workspace_id"] = "pentest_1"
+            args["workspace_id"] = workspace_id
 
         try:
-            if hasattr(self.mcp_client, "get_tools"):
-                tools_dict = asyncio.run(self.mcp_client.get_tools())
-            else:
-                tools_dict = getattr(self.mcp_client, "tools", {})
+            tools_dict = (
+                asyncio.run(self.mcp_client.get_tools())
+                if hasattr(self.mcp_client, "get_tools")
+                else getattr(self.mcp_client, "tools", {})
+            )
         except Exception as e:
             return {"error": f"Cannot fetch MCP tools: {e}"}
 
@@ -137,18 +140,34 @@ class Agent:
         if not tool:
             return {"error": f"Unknown tool: {tool_name}"}
 
-        # If the tool object wraps a function, try getting the callable
         callable_obj = getattr(tool, "fn", tool)
 
         try:
+            # 🔥 Signature-aware filtering (TOOLS + SESSION)
+            sig = inspect.signature(callable_obj)
+            filtered_args = {
+                k: v for k, v in args.items()
+                if k in sig.parameters
+            }
+
+            # If tool explicitly wants workspace_id, ensure it's there
+            if "workspace_id" in sig.parameters and "workspace_id" not in filtered_args:
+                filtered_args["workspace_id"] = workspace_id
+
             if asyncio.iscoroutinefunction(callable_obj):
-                return asyncio.run(callable_obj(**args))
-            return callable_obj(**args)
+                return asyncio.run(callable_obj(**filtered_args))
+            return callable_obj(**filtered_args)
+
         except TypeError as e:
-            # Likely wrong arg shape; return useful message for debugging
-            return {"error": f"Tool invocation failed (TypeError): {e}", "provided_args": args}
+            return {
+                "error": f"Tool invocation failed (TypeError): {e}",
+                "provided_args": args,
+                "filtered_args": filtered_args
+            }
         except Exception as e:
-            return {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
+            return {
+                "error": f"Tool execution failed: {type(e).__name__}: {e}"
+            }
 
     # -----------------------------------------------------------
     # LLM DECISION PARSER
@@ -168,45 +187,57 @@ class Agent:
     # MAIN INPUT PROCESSOR
     # -----------------------------------------------------------
     def process_input(self, user_input: str):
-        workspace_id = "pentest_1"  # or dynamically pass it
+        workspace_id = "pentest_1"  # default workspace
 
-        # --- Inject memory automatically ---
+        # 1️⃣ Fetch memory first
         short_mem = self.run_tool("mem_get_short", {"workspace_id": workspace_id})
         long_mem = self.run_tool("mem_get_long", {"workspace_id": workspace_id})
 
-
-
+        # 2️⃣ Build initial chain context for LLM
         chain_context = (
             f"[SHORT MEMORY]: {json.dumps(short_mem)}\n"
             f"[LONG MEMORY]: {json.dumps(long_mem)}\n"
             f"User Request: {user_input}"
         )
 
-        # Max 4 iterations to prevent infinite loops
-        for i in range(4):
+        # 3️⃣ Run LLM-tool loop (max 4 iterations)
+        for _ in range(4):
+            # Ask LLM for next action
             decision_raw = self.llm.generate_content(
-                system_instruction=self.formatted_system_prompt, 
+                system_instruction=self.formatted_system_prompt,
                 prompt=f"{chain_context}\n\nNext Action (JSON):"
             )
 
             decision = self._parse_llm_decision(decision_raw)
             if not decision:
-                print("Agent: Logic error.")
+                print("Agent: Logic error or invalid LLM output.")
                 break
 
             tool_name = decision.get("tool")
             args = decision.get("args", {}) or {}
             response = decision.get("response")
 
+            # 4️⃣ Execute tool if present
             if tool_name:
-                # RUN TOOL
                 result = self.run_tool(tool_name, args)
-                print(f"\n[ACTION] {tool_name} executed.")
 
-                # Append results to chain context for next iteration
+                # Print output for user immediately
+                print(f"\n[ACTION] {tool_name} executed. Output:\n{json.dumps(result, indent=2)}")
+
+                # Auto-log execution tool output to short-term memory
+                MEMORY_TOOLS = {"mem_get_short", "mem_set_short", "mem_get_long", "mem_set_long", "mem_log_finding"}
+                if tool_name not in MEMORY_TOOLS:
+                    self.run_tool("mem_set_short", {
+                        "workspace_id": workspace_id,
+                        "last_tool": tool_name,
+                        "last_result": json.dumps(result)
+                    })
+
+                # Append result to chain context for LLM
                 chain_context += f"\nObservation from {tool_name}: {json.dumps(result)}"
                 continue
 
+            # 5️⃣ Output LLM response if no tool
             if response:
                 print(f"\nAgent: {response}")
                 break

@@ -27,12 +27,17 @@ async def log_finding(workspace_id: str, finding: str, severity: str = "info"):
 # ======================================================================
 import xml.etree.ElementTree as ET
 
+import subprocess, datetime
+import xml.etree.ElementTree as ET
+
 @mcp.tool()
 def nmap_scan(target: str, args: str) -> dict:
     """
     Pure execution tool.
     LLM decides ALL flags.
-    Tool only runs nmap and parses XML.
+    Tool runs nmap, parses XML, returns:
+      - display: human-readable output
+      - parsed: structured data for agent
     """
 
     cmd = ["nmap"] + args.split() + ["-oX", "-", target]
@@ -42,21 +47,16 @@ def nmap_scan(target: str, args: str) -> dict:
         xml_output = subprocess.check_output(
             cmd,
             stderr=subprocess.STDOUT
-        ).decode()
+        ).decode(errors="ignore")
     except Exception as e:
         return {
             "status": "error",
             "error": str(e),
             "command": " ".join(cmd),
-            "target": target,
-            "args": args
         }
 
     end_dt = datetime.datetime.utcnow()
 
-    # =====================
-    # XML parsing (safe)
-    # =====================
     try:
         root = ET.fromstring(xml_output)
     except ET.ParseError as e:
@@ -64,28 +64,41 @@ def nmap_scan(target: str, args: str) -> dict:
             "status": "error",
             "error": f"XML parse failed: {e}",
             "command": " ".join(cmd),
-            "raw_xml": xml_output
         }
 
     parsed = {
+        "host": {},
         "ports": [],
         "os_matches": [],
         "scripts": []
     }
 
     # =====================
+    # Host info
+    # =====================
+    host_el = root.find("host")
+
+    if host_el is not None:
+        status_el = host_el.find("status")
+        addr_el = host_el.find("address")
+
+        parsed["host"] = {
+            "status": status_el.attrib.get("state") if status_el is not None else None,
+            "ip": addr_el.attrib.get("addr") if addr_el is not None else None,
+            "addr_type": addr_el.attrib.get("addrtype") if addr_el is not None else None,
+        }
+
+    # =====================
     # Ports
     # =====================
     for port in root.findall(".//port"):
         state_el = port.find("state")
-        state = state_el.attrib.get("state", "unknown") if state_el is not None else "unknown"
-
         service = port.find("service")
 
         parsed["ports"].append({
             "port": int(port.attrib.get("portid", 0)),
             "protocol": port.attrib.get("protocol"),
-            "state": state,
+            "state": state_el.attrib.get("state") if state_el is not None else "unknown",
             "service": service.attrib.get("name") if service is not None else None,
             "product": service.attrib.get("product") if service is not None else None,
             "version": service.attrib.get("version") if service is not None else None,
@@ -101,30 +114,43 @@ def nmap_scan(target: str, args: str) -> dict:
             "accuracy": int(osmatch.attrib.get("accuracy", 0))
         })
 
-    parsed["os_matches"].sort(
-        key=lambda x: x["accuracy"],
-        reverse=True
-    )
+    parsed["os_matches"].sort(key=lambda x: x["accuracy"], reverse=True)
 
     # =====================
     # NSE scripts
     # =====================
     for script in root.findall(".//script"):
-        tables = []
-        for table in script.findall("table"):
-            row = {}
-            for elem in table:
-                key = elem.attrib.get("key")
-                if key:
-                    row[key] = elem.text
-            if row:
-                tables.append(row)
-
         parsed["scripts"].append({
             "id": script.attrib.get("id"),
             "output": script.attrib.get("output"),
-            "tables": tables or None
         })
+
+    # =====================
+    # Build DISPLAY output
+    # =====================
+    lines = []
+
+    ip = parsed["host"].get("ip", target)
+    status = parsed["host"].get("status", "unknown")
+
+    lines.append(f"Nmap scan report for {ip}")
+    lines.append(f"Host is {status}\n")
+
+    if parsed["ports"]:
+        lines.append("PORT     STATE SERVICE     VERSION")
+        for p in parsed["ports"]:
+            version = " ".join(filter(None, [p["product"], p["version"]]))
+            lines.append(
+                f"{p['port']}/{p['protocol']:<3} "
+                f"{p['state']:<5} "
+                f"{(p['service'] or ''):<10} {version}"
+            )
+
+    if parsed["os_matches"]:
+        os = parsed["os_matches"][0]
+        lines.append(f"\nOS guess: {os['name']} ({os['accuracy']}%)")
+
+    display = "\n".join(lines)
 
     # =====================
     # Final response
@@ -137,8 +163,8 @@ def nmap_scan(target: str, args: str) -> dict:
         "started_at": start_dt.isoformat() + "Z",
         "finished_at": end_dt.isoformat() + "Z",
         "duration_sec": (end_dt - start_dt).total_seconds(),
-        "parsed": parsed,
-        "raw_xml": xml_output
+        "display": display,   # 👈 FastMCP screen output
+        "parsed": parsed      # 👈 agent reasoning data
     }
 
 # ======================================================================
