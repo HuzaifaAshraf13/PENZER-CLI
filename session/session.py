@@ -15,22 +15,20 @@ async def mem_set_short(workspace_id: str, key: str, value: str):
 # ---------------- LONG-TERM MEMORY ----------------
 @mcp.tool("mem_get_long")
 async def mem_get_long(workspace_id: str):
-    async with reme_app as app:
-        res = await app.async_execute(
-            "retrieve_task_memory",
-            workspace_id=workspace_id,
-            query="Retrieve all persistent session memory."
-        )
-        return res.get("answer", {})
+    res = await reme_app.async_execute(
+        "retrieve_task_memory",
+        workspace_id=workspace_id,
+        query="Return ALL stored key-value memory for this workspace. Do not summarize."
+    )
+    return res.get("answer") or {}
 
 @mcp.tool("mem_set_long")
 async def mem_set_long(workspace_id: str, key: str, value: str):
-    async with reme_app as app:
-        return await app.async_execute(
-            "summary_task_memory",
-            workspace_id=workspace_id,
-            trajectories=[{
-                "role": "assistant",
-                "content": f"{key}: {value}"
-            }]
-        )
+    return await reme_app.async_execute(
+        "summary_task_memory",
+        workspace_id=workspace_id,
+        trajectories=[{
+            "role": "assistant",
+            "content": f"{key}: {value}"
+        }]
+    )

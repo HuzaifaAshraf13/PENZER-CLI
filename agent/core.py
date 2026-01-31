@@ -16,3 +16,7 @@ reme_app = ReMeApp(
     "vector_store.default.backend=chroma",
     f"vector_store.chroma.path={db_path}"
 )
+
+# ---- KEEP REME ALIVE (IMPORTANT FIX) ----
+async def init_reme():
+    await reme_app.__aenter__()
