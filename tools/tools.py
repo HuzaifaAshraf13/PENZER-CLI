@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 
 import subprocess, datetime
 import xml.etree.ElementTree as ET
-
+from datetime import datetime, timezone
 @mcp.tool()
 def nmap_scan(target: str, args: str) -> dict:
     """
@@ -41,7 +41,7 @@ def nmap_scan(target: str, args: str) -> dict:
     """
 
     cmd = ["nmap"] + args.split() + ["-oX", "-", target]
-    start_dt = datetime.datetime.utcnow()
+    start_dt = datetime.now(timezone.utc)
 
     try:
         xml_output = subprocess.check_output(
@@ -55,7 +55,7 @@ def nmap_scan(target: str, args: str) -> dict:
             "command": " ".join(cmd),
         }
 
-    end_dt = datetime.datetime.utcnow()
+    end_dt   = datetime.now(timezone.utc)
 
     try:
         root = ET.fromstring(xml_output)

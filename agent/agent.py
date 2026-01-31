@@ -4,29 +4,16 @@ import asyncio
 import inspect
 from typing import Dict, Any, List, Optional
 
-from agent.server import mcp
+from agent.core import mcp
 from agent.llm import LLM
 from agent.prompts import SYSTEM_PROMPT
 
-from tools.ToolsPrompts import (
-    NMAP_SCAN_PROMPT,
-    RUN_MSFCONSOLE_COMMAND_PROMPT,
-    SEARCH_GITHUB_TOOL_PROMPT,
-    SEARCH_EXPLOIT_DB_TOOL_PROMPT,
-    MEM_LOG_FINDING_PROMPT,  # <-- add this
-)
+# Import and register prompts FIRST (before anything uses mcp)
+import session.sessionprompts  # registers session prompts
+import tools.ToolsPrompts      # registers tool prompts
 
 # Import session tools and resources
 import session.session  # registers memory resources and tools
-
-# Import session prompts
-from session.sessionprompts import (
-    SCOPE_PROMPT,
-    SESSION_SUMMARY_PROMPT,
-    OPERATOR_PREF_PROMPT,
-    MEMORY_QUERY_TEMPLATE,
-    SHORT_TERM_MEMORY_PROMPT,
-)
 
 
 class Agent:
@@ -86,32 +73,21 @@ class Agent:
         return serial
 
     def _build_system_prompt(self) -> str:
-        """SYSTEM_PROMPT + merged tool prompts + registered tools + resources."""
-        combined_tool_guide = "\n\n".join(
-            [
-                NMAP_SCAN_PROMPT,
-                RUN_MSFCONSOLE_COMMAND_PROMPT,
-                SEARCH_GITHUB_TOOL_PROMPT,
-                SEARCH_EXPLOIT_DB_TOOL_PROMPT,
-                MEM_LOG_FINDING_PROMPT,  # <-- include this
-            ]
-        )
-
+        """Build system prompt with registered tools and resources."""
+        # Retrieve registered prompts from MCP server
+        prompts_dict = getattr(self.mcp_client, "prompts", {})
+        
+        # Extract prompt names that are registered
+        prompt_names = list(prompts_dict.keys())
+        
         # create a safe, JSON-serializable summary of registered tools
         tools_info = self._serialize_tools_for_prompt(self.tool_schema or {})
 
         merged = f"""
 {SYSTEM_PROMPT}
 
-# === SESSION CONTEXT ===
-{SCOPE_PROMPT}
-{SESSION_SUMMARY_PROMPT}
-{OPERATOR_PREF_PROMPT}
-{MEMORY_QUERY_TEMPLATE}
-{SHORT_TERM_MEMORY_PROMPT}
-
-# === TOOL INSTRUCTIONS ===
-{combined_tool_guide}
+# === REGISTERED PROMPTS ===
+Available prompts: {', '.join(prompt_names)}
 
 # === REGISTERED TOOLS (names + args) ===
 {json.dumps(tools_info, indent=2)}
@@ -229,8 +205,10 @@ class Agent:
             # store last action
             await self.run_tool("mem_set_short", {
                 "workspace_id": workspace_id,
-                "last_tool": tool_name,
-                "last_result": json.dumps(result)
+                "data": {
+                    "last_tool": tool_name,
+                    "last_result": json.dumps(result)
+                }
             })
             return
 

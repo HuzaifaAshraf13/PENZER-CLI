@@ -1,46 +1,44 @@
 # ToolsPrompts.py
-# Unified, strict, tool‑specific instruction set for Penzer MCP tools.
-# These prompts teach the LLM EXACTLY how each tool should be triggered.
 
+from agent.core import mcp
 # ------------------------------------------------------------
 # NMAP — Network Scanning
 # ------------------------------------------------------------
-NMAP_SCAN_PROMPT = """
-Tool: nmap_scan
+@mcp.prompt(
+    name="nmap_scan_rules",
+    description="Rules for using the nmap_scan tool"
+)
+def nmap_scan_prompt():
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Use the nmap_scan tool for any network scanning or discovery task.\n"
+                "This includes port scanning, host discovery, service enumeration,\n"
+                "OS detection, and ping sweeps.\n\n"
 
-Intent:
-  Use this tool for any network scanning or discovery task.
-  This includes port scanning, host discovery, service enumeration,
-  OS detection, or ping sweeps.
+                "WHEN TO CALL:\n"
+                "- scan, nmap, discover hosts, ping sweep\n"
+                "- enumerate ports, check open ports, identify services\n\n"
 
-When to Call:
-  - Call nmap_scan whenever the user intent involves:
-    "scan", "nmap", "discover hosts", "ping sweep",
-    "enumerate ports", "check open ports", "identify services".
-  - Do NOT perform scanning logic yourself.
+                "ARGUMENT RULES:\n"
+                "- target: use the exact user-provided target\n"
+                "- args: include ONLY flags explicitly mentioned by the user\n"
+                "- if no flags are mentioned, pass an empty string\n"
+                "- NEVER invent or assume flags\n\n"
 
-Arguments:
-  - target (required):
-      Use the exact target string provided by the user.
-      This may be a single host, IP, domain, or subnet.
-  - args (optional):
-      Only include flags explicitly requested by the user
-      (e.g. "-sV", "-p-").
-      If the user does not mention flags, pass an empty string.
-      Never invent or assume flags.
+                "RULES:\n"
+                "- Do NOT perform scanning logic yourself\n"
+                "- Do NOT modify the target or arguments\n"
+                "- Do NOT add validation, authorization, or safety checks\n\n"
 
-Rules:
-  - The agent decides *what* to scan.
-  - The tool executes and parses the scan.
-  - Do not add validation, authorization, or safety checks.
-  - Do not modify the target or arguments.
+                "OUTPUT:\n"
+                "- Return ONLY the tool call with arguments\n"
+                "- Do NOT summarize, explain, or interpret results"
+            )
+        }
+    ]
 
-Output:
-  - Return only the tool call with arguments.
-  - Do not summarize, explain, or interpret scan results.
-"""
-
-# tools/ToolsPrompts.py
 
 # ---------------- TOOL PROMPTS TEMPLATE ----------------
 
@@ -60,123 +58,142 @@ You have access to a tool called `mem_log_finding`:
 # ------------------------------------------------------------
 # METASPLOIT — Non-interactive Command Execution
 # ------------------------------------------------------------
-RUN_MSFCONSOLE_COMMAND_PROMPT = """
-Tool: run_msfconsole
+from agent.core import mcp
 
-Intent:
-  Use this tool to execute Metasploit (msfconsole) commands in a scripted,
-  non-interactive manner.
+# ------------------------------------------------------------
+# METASPLOIT — Non-interactive Command Execution
+# ------------------------------------------------------------
+@mcp.prompt(
+    name="run_msfconsole_rules",
+    description="Rules for executing Metasploit commands using run_msfconsole"
+)
+def run_msfconsole_prompt():
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Use the run_msfconsole tool to execute Metasploit (msfconsole)\n"
+                "commands in a scripted, non-interactive manner.\n\n"
 
-When to Call:
-  - Call this tool only when the user explicitly requests Metasploit / MSF actions.
-  - Examples include:
-      - running auxiliary scanners
-      - executing exploit or post modules
-      - checking vulnerabilities via Metasploit
-      - fingerprinting services using MSF modules
+                "WHEN TO CALL:\n"
+                "- ONLY when the user explicitly requests Metasploit or MSF actions\n"
+                "- Examples: auxiliary scanners, exploit modules, post modules,\n"
+                "  vulnerability checks, or service fingerprinting via MSF\n\n"
 
-Command Construction Rules:
-  - Convert the user request into a list of msfconsole commands.
-  - Use only commands, modules, and parameters explicitly mentioned by the user.
-  - Do NOT guess module paths, options, payloads, or targets.
-  - Do NOT invent missing values or infer defaults.
-  - Preserve the user’s intent exactly.
+                "COMMAND CONSTRUCTION RULES:\n"
+                "- Convert the user request into an ordered list of msfconsole commands\n"
+                "- Use ONLY commands, modules, and parameters explicitly mentioned\n"
+                "- Do NOT guess module paths, payloads, options, or targets\n"
+                "- Do NOT invent values or infer defaults\n"
+                "- Preserve the user’s intent exactly\n\n"
 
-Arguments:
-  - commands (required):
-      Ordered list of msfconsole commands to execute.
-  - All other fields must be omitted unless explicitly provided by the user.
+                "ARGUMENTS:\n"
+                "- commands: required, ordered list of msfconsole commands\n"
+                "- Omit all other fields unless explicitly provided\n\n"
 
-Rules:
-  - The agent translates intent → commands.
-  - The tool executes commands as-is.
-  - Do not perform validation, safety checks, or optimization.
-  - Do not explain Metasploit behavior or results.
+                "RULES:\n"
+                "- Do NOT perform validation, safety checks, or optimization\n"
+                "- Do NOT explain Metasploit behavior or results\n\n"
 
-Output:
-  - Return only the tool call with arguments.
-  - Do not summarize or interpret the results.
-"""
+                "OUTPUT:\n"
+                "- Return ONLY the tool call with arguments\n"
+                "- Do NOT summarize or interpret results"
+            )
+        }
+    ]
 
 
 
 # ------------------------------------------------------------
 # GITHUB SEARCH — Repository Code Search
 # ------------------------------------------------------------
-SEARCH_GITHUB_TOOL_PROMPT = """
-Tool: search_github_repository
+from agent.core import mcp
 
-Intent:
-  Use this tool to search code within a specific public GitHub repository.
+# ------------------------------------------------------------
+# GITHUB — Repository Code Search
+# ------------------------------------------------------------
+@mcp.prompt(
+    name="search_github_repository_rules",
+    description="Rules for searching code in a specific GitHub repository"
+)
+def search_github_repository_prompt():
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Use the search_github_repository tool to search code within\n"
+                "a specific public GitHub repository.\n\n"
 
-When to Call:
-  - Call this tool only when the user explicitly specifies:
-      - a repository owner AND
-      - a repository name
-  - Examples:
-      - "search owner/repo for X"
-      - "find X in owner/repo"
-      - "look for secrets in owner/repo"
+                "WHEN TO CALL:\n"
+                "- ONLY when the user explicitly specifies BOTH:\n"
+                "  - a repository owner\n"
+                "  - a repository name\n"
+                "- Examples: search owner/repo for X, find X in owner/repo,\n"
+                "  look for secrets in owner/repo\n\n"
 
-Query Rules:
-  - Extract the search query exactly as stated by the user.
-  - Do NOT expand, rewrite, or infer additional keywords.
-  - Do NOT search outside the specified repository.
+                "QUERY RULES:\n"
+                "- Extract the search query EXACTLY as stated by the user\n"
+                "- Do NOT expand, rewrite, or infer additional keywords\n"
+                "- Do NOT search outside the specified repository\n\n"
 
-Arguments:
-  - owner (required):
-      Repository owner provided by the user.
-  - repo (required):
-      Repository name provided by the user.
-  - query (required):
-      Exact keyword or pattern provided by the user.
+                "ARGUMENTS:\n"
+                "- owner: repository owner provided by the user\n"
+                "- repo: repository name provided by the user\n"
+                "- query: exact keyword or pattern provided by the user\n\n"
 
-Rules:
-  - The agent performs intent → argument extraction only.
-  - The tool executes the search and normalizes results.
-  - Do not add filters, ranking logic, or assumptions.
+                "RULES:\n"
+                "- Perform intent → argument extraction ONLY\n"
+                "- Do NOT add filters, ranking logic, or assumptions\n\n"
 
-Output:
-  - Return only the tool call with arguments.
-  - Do not summarize or interpret search results.
-"""
-
+                "OUTPUT:\n"
+                "- Return ONLY the tool call with arguments\n"
+                "- Do NOT summarize or interpret results"
+            )
+        }
+    ]
 
 # ------------------------------------------------------------
 # EXPLOIT-DB SEARCH — Find Public Exploits
 # ------------------------------------------------------------
-SEARCH_EXPLOIT_DB_TOOL_PROMPT = """
-Tool: search_exploit_db
+from agent.core import mcp
 
-Intent:
-  Use this tool to search Exploit‑DB for publicly known exploits or CVE entries.
+# ------------------------------------------------------------
+# EXPLOIT‑DB — Public Exploit Search
+# ------------------------------------------------------------
+@mcp.prompt(
+    name="search_exploit_db_rules",
+    description="Rules for searching Exploit‑DB for public exploits or CVEs"
+)
+def search_exploit_db_prompt():
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Use the search_exploit_db tool to search Exploit‑DB for\n"
+                "publicly known exploits or CVE entries.\n\n"
 
-When to Call:
-  - Call this tool only when the user intent explicitly involves:
-      - exploits
-      - vulnerabilities
-      - CVEs
-      - Exploit‑DB
-  - Do NOT call for general security questions or mitigations.
+                "WHEN TO CALL:\n"
+                "- ONLY when the user intent explicitly involves:\n"
+                "  exploits, vulnerabilities, CVEs, or Exploit‑DB\n"
+                "- Do NOT call for general security questions or mitigations\n\n"
 
-Query Rules:
-  - Extract the search query exactly as stated by the user.
-  - Do NOT expand, rewrite, normalize, or infer keywords.
-  - Do NOT add version numbers or service names unless explicitly provided.
+                "QUERY RULES:\n"
+                "- Extract the search query EXACTLY as stated by the user\n"
+                "- Do NOT expand, rewrite, normalize, or infer keywords\n"
+                "- Do NOT add version numbers or service names unless explicitly provided\n\n"
 
-Arguments:
-  - query (required):
-      Exact query string provided by the user.
-  - platform (optional):
-      Include only if the user explicitly mentions a platform or OS.
+                "ARGUMENTS:\n"
+                "- query: required, exact query string from the user\n"
+                "- platform: optional, ONLY if the user explicitly mentions an OS or platform\n\n"
 
-Rules:
-  - The agent performs intent → argument extraction only.
-  - The tool performs the search and parses results.
-  - Do not rank, filter, or assess exploit severity.
+                "RULES:\n"
+                "- Perform intent → argument extraction ONLY\n"
+                "- Do NOT rank, filter, or assess exploit severity\n\n"
 
-Output:
-  - Return only the tool call with arguments.
-  - Do not summarize or interpret exploit results.
-"""
+                "OUTPUT:\n"
+                "- Return ONLY the tool call with arguments\n"
+                "- Do NOT summarize or interpret results"
+            )
+        }
+    ]
 

@@ -11,9 +11,11 @@ def echo(message: str) -> str:
 def add(a: int, b: int) -> int:
     return a + b
 
-# ---------------- LOAD EXTERNAL TOOLS ----------------
-import tools.tools      # registers tool decorators
-import session.session  # registers memory resources
+# ---------------- LOAD EXTERNAL TOOLS AND PROMPTS ----------------
+import tools.tools          # registers tool decorators
+import tools.ToolsPrompts   # registers tool prompts
+import session.session      # registers memory resources
+import session.sessionprompts  # registers session prompts
 
 # ---------------- HELPER TO LIST TOOLS ----------------
 async def _get_mcp_tool_keys():
