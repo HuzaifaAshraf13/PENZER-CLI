@@ -9,245 +9,86 @@ from bs4 import BeautifulSoup
 
 from agent.core import mcp
 
-# session tools
-from agent.core import mcp, reme_app
 
-@mcp.tool("mem_log_finding")
-async def log_finding(workspace_id: str, finding: str, severity: str = "info"):
-    """Log a finding to long-term memory."""
-    async with reme_app as app:
-        return await app.async_execute(
-            "summary_task_memory",
-            workspace_id=workspace_id,
-            trajectories=[{"role": "assistant", "content": f"[{severity.upper()}] {finding}"}]
-        )
-
-# ======================================================================
-#  NMAP — Real terminal execution
-# ======================================================================
-import xml.etree.ElementTree as ET
-
-import subprocess, datetime
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-@mcp.tool()
-def nmap_scan(target: str, args: str) -> dict:
-    """
-    Pure execution tool.
-    LLM decides ALL flags.
-    Tool runs nmap, parses XML, returns:
-      - display: human-readable output
-      - parsed: structured data for agent
-    """
-
-    cmd = ["nmap"] + args.split() + ["-oX", "-", target]
-    start_dt = datetime.now(timezone.utc)
-
-    try:
-        xml_output = subprocess.check_output(
-            cmd,
-            stderr=subprocess.STDOUT
-        ).decode(errors="ignore")
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "command": " ".join(cmd),
-        }
-
-    end_dt   = datetime.now(timezone.utc)
-
-    try:
-        root = ET.fromstring(xml_output)
-    except ET.ParseError as e:
-        return {
-            "status": "error",
-            "error": f"XML parse failed: {e}",
-            "command": " ".join(cmd),
-        }
-
-    parsed = {
-        "host": {},
-        "ports": [],
-        "os_matches": [],
-        "scripts": []
-    }
-
-    # =====================
-    # Host info
-    # =====================
-    host_el = root.find("host")
-
-    if host_el is not None:
-        status_el = host_el.find("status")
-        addr_el = host_el.find("address")
-
-        parsed["host"] = {
-            "status": status_el.attrib.get("state") if status_el is not None else None,
-            "ip": addr_el.attrib.get("addr") if addr_el is not None else None,
-            "addr_type": addr_el.attrib.get("addrtype") if addr_el is not None else None,
-        }
-
-    # =====================
-    # Ports
-    # =====================
-    for port in root.findall(".//port"):
-        state_el = port.find("state")
-        service = port.find("service")
-
-        parsed["ports"].append({
-            "port": int(port.attrib.get("portid", 0)),
-            "protocol": port.attrib.get("protocol"),
-            "state": state_el.attrib.get("state") if state_el is not None else "unknown",
-            "service": service.attrib.get("name") if service is not None else None,
-            "product": service.attrib.get("product") if service is not None else None,
-            "version": service.attrib.get("version") if service is not None else None,
-            "extrainfo": service.attrib.get("extrainfo") if service is not None else None,
-        })
-
-    # =====================
-    # OS detection
-    # =====================
-    for osmatch in root.findall(".//osmatch"):
-        parsed["os_matches"].append({
-            "name": osmatch.attrib.get("name"),
-            "accuracy": int(osmatch.attrib.get("accuracy", 0))
-        })
-
-    parsed["os_matches"].sort(key=lambda x: x["accuracy"], reverse=True)
-
-    # =====================
-    # NSE scripts
-    # =====================
-    for script in root.findall(".//script"):
-        parsed["scripts"].append({
-            "id": script.attrib.get("id"),
-            "output": script.attrib.get("output"),
-        })
-
-    # =====================
-    # Build DISPLAY output
-    # =====================
-    lines = []
-
-    ip = parsed["host"].get("ip", target)
-    status = parsed["host"].get("status", "unknown")
-
-    lines.append(f"Nmap scan report for {ip}")
-    lines.append(f"Host is {status}\n")
-
-    if parsed["ports"]:
-        lines.append("PORT     STATE SERVICE     VERSION")
-        for p in parsed["ports"]:
-            version = " ".join(filter(None, [p["product"], p["version"]]))
-            lines.append(
-                f"{p['port']}/{p['protocol']:<3} "
-                f"{p['state']:<5} "
-                f"{(p['service'] or ''):<10} {version}"
-            )
-
-    if parsed["os_matches"]:
-        os = parsed["os_matches"][0]
-        lines.append(f"\nOS guess: {os['name']} ({os['accuracy']}%)")
-
-    display = "\n".join(lines)
-
-    # =====================
-    # Final response
-    # =====================
-    return {
-        "status": "ok",
-        "target": target,
-        "args": args,
-        "command": " ".join(cmd),
-        "started_at": start_dt.isoformat() + "Z",
-        "finished_at": end_dt.isoformat() + "Z",
-        "duration_sec": (end_dt - start_dt).total_seconds(),
-        "display": display,   # 👈 FastMCP screen output
-        "parsed": parsed      # 👈 agent reasoning data
-    }
-
-# ======================================================================
-#  MSFCONSOLE — Real Metasploit execution via resource script
-# ======================================================================
 import subprocess
-import datetime
-import tempfile
-import os
-import re
+import shlex
 
 @mcp.tool()
-def run_msfconsole(commands: list) -> dict:
+def check_available_tools(tool_category: str = "network") -> dict:
     """
-    Pure execution tool.
-    LLM decides ALL commands.
-    Tool runs msfconsole and returns best-effort parsed results.
+    Checks which security/network tools are available on the system.
+    
+    Args:
+        tool_category: 'network', 'vuln', 'enum', or 'all'
+    
+    Returns:
+        Dictionary with available tools and their versions
     """
-
-    script_text = "\n".join(commands) + "\nexit\n"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".rc") as f:
-        f.write(script_text.encode())
-        rc_path = f.name
-
-    start_dt = datetime.datetime.utcnow()
-
-    try:
-        output = subprocess.check_output(
-            ["msfconsole", "-q", "-r", rc_path],
-            stderr=subprocess.STDOUT
-        ).decode(errors="ignore")
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "commands_run": commands
-        }
-    finally:
-        os.unlink(rc_path)
-
-    end_dt = datetime.datetime.utcnow()
-
-    parsed = {
-        "sessions": [],
-        "credentials": [],
-        "loot": [],
-        "findings": []
+    tools_to_check = {
+        "network": ["nmap", "netstat", "arp-scan", "ping", "fping", "masscan"],
+        "vuln": ["nessus", "openvas", "nikto", "metasploit"],
+        "enum": ["enum4linux", "ldapsearch", "rpcclient"],
+        "system": ["sudo", "grep", "awk", "sed"]
     }
-
-    # sessions (best-effort, version-agnostic)
-    for m in re.findall(r"^\s*(\d+)\s+(\S+)\s+(\S+)", output, re.MULTILINE):
-        parsed["sessions"].append({
-            "id": m[0],
-            "type": m[1],
-            "target": m[2]
-        })
-
-    # credentials
-    for m in re.findall(r"Username:\s*(\S+).*?Password:\s*(\S+)", output, re.DOTALL):
-        parsed["credentials"].append({
-            "username": m[0],
-            "password": m[1]
-        })
-
-    # loot paths
-    for m in re.findall(r"Stored in:\s*(/.*)", output):
-        parsed["loot"].append({"path": m})
-
-    # generic positive findings
-    for m in re.findall(r"\[\+\]\s+(.*)", output):
-        parsed["findings"].append({"info": m})
-
+    
+    if tool_category == "all":
+        tools = []
+        for cat_tools in tools_to_check.values():
+            tools.extend(cat_tools)
+    else:
+        tools = tools_to_check.get(tool_category, [])
+    
+    available = {}
+    for tool in tools:
+        try:
+            result = subprocess.run(
+                ["which", tool],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                path = result.stdout.strip()
+                available[tool] = {
+                    "status": "available",
+                    "path": path
+                }
+        except Exception:
+            pass
+    
     return {
-        "status": "ok",
-        "commands_run": commands,
-        "started_at": start_dt.isoformat() + "Z",
-        "finished_at": end_dt.isoformat() + "Z",
-        "duration_sec": (end_dt - start_dt).total_seconds(),
-        "parsed": parsed,
-        "raw_output": output
+        "status": "success",
+        "category": tool_category,
+        "available_tools": available,
+        "count": len(available)
     }
 
+@mcp.tool()
+def execute_system_command(command: str, timeout: int = 300) -> dict:
+    """
+    Executes any pentesting or system command.
+    The LLM should check for tool availability before running complex chains.
+    
+    Args:
+        command: The command to execute (with sudo prefix if needed)
+        timeout: Maximum execution time in seconds (default 300)
+    """
+    try:
+        result = subprocess.run(
+            shlex.split(command),
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        
+        return {
+            "status": "success" if result.returncode == 0 else "warning",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.returncode
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 # ======================================================================
 #  GITHUB SEARCH — GitHub API (online)
 # ======================================================================

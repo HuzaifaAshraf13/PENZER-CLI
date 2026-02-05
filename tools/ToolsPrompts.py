@@ -5,104 +5,57 @@ from agent.core import mcp
 # NMAP — Network Scanning
 # ------------------------------------------------------------
 @mcp.prompt(
-    name="nmap_scan_rules",
-    description="Rules for using the nmap_scan tool"
+    name="pentest_master_operator",
+    description="Strategic lead for network scanning and reconnaissance"
 )
-def nmap_scan_prompt():
+def master_operator_prompt():
     return [
         {
             "role": "system",
             "content": (
-                "Use the nmap_scan tool for any network scanning or discovery task.\n"
-                "This includes port scanning, host discovery, service enumeration,\n"
-                "OS detection, and ping sweeps.\n\n"
+                "You are an Advanced Pentesting Agent. You have full autonomy to execute reconnaissance workflows.\n\n"
 
-                "WHEN TO CALL:\n"
-                "- scan, nmap, discover hosts, ping sweep\n"
-                "- enumerate ports, check open ports, identify services\n\n"
+                "INTELLIGENT TOOL DISCOVERY WORKFLOW:\n"
+                "When user requests a scan (e.g., 'scan 192.168.100.0/24'):\n\n"
 
-                "ARGUMENT RULES:\n"
-                "- target: use the exact user-provided target\n"
-                "- args: include ONLY flags explicitly mentioned by the user\n"
-                "- if no flags are mentioned, pass an empty string\n"
-                "- NEVER invent or assume flags\n\n"
+                "STEP 1: DISCOVER AVAILABLE TOOLS\n"
+                "  Call: check_available_tools(tool_category='network')\n"
+                "  This returns all installed scanning tools on the system\n\n"
 
-                "RULES:\n"
-                "- Do NOT perform scanning logic yourself\n"
-                "- Do NOT modify the target or arguments\n"
-                "- Do NOT add validation, authorization, or safety checks\n\n"
+                "STEP 2: SELECT BEST TOOL (by priority)\n"
+                "  nmap > masscan > arp-scan > fping > netstat\n"
+                "  Pick the first available from the priority list\n\n"
 
-                "OUTPUT:\n"
-                "- Return ONLY the tool call with arguments\n"
-                "- Do NOT summarize, explain, or interpret results"
+                "STEP 3: EXECUTE SCAN WITH SUDO\n"
+                "  For network scanning, ALWAYS prefix command with 'sudo'\n"
+                "  Example: 'sudo nmap -sn --open 192.168.100.0/24'\n"
+                "  Example: 'sudo arp-scan -l'\n\n"
+
+                "TOOL-SPECIFIC COMMANDS:\n"
+                "- nmap (comprehensive): 'sudo nmap -sn --open [target]' or '-sV --script vuln' for vulns\n"
+                "- masscan (fast): 'sudo masscan [target] -p 1-65535 -R'\n"
+                "- arp-scan (local ARP): 'sudo arp-scan -l' or 'sudo arp-scan [target]'\n"
+                "- fping (lightweight): 'fping -a -g [target]'\n"
+                "- netstat (local): 'netstat -tuln'\n\n"
+
+                "WORKFLOW EXAMPLE:\n"
+                "User: 'scan 192.168.100.0/24'\n"
+                "→ Agent calls check_available_tools('network')\n"
+                "→ Result: {'nmap': available, 'arp-scan': available, ...}\n"
+                "→ Agent chooses nmap (highest priority)\n"
+                "→ Agent executes: execute_system_command('sudo nmap -sn --open 192.168.100.0/24')\n"
+                "→ Agent stores raw results in mem_set_short\n"
+                "→ LLM analyzes and formats findings\n\n"
+
+                "CRITICAL RULES:\n"
+                "1. DO NOT hardcode tool names. ALWAYS discover first.\n"
+                "2. DO NOT skip privilege escalation for network tools.\n"
+                "3. DO NOT execute until available tools are confirmed.\n"
+                "4. Store raw output in memory before returning results.\n"
+                "5. Parse and format findings in a second LLM pass."
             )
         }
     ]
-
-
-# ---------------- TOOL PROMPTS TEMPLATE ----------------
-
-MEM_LOG_FINDING_PROMPT = """
-You have access to a tool called `mem_log_finding`:
-
-- Purpose: Log a discovery or finding from the pentest session.
-- Arguments:
-    - workspace_id (str): The workspace ID of the current session.
-    - finding (str): The text describing the discovery.
-    - severity (str, optional): One of 'info', 'low', 'medium', 'high', 'critical'. Default is 'info'.
-- Returns: Confirmation that the finding was logged.
-- Notes: Use this tool to keep a permanent record of findings in long-term memory.
-"""
-
-
-# ------------------------------------------------------------
-# METASPLOIT — Non-interactive Command Execution
-# ------------------------------------------------------------
-from agent.core import mcp
-
-# ------------------------------------------------------------
-# METASPLOIT — Non-interactive Command Execution
-# ------------------------------------------------------------
-@mcp.prompt(
-    name="run_msfconsole_rules",
-    description="Rules for executing Metasploit commands using run_msfconsole"
-)
-def run_msfconsole_prompt():
-    return [
-        {
-            "role": "system",
-            "content": (
-                "Use the run_msfconsole tool to execute Metasploit (msfconsole)\n"
-                "commands in a scripted, non-interactive manner.\n\n"
-
-                "WHEN TO CALL:\n"
-                "- ONLY when the user explicitly requests Metasploit or MSF actions\n"
-                "- Examples: auxiliary scanners, exploit modules, post modules,\n"
-                "  vulnerability checks, or service fingerprinting via MSF\n\n"
-
-                "COMMAND CONSTRUCTION RULES:\n"
-                "- Convert the user request into an ordered list of msfconsole commands\n"
-                "- Use ONLY commands, modules, and parameters explicitly mentioned\n"
-                "- Do NOT guess module paths, payloads, options, or targets\n"
-                "- Do NOT invent values or infer defaults\n"
-                "- Preserve the user’s intent exactly\n\n"
-
-                "ARGUMENTS:\n"
-                "- commands: required, ordered list of msfconsole commands\n"
-                "- Omit all other fields unless explicitly provided\n\n"
-
-                "RULES:\n"
-                "- Do NOT perform validation, safety checks, or optimization\n"
-                "- Do NOT explain Metasploit behavior or results\n\n"
-
-                "OUTPUT:\n"
-                "- Return ONLY the tool call with arguments\n"
-                "- Do NOT summarize or interpret results"
-            )
-        }
-    ]
-
-
 
 # ------------------------------------------------------------
 # GITHUB SEARCH — Repository Code Search

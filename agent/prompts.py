@@ -34,6 +34,26 @@ You MUST follow this loop strictly:
 
 If additional actions are required, continue the loop.
 
+## CRITICAL ACTION MAPPING
+When user requests network scanning:
+1. **FIRST**: Call check_available_tools("network") to see what tools are available
+2. **THEN**: Choose the best available tool based on output
+3. **FINALLY**: Execute the scan using execute_system_command with the chosen tool
+
+TOOL PRIORITY (best to worst):
+- nmap (most comprehensive, preferred)
+- masscan (faster for large ranges)
+- arp-scan (ARP discovery, fastest for local networks)
+- fping (simple ping, lightweight)
+- netstat (local network info)
+
+Example workflow for "scan 192.168.100.0/24":
+1. check_available_tools("network")
+2. If nmap available → execute: "sudo nmap -sn --open 192.168.100.0/24"
+3. If only arp-scan → execute: "sudo arp-scan -l"
+4. Store results in memory
+5. Respond with findings
+
 ---------------------------------------------------------------------
 
 ## 2. AUTOMATIC MEMORY MANAGEMENT

@@ -163,58 +163,127 @@ Available prompts: {', '.join(prompt_names)}
             return None
             
     # -----------------------------------------------------------
-    # LLM DECISION PARSER
+    # LLM DECISION PARSER — MULTI-STEP WORKFLOW
     # -----------------------------------------------------------
     async def process_input(self, user_input: str):
         workspace_id = "pentest_1"
+        max_iterations = 5  # Prevent infinite loops
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
 
-        # 1️⃣ Load memory
-        short_mem = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
-        long_mem = await self.run_tool("mem_get_long", {"workspace_id": workspace_id})
+            # 1️⃣ Load memory
+            short_mem = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
+            long_mem = await self.run_tool("mem_get_long", {"workspace_id": workspace_id})
 
-        # 2️⃣ Build context
-        chain_context = (
-            f"[SHORT MEMORY]: {json.dumps(short_mem)}\n"
-            f"[LONG MEMORY]: {json.dumps(long_mem)}\n"
-            f"User Request: {user_input}\n\n"
-            f"Next Action (JSON):"
-        )
+            # 2️⃣ Build context
+            chain_context = (
+                f"[SHORT MEMORY]: {json.dumps(short_mem)}\n"
+                f"[LONG MEMORY]: {json.dumps(long_mem)}\n"
+                f"User Request: {user_input}\n\n"
+                f"Next Action (JSON):"
+            )
 
-        # 3️⃣ Single LLM call
-        decision_raw = await asyncio.to_thread(
-            self.llm.generate_content,
-            system_instruction=self.formatted_system_prompt,
-            prompt=chain_context
-        )
+            # 3️⃣ Single LLM call
+            decision_raw = await asyncio.to_thread(
+                self.llm.generate_content,
+                system_instruction=self.formatted_system_prompt,
+                prompt=chain_context
+            )
 
-        decision = self._parse_llm_decision(decision_raw)
-        if not decision:
-            print("Agent: Invalid LLM output.")
+            decision = self._parse_llm_decision(decision_raw)
+            if not decision:
+                print("Agent: Invalid LLM output.")
+                return
+
+            tool_name = decision.get("tool")
+            args = decision.get("args", {}) or {}
+            response = decision.get("response")
+
+            # 4️⃣ Execute tool
+            if tool_name:
+                result = await self.run_tool(tool_name, args)
+                print(f"\n[ACTION] {tool_name} executed. Output:\n{json.dumps(result, indent=2)}")
+
+                # Store result in memory for context in next iteration
+                await self.run_tool("mem_set_short", {
+                    "workspace_id": workspace_id,
+                    "data": {
+                        "last_tool": tool_name,
+                        "last_result": json.dumps(result)
+                    }
+                })
+
+                # DISCOVERY TOOLS: Continue loop for follow-up action
+                # These tools gather information but don't provide final results
+                discovery_tools = ["check_available_tools", "search_github_repository", "search_exploit_db"]
+                
+                if tool_name in discovery_tools:
+                    # Store discovery result and continue loop to act on it
+                    await self.run_tool("mem_set_short", {
+                        "workspace_id": workspace_id,
+                        "data": {f"{tool_name}_result": json.dumps(result)}
+                    })
+                    continue  # Loop again to execute follow-up action
+
+                # ACTION TOOLS: Analyze results and return
+                # These tools produce final actionable results
+                action_tools = ["execute_system_command", "mem_get_short", "mem_get_long", "mem_set_short", "mem_set_long"]
+                
+                if tool_name in action_tools or result.get("status") in ["success", "warning"]:
+                    # Determine analysis type based on tool and result
+                    if tool_name == "execute_system_command":
+                        analysis_prompt = (
+                            f"System command executed: {args.get('command', 'N/A')}\n"
+                            f"Result:\n{json.dumps(result, indent=2)}\n\n"
+                            f"Provide a concise, human-readable summary of findings. "
+                            f"Focus on: discovered hosts, services, open ports, vulnerabilities, exploits, or other key security insights. "
+                            f"Use tables for structured data. Be direct and technical."
+                        )
+                    else:
+                        analysis_prompt = (
+                            f"Tool '{tool_name}' executed and returned:\n"
+                            f"{json.dumps(result, indent=2)}\n\n"
+                            f"Provide a concise summary of findings and next steps if applicable. "
+                            f"Be direct and technical."
+                        )
+                    
+                    summary = await asyncio.to_thread(
+                        self.llm.generate_content,
+                        system_instruction=self.formatted_system_prompt,
+                        prompt=analysis_prompt
+                    )
+                    
+                    if summary and summary.strip():
+                        print(f"\n[FINDINGS]\n{summary}")
+                    return
+
+                # Default: analyze any other tool result
+                analysis_prompt = (
+                    f"Tool '{tool_name}' was executed with result:\n"
+                    f"{json.dumps(result, indent=2)}\n\n"
+                    f"Provide a concise, human-readable summary of findings."
+                )
+                
+                summary = await asyncio.to_thread(
+                    self.llm.generate_content,
+                    system_instruction=self.formatted_system_prompt,
+                    prompt=analysis_prompt
+                )
+                
+                if summary and summary.strip():
+                    print(f"\n[FINDINGS]\n{summary}")
+                return
+
+            # 5️⃣ Or plain response
+            if response:
+                print(f"\nAgent: {response}")
+                return
+            
+            # If we get here, something went wrong
+            print("Agent: Unable to determine next action.")
             return
-
-        tool_name = decision.get("tool")
-        args = decision.get("args", {}) or {}
-        response = decision.get("response")
-
-        # 4️⃣ Execute tool once
-        if tool_name:
-            result = await self.run_tool(tool_name, args)
-
-            print(f"\n[ACTION] {tool_name} executed. Output:\n{json.dumps(result, indent=2)}")
-
-            # store last action
-            await self.run_tool("mem_set_short", {
-                "workspace_id": workspace_id,
-                "data": {
-                    "last_tool": tool_name,
-                    "last_result": json.dumps(result)
-                }
-            })
-            return
-
-        # 5️⃣ Or plain response
-        if response:
-            print(f"\nAgent: {response}")
 
 # -----------------------------------------------------------
 # ENTRY POINT
