@@ -40,3 +40,4 @@ logs/
 memory_store/
 data/
 chromma_vector_store/
+model/
