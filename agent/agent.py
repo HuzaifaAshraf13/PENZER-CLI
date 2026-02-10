@@ -163,127 +163,154 @@ Available prompts: {', '.join(prompt_names)}
             return None
             
     # -----------------------------------------------------------
-    # LLM DECISION PARSER — MULTI-STEP WORKFLOW
+    # LLM DECISION PARSER — AUTONOMOUS ReAct LOOP
     # -----------------------------------------------------------
     async def process_input(self, user_input: str):
+        """
+        Autonomous ReAct (Thought-Action-Observation) framework.
+        Continues until the LLM returns a final_answer.
+        
+        Message history format:
+        - System message injected at start with Current Context from memory
+        - User message: initial request
+        - Agent messages with 'thought' and optionally 'tool' + 'args'
+        - Observation messages with tool results
+        - Final agent message with 'thought' and 'final_answer'
+        """
         workspace_id = "pentest_1"
-        max_iterations = 5  # Prevent infinite loops
+        max_iterations = 10  # Prevent infinite loops
         iteration = 0
+        
+        # Initialize message history (for maintaining conversation state)
+        messages: List[Dict[str, Any]] = []
+        
+        # 1️⃣ Auto-fetch memory at the start
+        short_mem_result = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
+        current_context = short_mem_result.get("data", {}) if isinstance(short_mem_result, dict) else {}
+        
+        # Inject current context into system prompt
+        system_prompt_with_context = f"""{self.formatted_system_prompt}
+
+# === CURRENT CONTEXT ===
+{json.dumps(current_context, indent=2) if current_context else "No prior context"}
+"""
+        
+        # Add initial user message to history
+        messages.append({
+            "role": "user",
+            "content": user_input
+        })
         
         while iteration < max_iterations:
             iteration += 1
-
-            # 1️⃣ Load memory
-            short_mem = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
-            long_mem = await self.run_tool("mem_get_long", {"workspace_id": workspace_id})
-
-            # 2️⃣ Build context
-            chain_context = (
-                f"[SHORT MEMORY]: {json.dumps(short_mem)}\n"
-                f"[LONG MEMORY]: {json.dumps(long_mem)}\n"
-                f"User Request: {user_input}\n\n"
-                f"Next Action (JSON):"
-            )
-
-            # 3️⃣ Single LLM call
+            
+            # 2️⃣ Build prompt with message history
+            conversation_text = self._build_conversation_prompt(messages)
+            
+            # 3️⃣ LLM Call — expect JSON with thought, tool (optional), final_answer (optional)
             decision_raw = await asyncio.to_thread(
                 self.llm.generate_content,
-                system_instruction=self.formatted_system_prompt,
-                prompt=chain_context
+                system_instruction=system_prompt_with_context,
+                prompt=conversation_text
             )
-
+            
             decision = self._parse_llm_decision(decision_raw)
             if not decision:
-                print("Agent: Invalid LLM output.")
-                return
-
-            tool_name = decision.get("tool")
-            args = decision.get("args", {}) or {}
-            response = decision.get("response")
-
-            # 4️⃣ Execute tool
-            if tool_name:
-                result = await self.run_tool(tool_name, args)
-                print(f"\n[ACTION] {tool_name} executed. Output:\n{json.dumps(result, indent=2)}")
-
-                # Store result in memory for context in next iteration
-                await self.run_tool("mem_set_short", {
-                    "workspace_id": workspace_id,
-                    "data": {
-                        "last_tool": tool_name,
-                        "last_result": json.dumps(result)
-                    }
-                })
-
-                # DISCOVERY TOOLS: Continue loop for follow-up action
-                # These tools gather information but don't provide final results
-                discovery_tools = ["check_available_tools", "search_github_repository", "search_exploit_db"]
-                
-                if tool_name in discovery_tools:
-                    # Store discovery result and continue loop to act on it
-                    await self.run_tool("mem_set_short", {
-                        "workspace_id": workspace_id,
-                        "data": {f"{tool_name}_result": json.dumps(result)}
-                    })
-                    continue  # Loop again to execute follow-up action
-
-                # ACTION TOOLS: Analyze results and return
-                # These tools produce final actionable results
-                action_tools = ["execute_system_command", "mem_get_short", "mem_get_long", "mem_set_short", "mem_set_long"]
-                
-                if tool_name in action_tools or result.get("status") in ["success", "warning"]:
-                    # Determine analysis type based on tool and result
-                    if tool_name == "execute_system_command":
-                        analysis_prompt = (
-                            f"System command executed: {args.get('command', 'N/A')}\n"
-                            f"Result:\n{json.dumps(result, indent=2)}\n\n"
-                            f"Provide a concise, human-readable summary of findings. "
-                            f"Focus on: discovered hosts, services, open ports, vulnerabilities, exploits, or other key security insights. "
-                            f"Use tables for structured data. Be direct and technical."
-                        )
-                    else:
-                        analysis_prompt = (
-                            f"Tool '{tool_name}' executed and returned:\n"
-                            f"{json.dumps(result, indent=2)}\n\n"
-                            f"Provide a concise summary of findings and next steps if applicable. "
-                            f"Be direct and technical."
-                        )
-                    
-                    summary = await asyncio.to_thread(
-                        self.llm.generate_content,
-                        system_instruction=self.formatted_system_prompt,
-                        prompt=analysis_prompt
-                    )
-                    
-                    if summary and summary.strip():
-                        print(f"\n[FINDINGS]\n{summary}")
-                    return
-
-                # Default: analyze any other tool result
-                analysis_prompt = (
-                    f"Tool '{tool_name}' was executed with result:\n"
-                    f"{json.dumps(result, indent=2)}\n\n"
-                    f"Provide a concise, human-readable summary of findings."
-                )
-                
-                summary = await asyncio.to_thread(
-                    self.llm.generate_content,
-                    system_instruction=self.formatted_system_prompt,
-                    prompt=analysis_prompt
-                )
-                
-                if summary and summary.strip():
-                    print(f"\n[FINDINGS]\n{summary}")
-                return
-
-            # 5️⃣ Or plain response
-            if response:
-                print(f"\nAgent: {response}")
+                print("Agent: Invalid LLM output. Expected JSON with 'thought' key.")
                 return
             
-            # If we get here, something went wrong
-            print("Agent: Unable to determine next action.")
-            return
+            # Extract ReAct components
+            thought = decision.get("thought", "")
+            tool_name = decision.get("tool")
+            tool_args = decision.get("args", {}) or {}
+            final_answer = decision.get("final_answer")
+            
+            # Append thought to message history
+            if thought:
+                messages.append({
+                    "role": "assistant",
+                    "content": f"[THOUGHT] {thought}"
+                })
+            
+            # 4️⃣ Check if task is complete
+            if final_answer:
+                messages.append({
+                    "role": "assistant",
+                    "content": f"[FINAL ANSWER] {final_answer}"
+                })
+                print(f"\nAgent: {final_answer}")
+                return
+            
+            # 5️⃣ Execute tool if specified
+            if tool_name:
+                print(f"\n[ACTION] Executing: {tool_name}")
+                result = await self.run_tool(tool_name, tool_args)
+                
+                # 6️⃣ Check for errors
+                if isinstance(result, dict) and "error" in result:
+                    error_msg = result.get("error", "Unknown error")
+                    print(f"[ERROR] {error_msg}")
+                    # Append error as observation so LLM can self-correct
+                    messages.append({
+                        "role": "user",
+                        "content": f"[OBSERVATION - ERROR] Tool '{tool_name}' failed: {error_msg}. Please try a different approach."
+                    })
+                else:
+                    # Success: append result as observation
+                    print(f"[OBSERVATION] {json.dumps(result, indent=2)[:500]}...")  # Truncate output for readability
+                    messages.append({
+                        "role": "user",
+                        "content": f"[OBSERVATION] Tool '{tool_name}' returned:\n{json.dumps(result, indent=2)}"
+                    })
+                    
+                    # 7️⃣ Auto-save tool result to short-term memory
+                    await self._auto_save_to_memory(workspace_id, tool_name, result)
+            else:
+                # No tool specified and no final answer — agent is stuck
+                print("Agent: No tool specified and no final answer. Ending loop.")
+                return
+        
+        # Max iterations reached
+        print(f"Agent: Reached maximum iterations ({max_iterations}). Ending session.")
+        return
+    
+    def _build_conversation_prompt(self, messages: List[Dict[str, Any]]) -> str:
+        """
+        Convert message history into a prompt string.
+        Format: role: content
+        """
+        prompt_lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            prompt_lines.append(f"{role}: {content}")
+        
+        prompt_lines.append("\nNext decision (return JSON with 'thought', optionally 'tool'+'args', or 'final_answer'):")
+        return "\n".join(prompt_lines)
+    
+    async def _auto_save_to_memory(self, workspace_id: str, tool_name: str, result: Any) -> None:
+        """
+        Automatically save tool execution result to short-term memory.
+        Runs in background without blocking.
+        """
+        try:
+            # Create a safe key from tool name
+            safe_key = tool_name.replace(" ", "_")
+            
+            # Save the result
+            await self.run_tool("mem_set_short", {
+                "workspace_id": workspace_id,
+                "data": {
+                    f"last_execution": {
+                        "tool": tool_name,
+                        "timestamp": str(__import__('datetime').datetime.now()),
+                        "result_summary": str(result)[:200]  # Store summary, not full result
+                    }
+                }
+            })
+        except Exception as e:
+            # Fail silently for auto-save errors
+            print(f"[DEBUG] Auto-save to memory failed: {e}")
 
 # -----------------------------------------------------------
 # ENTRY POINT
