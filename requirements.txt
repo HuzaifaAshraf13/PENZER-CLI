@@ -74,6 +74,7 @@ jsonschema-path==0.3.4
 jsonschema-specifications==2025.9.1
 keyring==25.6.0
 kubernetes==35.0.0
+llama-cpp-python==0.2.82
 litellm==1.81.3
 loguru==0.7.3
 markdown-it-py==4.0.0

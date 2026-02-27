@@ -1,36 +1,66 @@
-# agent/llm.py
 import os
+import glob
 from dotenv import load_dotenv
-from google import genai
 from typing import Optional
+from llama_cpp import Llama
+import psutil
 
 class LLM:
     def __init__(self):
         load_dotenv()
-        self.gemini_api_key = os.getenv("GEMINI_API_KEY")
-        if not self.gemini_api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment variables.")
-        self.client = genai.Client(api_key=self.gemini_api_key)
+        self.model = self._load_model()
 
-    # FIX: Add system_instruction as a keyword argument.
-    def generate_content(self, prompt: str, system_instruction: Optional[str] = None):
-        """
-        Generates content from the Gemini model, including a system instruction 
-        for role-setting/tool use context.
-        """
+    def _load_model(self):
+        model_dir = "model/"
+        model_path = None
         
-        # --- Configure the model with the system instruction (if provided) ---
-        config = {}
-        if system_instruction:
-            # FIX: Use the 'system_instruction' key within the configuration dictionary
-            config['system_instruction'] = system_instruction
+        # Search for .gguf models in the model directory
+        gguf_models = glob.glob(os.path.join(model_dir, "*.gguf"))
+        if not gguf_models:
+            raise FileNotFoundError(f"No GGUF models found in the directory: {model_dir}")
         
-        # Check if the config dictionary is empty before passing it
-        config_param = config if config else None
+        # For simplicity, load the first GGUF model found
+        model_path = gguf_models[0]
+        print(f"Loading model from: {model_path}")
 
-        response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[prompt],
-            config=config_param # Pass the configuration
+        # Determine max_tokens based on available RAM
+        available_ram_gb = psutil.virtual_memory().available / (1024**3)
+        # This is a simplified heuristic. Adjust based on actual model memory usage.
+        if available_ram_gb > 16:
+            max_tokens = 4096
+        elif available_ram_gb > 8:
+            max_tokens = 2048
+        else:
+            max_tokens = 1024 # Minimum reasonable token count
+
+        print(f"Available RAM: {available_ram_gb:.2f} GB, setting max_tokens: {max_tokens}")
+
+        llm = Llama(
+            model_path=model_path,
+            n_ctx=max_tokens,  # Context window
+            n_gpu_layers=-1,  # Uncomment to use GPU, -1 for all layers
+            verbose=False
         )
-        return response.text
+        return llm
+
+    def generate_content(self, prompt: str, system_instruction: Optional[str] = None):
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": prompt})
+
+        # Calculate prompt tokens (a rough estimate)
+        prompt_tokens = self.model.tokenize(self.model.encode(str(messages)).encode("utf-8"))
+        
+        # Leave some room for the prompt and a buffer
+        max_response_tokens = self.model.n_ctx - len(prompt_tokens) - 50  # 50 for a small buffer
+        if max_response_tokens < 100: # Ensure a minimum response length
+            max_response_tokens = 100
+
+        response = self.model.create_chat_completion(
+            messages=messages,
+            max_tokens=max_response_tokens, # Use the calculated max_response_tokens
+            stop=["<|im_end|>"], # Adjust stop tokens based on your model
+            temperature=0.7,
+        )
+        return response["choices"][0]["message"]["content"]
