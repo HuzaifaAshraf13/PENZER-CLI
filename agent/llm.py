@@ -38,17 +38,11 @@ class LLM:
     def _calculate_max_tokens(
         self,
         model_path: str,
-        reserved_gb: float = 2.0,
+        reserved_gb: float = 0.5,
         ram_per_token_gb: float = 0.00006,
         token_cap: int = 8192,
     ) -> int:
         """Estimate how many tokens can fit in the available RAM.
-
-        The calculation takes into account a rough per-token RAM usage and
-        optionally adjusts for model quantization.  For example, some
-        GGUF models are quantized (q6/q8/etc.) which dramatically reduces
-        memory usage; we treat a token as consuming only ~6% of the standard
-        amount when a quantized model is detected.
 
         Args:
             model_path: the path to the model file (used to detect quantization).
@@ -60,27 +54,10 @@ class LLM:
         available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
         usable_ram_gb = max(available_ram_gb - reserved_gb, 0.5)
 
-        # detect quantized model types and apply a scaling factor
-        # Assumption: qwen2.5 q4_k_m is a very memory-efficient 4-bit kernel-ma
-        # variant — treat it as highly quantized to allow more tokens to fit.
-        # NOTE: These factors are heuristic. For q4_k_m we use 0.06 to aggressively
-        # scale token capacity per user's request (allows more tokens in low RAM).
-        quant_factor = 1.0
-        fname = os.path.basename(model_path).lower()
-        # aggressive heuristics for known quant types
-        if "q4_k_m" in fname or ("qwen" in fname and "q4" in fname):
-            quant_factor = 0.06
-        elif "q6" in fname or "0.06" in fname or "quant" in fname:
-            quant_factor = 0.06
-        elif "q4" in fname:
-            quant_factor = 0.25
-        elif "q8" in fname:
-            quant_factor = 0.125
+        # Calculate max tokens based on usable RAM and per-token RAM usage
+        max_tokens = int(usable_ram_gb / ram_per_token_gb)
 
-        max_tokens = int(usable_ram_gb / (ram_per_token_gb * quant_factor))
-        max_tokens = min(max_tokens, token_cap)
-
-        # additional caps for very low memory systems
+        # Apply safe caps based on usable RAM size
         if usable_ram_gb < 1.0:
             max_tokens = min(max_tokens, 1024)
         elif usable_ram_gb < 2.0:
@@ -88,9 +65,13 @@ class LLM:
         elif usable_ram_gb < 4.0:
             max_tokens = min(max_tokens, 4096)
 
+        # Ensure token_cap parameter limits the returned tokens
+        max_tokens = min(max_tokens, token_cap)
+
+        # Update logging to show actual usable RAM, calculated max tokens, and reserved RAM
         logging.info(
             f"Available RAM: {available_ram_gb:.2f} GB, usable: {usable_ram_gb:.2f} GB, "
-            f"quant_factor: {quant_factor}, max_tokens: {max_tokens}"
+            f"reserved: {reserved_gb:.2f} GB, max_tokens: {max_tokens}"
         )
         return max_tokens
 
