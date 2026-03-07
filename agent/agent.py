@@ -7,6 +7,14 @@ from typing import Dict, Any, List, Optional
 from agent.core import mcp
 from agent.llm import LLM
 from agent.prompts import SYSTEM_PROMPT
+from agent.skill_selector import (
+    PhaseSpecificSkillsRegistry,
+    PentestPhase,
+    PentestPhaseDetector,
+    SkillSelector,
+    ClaudeSkillsAPIBuilder,
+    create_skill_aware_system_prompt
+)
 
 # Import and register prompts FIRST (before anything uses mcp)
 import session.sessionprompts  # registers session prompts
@@ -25,12 +33,24 @@ class Agent:
         self.tool_schema: Dict[str, Any] = {}
         self.resource_uris: List[str] = []
         self.formatted_system_prompt: str = ""
+        
+        # Phase-specific Claude Agent Skills
+        self.skills_registry = PhaseSpecificSkillsRegistry()
+        self.skill_selector: Optional[SkillSelector] = None
+        self.current_phase: Optional[PentestPhase] = None
+        self.current_skill: Optional[Dict[str, Any]] = None
 
     async def async_init(self):
         # Async-safe initialization
         self.tool_schema = await self._load_tool_schema()
         self.resource_uris = self._load_resource_uris()
         self.formatted_system_prompt = self._build_system_prompt()
+        
+        # Initialize phase-specific skill selector
+        self.skill_selector = SkillSelector(self.skills_registry)
+        
+        print(f"[AGENT] Initialized with phase-specific pentest skills")
+        print(f"[AGENT] Available phases: {', '.join([p.value for p in PentestPhase if p != PentestPhase.UNKNOWN])}")
         return self
 
     # -----------------------------------------------------------
@@ -73,29 +93,14 @@ class Agent:
         return serial
 
     def _build_system_prompt(self) -> str:
-        """Build system prompt with registered tools and resources."""
-        # Retrieve registered prompts from MCP server
-        prompts_dict = getattr(self.mcp_client, "prompts", {})
-        
-        # Extract prompt names that are registered
-        prompt_names = list(prompts_dict.keys())
-        
-        # create a safe, JSON-serializable summary of registered tools
-        tools_info = self._serialize_tools_for_prompt(self.tool_schema or {})
+        """Minimal system prompt - Claude Skills handle full instructions on-demand."""
+        return SYSTEM_PROMPT.strip()
 
-        merged = f"""
-{SYSTEM_PROMPT}
-
-# === REGISTERED PROMPTS ===
-Available prompts: {', '.join(prompt_names)}
-
-# === REGISTERED TOOLS (names + args) ===
-{json.dumps(tools_info, indent=2)}
-
-# === RESOURCES ===
-{chr(10).join(self.resource_uris)}
-"""
-        return merged.strip()
+    def _build_skill_filtered_system_prompt(self, phase: PentestPhase) -> str:
+        """
+        Minimal phase context - Claude Skills load full instructions on-demand.
+        """
+        return f"Pentest Phase: {phase.value.upper()}"
 
     # -----------------------------------------------------------
     # TOOL EXECUTION (supports FastMCP.get_tools())
@@ -163,33 +168,52 @@ Available prompts: {', '.join(prompt_names)}
             return None
             
     # -----------------------------------------------------------
-    # LLM DECISION PARSER — AUTONOMOUS ReAct LOOP
+    # LLM DECISION PARSER — AUTONOMOUS ReAct LOOP WITH PHASE-SPECIFIC SKILLS
     # -----------------------------------------------------------
     async def process_input(self, user_input: str):
         """
-        Autonomous ReAct (Thought-Action-Observation) framework.
-        Continues until the LLM returns a final_answer.
-        
-        Message history format:
-        - System message injected at start with Current Context from memory
-        - User message: initial request
-        - Agent messages with 'thought' and optionally 'tool' + 'args'
-        - Observation messages with tool results
-        - Final agent message with 'thought' and 'final_answer'
+        Autonomous ReAct framework with phase-specific Claude Agent Skills.
+        Workflow: Scan → Enumeration → Exploitation → Post-Exploitation → Reporting
         """
         workspace_id = "pentest_1"
         max_iterations = 10  # Prevent infinite loops
         iteration = 0
         
-        # Initialize message history (for maintaining conversation state)
+        # Initialize message history
         messages: List[Dict[str, Any]] = []
         
-        # 1️⃣ Auto-fetch memory at the start
+        # 1️⃣ DETECT PENTEST PHASE
+        detected_phase = PentestPhaseDetector.detect_phase(user_input)
+        self.current_phase = detected_phase
+        
+        # 2️⃣ SELECT SKILL FOR PHASE
+        if not self.skill_selector:
+            print("[AGENT] Skill selector not initialized")
+            return
+        
+        selected_skill, phase = self.skill_selector.select_skill(user_request=user_input)
+        self.current_phase = phase
+        self.current_skill = selected_skill
+        
+        if selected_skill:
+            print(f"[PHASE DETECTOR] Phase: {phase.value}")
+            print(f"[SKILL SELECTOR] Selected '{selected_skill.get('name')}'")
+        else:
+            print("[SKILL SELECTOR] No matching skill found")
+            return
+        
+        # 3️⃣ Auto-fetch memory context
         short_mem_result = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
         current_context = short_mem_result.get("data", {}) if isinstance(short_mem_result, dict) else {}
         
-        # Inject current context into system prompt
-        system_prompt_with_context = f"""{self.formatted_system_prompt}
+        # 4️⃣ Build skill context only (Claude loads full skill instructions on-demand)
+        system_prompt_with_skills = create_skill_aware_system_prompt(
+            selected_skill,
+            base_context=""
+        )
+        
+        # 5️⃣ Add current context
+        system_prompt_with_context = f"""{system_prompt_with_skills}
 
 # === CURRENT CONTEXT ===
 {json.dumps(current_context, indent=2) if current_context else "No prior context"}
@@ -204,10 +228,10 @@ Available prompts: {', '.join(prompt_names)}
         while iteration < max_iterations:
             iteration += 1
             
-            # 2️⃣ Build prompt with message history
+            # 6️⃣ Build conversation prompt with message history
             conversation_text = self._build_conversation_prompt(messages)
             
-            # 3️⃣ LLM Call — expect JSON with thought, tool (optional), final_answer (optional)
+            # 7️⃣ LLM Call with Claude Skills (full instructions loaded on-demand)
             decision_raw = await asyncio.to_thread(
                 self.llm.generate_content,
                 system_instruction=system_prompt_with_context,
@@ -232,7 +256,7 @@ Available prompts: {', '.join(prompt_names)}
                     "content": f"[THOUGHT] {thought}"
                 })
             
-            # 4️⃣ Check if task is complete
+            # 8️⃣ Check if task is complete
             if final_answer:
                 messages.append({
                     "role": "assistant",
@@ -241,12 +265,12 @@ Available prompts: {', '.join(prompt_names)}
                 print(f"\nAgent: {final_answer}")
                 return
             
-            # 5️⃣ Execute tool if specified
+            # 9️⃣ Execute tool if specified
             if tool_name:
                 print(f"\n[ACTION] Executing: {tool_name}")
                 result = await self.run_tool(tool_name, tool_args)
                 
-                # 6️⃣ Check for errors
+                # 🔟 Check for errors
                 if isinstance(result, dict) and "error" in result:
                     error_msg = result.get("error", "Unknown error")
                     print(f"[ERROR] {error_msg}")
@@ -257,13 +281,13 @@ Available prompts: {', '.join(prompt_names)}
                     })
                 else:
                     # Success: append result as observation
-                    print(f"[OBSERVATION] {json.dumps(result, indent=2)[:500]}...")  # Truncate output for readability
+                    print(f"[OBSERVATION] {json.dumps(result, indent=2)[:500]}...")
                     messages.append({
                         "role": "user",
                         "content": f"[OBSERVATION] Tool '{tool_name}' returned:\n{json.dumps(result, indent=2)}"
                     })
                     
-                    # 7️⃣ Auto-save tool result to short-term memory
+                    # 1️⃣1️⃣ Auto-save tool result to short-term memory
                     await self._auto_save_to_memory(workspace_id, tool_name, result)
             else:
                 # No tool specified and no final answer — agent is stuck

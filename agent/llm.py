@@ -84,11 +84,8 @@ class LLM:
         n_gpu_layers = -1 if GPU_AVAILABLE else 0
 
         # Heuristic adjustments for low-RAM systems and q4_k_m models
-        fname = os.path.basename(model_path).lower()
         use_mmap = True
         use_mlock = False if psutil.virtual_memory().available / (1024 ** 3) < 1.0 else True
-        kv_cache = True
-        low_vram = True
         n_threads = min(4, (os.cpu_count() or 1))
 
         try:
@@ -99,8 +96,6 @@ class LLM:
                 n_threads=n_threads,
                 use_mmap=use_mmap,
                 use_mlock=use_mlock,
-                kv_cache=kv_cache,
-                low_vram=low_vram,
                 verbose=False,
             )
         except Exception as e:
@@ -112,8 +107,6 @@ class LLM:
                 n_threads=n_threads,
                 use_mmap=use_mmap,
                 use_mlock=False,
-                kv_cache=kv_cache,
-                low_vram=True,
                 verbose=False,
             )
 
