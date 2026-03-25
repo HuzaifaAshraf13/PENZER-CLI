@@ -9,15 +9,8 @@ import re
 from typing import Dict, List, Any, Optional, Tuple
 from enum import Enum
 
-
-class PentestPhase(Enum):
-    """Pentest workflow phases"""
-    SCAN = "scan"
-    ENUMERATION = "enumeration"
-    EXPLOITATION = "exploitation"
-    POST_EXPLOITATION = "post_exploitation"
-    REPORTING = "reporting"
-    UNKNOWN = "unknown"
+# Import unified PentestPhase enum from modular skills system
+from agent.skills import PentestPhase
 
 
 class PhaseSpecificSkillsRegistry:
@@ -468,23 +461,42 @@ class SkillSelector:
     """
     Selects the most relevant skill for a given user request and phase.
     Implements Claude Agent Skills API pattern with on-demand instruction loading.
+    Works with modular skill system (Dict[PentestPhase, List[Skill]])
     """
     
-    def __init__(self, registry: PhaseSpecificSkillsRegistry):
-        self.registry = registry
-        self.all_skills = registry.get_all_skills_metadata()
+    def __init__(self, all_skills: Dict[PentestPhase, List[Any]]):
+        """
+        Initialize with modular skills dictionary from agent.skills.load_all_skills()
+        
+        Args:
+            all_skills: Dict mapping PentestPhase to List[Skill] objects
+        """
+        self.all_skills_by_phase = all_skills
+        # Flatten for quick lookup: skill_id -> Skill
+        self.all_skills_flat = {}
+        for phase, skills in all_skills.items():
+            for skill in skills:
+                skill_id = skill.skill_id if hasattr(skill, 'skill_id') else skill.get('skill_id')
+                self.all_skills_flat[skill_id] = skill
     
-    def score_skill_relevance(self, skill: Dict[str, Any], keywords: List[str]) -> float:
+    def score_skill_relevance(self, skill: Any, keywords: List[str]) -> float:
         """
         Score how relevant a skill is to the request keywords.
-        Matches against skill description and keywords.
+        Works with both old dict format and new Skill objects.
         
         Returns:
             Score 0-1 where 1 is perfect match
         """
         score = 0.0
-        skill_text = (skill.get("description", "") + " " + skill.get("name", "")).lower()
-        skill_keywords = skill.get("keywords", [])
+        
+        # Support both old dict format and new Skill objects
+        if hasattr(skill, 'description'):  # New Skill object
+            skill_text = (skill.description + " " + skill.name).lower()
+            skill_keywords = skill.keywords
+        else:  # Old dict format
+            skill_text = (skill.get("description", "") + " " + skill.get("name", "")).lower()
+            skill_keywords = skill.get("keywords", [])
+        
         keyword_set = set(keywords)
         
         # Direct keyword matches (highest weight)
@@ -503,19 +515,19 @@ class SkillSelector:
         
         return score
     
-    def select_skill_for_phase(self, phase: PentestPhase, user_request: str) -> Optional[Dict[str, Any]]:
+    def select_skill_for_phase(self, phase: PentestPhase, user_request: str) -> Optional[Any]:
         """
         Select the best skill for the user request within the detected phase.
+        Works with modular skill system.
         
         Returns:
-            Selected skill metadata or None if no good match
+            Selected Skill object or None if no good match
         """
-        phase_skills = self.registry.get_skills_for_phase(phase)
+        phase_skills = self.all_skills_by_phase.get(phase, [])
         if not phase_skills:
             return None
         
         keywords = PentestPhaseDetector.extract_keywords(user_request)
-        keyword_set = set(keywords)
         
         # Score all skills in the phase
         best_skill = None
@@ -530,12 +542,13 @@ class SkillSelector:
         # Return best skill if it has any relevance
         return best_skill if best_score > 0 else (phase_skills[0] if phase_skills else None)
     
-    def select_skill(self, user_request: str) -> Tuple[Optional[Dict[str, Any]], PentestPhase]:
+    def select_skill(self, user_request: str) -> Tuple[Optional[Any], PentestPhase]:
         """
         Select the best skill for the user request (full workflow).
+        Works with modular skill system.
         
         Returns:
-            Tuple of (selected_skill_metadata, detected_phase)
+            Tuple of (selected_skill_object, detected_phase)
         """
         # 1. Detect phase
         phase = PentestPhaseDetector.detect_phase(user_request)
@@ -545,12 +558,38 @@ class SkillSelector:
         
         # 3. Fallback: if no clear phase detected, use reporting skill
         if phase == PentestPhase.UNKNOWN or not skill:
-            reporting_skills = self.registry.get_skills_for_phase(PentestPhase.REPORTING)
+            reporting_skills = self.all_skills_by_phase.get(PentestPhase.REPORTING, [])
             if reporting_skills:
                 skill = reporting_skills[0]
                 phase = PentestPhase.REPORTING
         
         return skill, phase
+    
+    def skill_to_dict(self, skill: Any) -> Dict[str, Any]:
+        """
+        Convert Skill object to dict format for backward compatibility.
+        Handles both new Skill objects and old dict format.
+        
+        Returns:
+            Dictionary representation of skill
+        """
+        if hasattr(skill, 'to_dict'):
+            return skill.to_dict()
+        elif isinstance(skill, dict):
+            return skill
+        else:
+            # Fallback: create dict from attributes
+            return {
+                "skill_id": getattr(skill, 'skill_id', 'unknown'),
+                "name": getattr(skill, 'name', 'Unknown'),
+                "description": getattr(skill, 'description', ''),
+                "type": "skill",
+                "version": "latest",
+                "keywords": getattr(skill, 'keywords', []),
+                "mcp_tools": getattr(skill, 'mcp_tools', []),
+                "agent_behavior": getattr(skill, 'agent_behavior', ''),
+                "next_phase": getattr(skill, 'next_phase', 'unknown')
+            }
 
 
 class ClaudeSkillsAPIBuilder:
@@ -584,24 +623,34 @@ class ClaudeSkillsAPIBuilder:
         }
     
     @staticmethod
-    def build_system_prompt_for_skill(skill: Dict[str, Any], base_context: str = "") -> str:
+    def build_system_prompt_for_skill(skill: Any, base_context: str = "") -> str:
         """
         Build system prompt that acknowledges the selected skill.
         Includes agent behavior instructions and available MCP tools.
+        Works with both Skill objects and dict format.
         
         Args:
-            skill: Selected skill metadata
+            skill: Selected skill metadata (Skill object or dict)
             base_context: Base context/system prompt
         
         Returns:
             System prompt with skill context and behavior instructions
         """
-        skill_name = skill.get('name', 'Unknown')
-        skill_id = skill.get('skill_id')
-        description = skill.get('description', 'No description')
-        agent_behavior = skill.get('agent_behavior', 'No specific instructions defined')
-        mcp_tools = skill.get('mcp_tools', [])
-        next_phase = skill.get('next_phase', 'unknown')
+        # Support both Skill objects and dict format
+        if hasattr(skill, 'name'):  # Skill object
+            skill_name = skill.name
+            skill_id = skill.skill_id
+            description = skill.description
+            agent_behavior = skill.agent_behavior
+            mcp_tools = skill.mcp_tools
+            next_phase = skill.next_phase
+        else:  # Dict format
+            skill_name = skill.get('name', 'Unknown')
+            skill_id = skill.get('skill_id')
+            description = skill.get('description', 'No description')
+            agent_behavior = skill.get('agent_behavior', 'No specific instructions defined')
+            mcp_tools = skill.get('mcp_tools', [])
+            next_phase = skill.get('next_phase', 'unknown')
         
         tools_section = ""
         if mcp_tools:
@@ -625,15 +674,15 @@ After completing this phase, recommend proceeding to: {next_phase.upper()}
 
 
 def create_skill_aware_system_prompt(
-    skill: Dict[str, Any],
+    skill: Any,
     base_context: str = ""
 ) -> str:
     """
     Build system prompt for selected skill.
-    Full skill instructions loaded by Claude runtime (progressive disclosure).
+    Works with both Skill objects and dict format.
     
     Args:
-        skill: Selected skill metadata
+        skill: Selected skill metadata (Skill object or dict)
         base_context: Base system context
     
     Returns:

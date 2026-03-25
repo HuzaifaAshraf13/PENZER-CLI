@@ -4,6 +4,7 @@ import time
 import sys
 from agent.agent import Agent
 from agent.server import start_server
+from agent.core import cleanup_reme
 
 # --- Utility: typing effect ---
 def type_effect(text, delay=0.02, color="", newline=True):
@@ -57,12 +58,16 @@ async def main():
     agent = await Agent().async_init()
     type_effect("Speak your intent.\n", 0.02, color="\033[91m")
 
-    while True:
-        user_input = input("\033[97mUser> \033[0m")
-        if user_input.lower() in ["exit", "quit"]:
-            type_effect("\n[ Shutting Down ] Penzer slips back into the dark mesh.", 0.02, color="\033[91m")
-            break
-        await agent.process_input(user_input)
+    try:
+        while True:
+            user_input = input("\033[97mUser> \033[0m")
+            if user_input.lower() in ["exit", "quit"]:
+                type_effect("\n[ Shutting Down ] Penzer slips back into the dark mesh.", 0.02, color="\033[91m")
+                break
+            await agent.process_input(user_input)
+    finally:
+        # Cleanup resources
+        await cleanup_reme()
 
 if __name__ == "__main__":
     asyncio.run(main())

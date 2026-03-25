@@ -4,16 +4,14 @@ import asyncio
 import inspect
 from typing import Dict, Any, List, Optional
 
-from agent.core import mcp
+from agent.core import mcp, init_reme, cleanup_reme
 from agent.llm import LLM
 from agent.skill_selector import (
-    PhaseSpecificSkillsRegistry,
-    PentestPhase,
     PentestPhaseDetector,
     SkillSelector,
-    ClaudeSkillsAPIBuilder,
     create_skill_aware_system_prompt
 )
+from agent.skills import PentestPhase, load_all_skills
 
 # Import and register prompts FIRST (before anything uses mcp)
 import session.sessionprompts  # registers session prompts
@@ -33,20 +31,28 @@ class Agent:
         self.resource_uris: List[str] = []
         self.formatted_system_prompt: str = ""
         
-        # Phase-specific Claude Agent Skills
-        self.skills_registry = PhaseSpecificSkillsRegistry()
+        # Load all skills from modular system
+        self.all_skills = load_all_skills()
         self.skill_selector: Optional[SkillSelector] = None
         self.current_phase: Optional[PentestPhase] = None
         self.current_skill: Optional[Dict[str, Any]] = None
 
     async def async_init(self):
+        # Initialize ReMeApp for long-term memory
+        reme_success = await init_reme()
+        if not reme_success:
+            print("[WARN] Long-term memory unavailable, continuing with short-term only")
+        
         # Async-safe initialization
         self.tool_schema = await self._load_tool_schema()
         self.resource_uris = self._load_resource_uris()
         self.formatted_system_prompt = self._build_system_prompt()
         
-        # Initialize phase-specific skill selector
-        self.skill_selector = SkillSelector(self.skills_registry)
+        # Load modular skill system (all skills from separate files)
+        self.all_skills = load_all_skills()
+        
+        # Initialize phase-specific skill selector with modular skills
+        self.skill_selector = SkillSelector(self.all_skills)
         
         print(f"[AGENT] Initialized with phase-specific pentest skills")
         print(f"[AGENT] Available phases: {', '.join([p.value for p in PentestPhase if p != PentestPhase.UNKNOWN])}")
@@ -139,6 +145,12 @@ class Agent:
   
 
     async def run_tool(self, tool_name: str, args: Dict) -> Dict:
+        """
+        Execute a tool via MCP.
+        
+        Returns:
+            Standardized ToolResult dict with status, data, error, metadata
+        """
         workspace_id = "pentest_1"
         if "workspace_id" not in args:
             args["workspace_id"] = workspace_id
@@ -150,11 +162,11 @@ class Agent:
                 else getattr(self.mcp_client, "tools", {})
             )
         except Exception as e:
-            return {"error": f"Cannot fetch MCP tools: {e}"}
+            return {"status": "error", "error": f"Cannot fetch MCP tools: {e}"}
 
         tool = tools_dict.get(tool_name)
         if not tool:
-            return {"error": f"Unknown tool: {tool_name}"}
+            return {"status": "error", "error": f"Unknown tool: {tool_name}"}
 
         callable_obj = getattr(tool, "fn", tool)
 
@@ -163,72 +175,106 @@ class Agent:
             sig = inspect.signature(callable_obj)
             filtered_args = {k: v for k, v in args.items() if k in sig.parameters}
 
-            # Ensure workspace_id is included
+            # Ensure workspace_id is included if needed
             if "workspace_id" in sig.parameters and "workspace_id" not in filtered_args:
                 filtered_args["workspace_id"] = workspace_id
 
             # Async or sync execution
             if asyncio.iscoroutinefunction(callable_obj):
-                return await callable_obj(**filtered_args)
-            return callable_obj(**filtered_args)
+                result = await callable_obj(**filtered_args)
+            else:
+                result = callable_obj(**filtered_args)
+            
+            # Ensure result is a dict with status field
+            if not isinstance(result, dict):
+                return {"status": "error", "error": f"Tool returned non-dict: {type(result)}"}
+            
+            # Wrap result if it doesn't have status field (backwards compatibility)
+            if "status" not in result:
+                return {"status": "success", "data": result}
+            
+            return result
 
         except TypeError as e:
             return {
+                "status": "error",
                 "error": f"Tool invocation failed (TypeError): {e}",
-                "provided_args": args,
-                "filtered_args": filtered_args
+                "metadata": {
+                    "tool_name": tool_name,
+                    "provided_args": list(args.keys()),
+                    "filtered_args": list(filtered_args.keys()) if 'filtered_args' in locals() else []
+                }
             }
         except Exception as e:
             return {
-                "error": f"Tool execution failed: {type(e).__name__}: {e}"
+                "status": "error",
+                "error": f"Tool execution failed: {type(e).__name__}: {str(e)[:200]}"
             }
+    
     def _parse_llm_decision(self, raw: str) -> dict | None:
         """
         Convert LLM raw output (JSON) into a Python dict.
-        Optimized for speed with minimal debug output.
+        
+        Handles:
+        - Valid JSON
+        - JSON wrapped in markdown backticks
+        - Partial JSON (extracts first valid JSON object)
+        - Non-JSON responses (wraps as thought)
+        
+        Returns:
+            Dict with required "thought" field, or None if parsing completely fails
         """
+        if not raw or not isinstance(raw, str):
+            return None
+        
+        txt = raw.strip()
+        
+        # If it's already a dict, return it
+        if isinstance(txt, dict):
+            return txt if "thought" in txt else {"thought": json.dumps(txt)}
+        
+        # Try 1: Remove markdown-style code blocks
+        if txt.startswith("```") and txt.endswith("```"):
+            lines = txt.split("\n")
+            txt = "\n".join(lines[1:-1]).strip()
+        
+        # Try 2: Direct JSON parse
         try:
-            txt = raw.strip()
-            
-            # If it's already a dict, return it
-            if isinstance(txt, dict):
-                return txt
-            
-            # Remove markdown-style code blocks
-            if isinstance(txt, str) and txt.startswith("```") and txt.endswith("```"):
-                lines = txt.split("\n")
-                txt = "\n".join(lines[1:-1]).strip()
-            
-            # Parse JSON
             result = json.loads(txt)
-            
-            # Ensure it has 'thought' key
             if isinstance(result, dict):
-                if "thought" in result:
-                    return result
-                elif "tool" in result or "action" in result:
-                    # Already has action structure, return as-is
-                    return result
-                else:
-                    # Wrap other structures
-                    return {"thought": json.dumps(result)}
-            
-            return {"thought": str(result)}
-            
+                # Ensure 'thought' is present
+                if "thought" not in result:
+                    result["thought"] = json.dumps({k: v for k, v in result.items() if k not in ["tool", "args", "final_answer"]})
+                return result
+            else:
+                # Non-dict JSON (array, string, number, etc)
+                return {"thought": json.dumps(result)}
         except json.JSONDecodeError:
-            # Try to extract JSON-like content
-            if "{" in raw and "}" in raw:
-                try:
-                    start = raw.find("{")
-                    end = raw.rfind("}") + 1
-                    result = json.loads(raw[start:end])
-                    return result if isinstance(result, dict) and "thought" in result else {"thought": json.dumps(result)}
-                except:
-                    pass
-            return None
-        except Exception as e:
-            print(f"[ERROR] Parse failed: {e}")
-            return None
+            pass
+        
+        # Try 3: Extract JSON from partial/malformed input
+        # Find first { and last }
+        start_idx = txt.find("{")
+        end_idx = txt.rfind("}")
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            try:
+                extracted = txt[start_idx:end_idx + 1]
+                result = json.loads(extracted)
+                if isinstance(result, dict):
+                    if "thought" not in result:
+                        result["thought"] = json.dumps({k: v for k, v in result.items() if k not in ["tool", "args", "final_answer"]})
+                    return result
+            except json.JSONDecodeError:
+                pass
+        
+        # Try 4: Wrap raw text as thought (last resort)
+        # Only if it looks like it might be a valid response
+        if any(keyword in txt.lower() for keyword in ["thought", "tool", "final_answer", "action"]):
+            return {"thought": txt[:500]}
+        
+        # Completely unparseable
+        return None
             
     # -----------------------------------------------------------
     # LLM DECISION PARSER — AUTONOMOUS ReAct LOOP WITH PHASE-SPECIFIC SKILLS
@@ -256,34 +302,46 @@ class Agent:
         
         selected_skill, phase = self.skill_selector.select_skill(user_request=user_input)
         self.current_phase = phase
-        self.current_skill = selected_skill
+        
+        # Convert Skill object to dict for backward compatibility
+        if selected_skill:
+            self.current_skill = self.skill_selector.skill_to_dict(selected_skill)
+        else:
+            self.current_skill = None
         
         if selected_skill:
+            skill_name = self.current_skill.get('name', 'Unknown')
             print(f"[PHASE DETECTOR] Phase: {phase.value}")
-            print(f"[SKILL SELECTOR] Selected '{selected_skill.get('name')}'")
+            print(f"[SKILL SELECTOR] Selected '{skill_name}'")
         else:
             print("[SKILL SELECTOR] No matching skill found")
             return
         
         # 3️⃣ Fetch SHORT-TERM memory (current session discoveries) - QUICK
         short_mem_result = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
-        short_term_context = short_mem_result.get("data", {}) if isinstance(short_mem_result, dict) else {}
+
+        # Extract data from standardized result format
+        if short_mem_result.get("status") == "success":
+            short_term_context = short_mem_result.get("data", {})
+        else:
+            print(f"[WARN] Short-term memory fetch failed: {short_mem_result.get('error', 'unknown error')}")
+            short_term_context = {}
         
         # 4️⃣ Fetch LONG-TERM memory ASYNC (don't block on this, try in background)
         long_term_context = {}
         try:
             # Use a timeout to avoid waiting too long for ReMeApp
             long_mem_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self.run_tool,
-                    "mem_get_long",
-                    {"workspace_id": workspace_id}
-                )
+                self.run_tool("mem_get_long", {"workspace_id": workspace_id})
             )
             # Don't wait if it takes more than 2 seconds
             try:
                 long_mem_result = await asyncio.wait_for(long_mem_task, timeout=2.0)
-                long_term_context = long_mem_result if isinstance(long_mem_result, dict) else {}
+                # Extract data from standardized result format
+                if long_mem_result.get("status") == "success":
+                    long_term_context = long_mem_result.get("data", {})
+                else:
+                    print(f"[WARN] Long-term memory error: {long_mem_result.get('error')}")
             except asyncio.TimeoutError:
                 print("[WARN] Long-term memory fetch timeout, proceeding with short-term only")
                 long_term_context = {}
@@ -291,8 +349,9 @@ class Agent:
             print(f"[WARN] Long-term memory error: {e}, using short-term only")
         
         # 5️⃣ Build skill context with available memory
+        # Use current_skill (dict format) for backward compatibility with ClaudeSkillsAPIBuilder
         system_prompt_with_skills = create_skill_aware_system_prompt(
-            selected_skill,
+            self.current_skill,
             base_context=""
         )
         
@@ -332,10 +391,17 @@ class Agent:
                 print(f"[DEBUG] Full response was:\n{decision_raw}\n")
                 print("[DEBUG] Attempting fallback: wrapping as thought...")
                 # Fallback: wrap the raw response as thought
-                decision = {"thought": str(decision_raw)[:200]}
-                if not decision:
-                    print("[ERROR] Fallback failed. Exiting.")
+                fallback_thought = str(decision_raw)[:500]
+                if fallback_thought.strip():
+                    decision = {"thought": fallback_thought}
+                else:
+                    print("[ERROR] Fallback failed - empty response. Exiting.")
                     return
+            
+            # Validate decision has required 'thought' field
+            if not isinstance(decision, dict) or "thought" not in decision:
+                print("[ERROR] Decision missing 'thought' field after parsing. Exiting.")
+                return
             
             # Extract ReAct components
             thought = decision.get("thought", "")
@@ -367,8 +433,10 @@ class Agent:
                 print(f"\n[ACTION] Executing: {tool_name}")
                 result = await self.run_tool(tool_name, tool_args)
                 
-                # 🔟 Check for errors
-                if isinstance(result, dict) and "error" in result:
+                # 🔟 Check for errors using standardized status format
+                result_status = result.get("status", "unknown")
+                
+                if result_status == "error":
                     error_msg = result.get("error", "Unknown error")
                     print(f"[ERROR] {error_msg}")
                     # Append error as observation so LLM can self-correct
@@ -376,12 +444,25 @@ class Agent:
                         "role": "user",
                         "content": f"[OBSERVATION - ERROR] Tool '{tool_name}' failed: {error_msg}. Please try a different approach."
                     })
-                else:
-                    # Success: append result as observation
-                    print(f"[OBSERVATION] {json.dumps(result, indent=2)[:500]}...")
+                elif result_status == "warning":
+                    # Warning = partial success, still proceed but log warning
+                    warning_msg = result.get("error", "Warning during execution")
+                    print(f"[WARNING] {warning_msg}")
+                    print(f"[OBSERVATION] {json.dumps(result.get('data', {}), indent=2)[:500]}...")
                     messages.append({
                         "role": "user",
-                        "content": f"[OBSERVATION] Tool '{tool_name}' returned:\n{json.dumps(result, indent=2)}"
+                        "content": f"[OBSERVATION - WARNING] Tool '{tool_name}' completed with warning: {warning_msg}\nData: {json.dumps(result.get('data', {}))}"
+                    })
+                    
+                    # Save partial result to memory
+                    asyncio.create_task(self._auto_save_to_memory(workspace_id, tool_name, result))
+                else:
+                    # Success: append result as observation
+                    data = result.get("data", result)  # Extract data if wrapped
+                    print(f"[OBSERVATION] {json.dumps(data, indent=2)[:500]}...")
+                    messages.append({
+                        "role": "user",
+                        "content": f"[OBSERVATION] Tool '{tool_name}' succeeded. Data:\n{json.dumps(data, indent=2)}"
                     })
                     
                     # Save tool result to memory (async, non-blocking)

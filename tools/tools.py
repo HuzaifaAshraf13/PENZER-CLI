@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from agent.core import mcp
+from tools.standards import success, error, warning
 
 
 import subprocess
@@ -22,7 +23,7 @@ def check_available_tools(tool_category: str = "network") -> dict:
         tool_category: 'network', 'vuln', 'enum', or 'all'
     
     Returns:
-        Dictionary with available tools and their versions
+        Standardized ToolResult with available tools
     """
     tools_to_check = {
         "network": ["nmap", "netstat", "arp-scan", "ping", "fping", "masscan"],
@@ -56,12 +57,15 @@ def check_available_tools(tool_category: str = "network") -> dict:
         except Exception:
             pass
     
-    return {
-        "status": "success",
-        "category": tool_category,
-        "available_tools": available,
-        "count": len(available)
-    }
+    return success(
+        data={
+            "category": tool_category,
+            "available_tools": available,
+            "count": len(available)
+        },
+        metadata={"operation": "check_available_tools", "timestamp": datetime.datetime.now().isoformat()}
+    )
+
 
 @mcp.tool()
 def execute_system_command(command: str, timeout: int = 300) -> dict:
@@ -72,6 +76,9 @@ def execute_system_command(command: str, timeout: int = 300) -> dict:
     Args:
         command: The command to execute (with sudo prefix if needed)
         timeout: Maximum execution time in seconds (default 300)
+    
+    Returns:
+        Standardized ToolResult with command output
     """
     try:
         result = subprocess.run(
@@ -81,14 +88,31 @@ def execute_system_command(command: str, timeout: int = 300) -> dict:
             timeout=timeout
         )
         
-        return {
-            "status": "success" if result.returncode == 0 else "warning",
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "exit_code": result.returncode
-        }
+        if result.returncode == 0:
+            return success(
+                data={
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "exit_code": result.returncode
+                },
+                metadata={"command": command}
+            )
+        else:
+            # Non-zero exit code = warning, but include output
+            return warning(
+                data={
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "exit_code": result.returncode
+                },
+                message=f"Command exited with code {result.returncode}",
+                metadata={"command": command}
+            )
+    except subprocess.TimeoutExpired:
+        return error(f"Command timed out after {timeout} seconds")
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return error(f"Command execution failed: {str(e)}")
+
 # ======================================================================
 #  GITHUB SEARCH — GitHub API (online)
 # ======================================================================
@@ -102,6 +126,9 @@ def search_github_repository(owner: str, repo: str, query: str) -> dict:
     Pure execution tool.
     Agent decides search intent.
     Tool queries GitHub API and returns parsed results.
+    
+    Returns:
+        Standardized ToolResult with search results
     """
 
     q = f"{query} repo:{owner}/{repo}"
@@ -119,14 +146,12 @@ def search_github_repository(owner: str, repo: str, query: str) -> dict:
     try:
         resp = requests.get(api_url, headers=headers, timeout=10)
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return error(f"GitHub API request failed: {str(e)}")
 
     if resp.status_code != 200:
-        return {
-            "status": "error",
-            "error": "GitHub API error",
-            "status_code": resp.status_code
-        }
+        return error(
+            f"GitHub API error (HTTP {resp.status_code}): {resp.text[:200]}"
+        )
 
     data = resp.json()
 
@@ -139,13 +164,16 @@ def search_github_repository(owner: str, repo: str, query: str) -> dict:
             "score": item.get("score")
         })
 
-    return {
-        "status": "ok",
-        "query": query,
-        "repository": f"{owner}/{repo}",
-        "total_matches": data.get("total_count", 0),
-        "results": results
-    }
+    return success(
+        data={
+            "query": query,
+            "repository": f"{owner}/{repo}",
+            "total_matches": data.get("total_count", 0),
+            "results": results
+        },
+        metadata={"total_results": len(results)}
+    )
+
 
 
 # ======================================================================
@@ -161,6 +189,9 @@ def search_exploit_db(query: str) -> dict:
     Pure execution tool.
     Agent decides query intent.
     Tool scrapes Exploit-DB and returns parsed results.
+    
+    Returns:
+        Standardized ToolResult with exploit data
     """
 
     encoded_query = urllib.parse.quote(query)
@@ -173,41 +204,44 @@ def search_exploit_db(query: str) -> dict:
             timeout=10
         )
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return error(f"Exploit-DB request failed: {str(e)}")
 
     if r.status_code != 200:
-        return {
-            "status": "error",
-            "error": "Exploit-DB unreachable",
-            "status_code": r.status_code
-        }
+        return error(
+            f"Exploit-DB unreachable (HTTP {r.status_code})"
+        )
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    rows = soup.select("table tbody tr")
+    try:
+        soup = BeautifulSoup(r.text, "html.parser")
+        rows = soup.select("table tbody tr")
 
-    exploits = []
+        exploits = []
 
-    for row in rows:
-        cols = [c.text.strip() for c in row.find_all("td")]
-        if len(cols) < 7:
-            continue
+        for row in rows:
+            cols = [c.text.strip() for c in row.find_all("td")]
+            if len(cols) < 7:
+                continue
 
-        exploits.append({
-            "exploit_id": cols[0],
-            "date": cols[1],
-            "description": cols[2],
-            "cve": cols[3] or None,
-            "platform": cols[4],
-            "type": cols[5],
-            "author": cols[6]
-        })
+            exploits.append({
+                "exploit_id": cols[0],
+                "date": cols[1],
+                "description": cols[2],
+                "cve": cols[3] or None,
+                "platform": cols[4],
+                "type": cols[5],
+                "author": cols[6]
+            })
 
-    return {
-        "status": "ok",
-        "query": query,
-        "total_results": len(exploits),
-        "exploits": exploits
-    }
+        return success(
+            data={
+                "query": query,
+                "total_results": len(exploits),
+                "exploits": exploits
+            },
+            metadata={"parsed_results": len(exploits)}
+        )
+    except Exception as e:
+        return error(f"Exploit-DB parsing failed: {str(e)}")
 
 
 # ======================================================================
