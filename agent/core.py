@@ -1,8 +1,26 @@
 # agent/core.py
-from fastmcp import FastMCP
-from reme_ai import ReMeApp
 import os
 import asyncio
+
+# Disable loguru logging from flowllm/reme_ai BEFORE importing ReMeApp
+try:
+    from loguru import logger
+    logger.disable("flowllm")
+    logger.disable("reme_ai")
+except:
+    pass
+
+from fastmcp import FastMCP
+from reme_ai import ReMeApp
+
+# Also try to disable via environment variables
+os.environ['FLOWLLM_LOG_LEVEL'] = 'ERROR'
+
+# Suppress specific flow execution logs
+import logging
+logging.basicConfig(level=logging.WARNING)
+for logger_name in ["flowllm", "reme_ai", "base_flow", "timer"]:
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
 
 # ---------------- SINGLE MCP INSTANCE ----------------
 mcp = FastMCP(name="PenzerMCP")
