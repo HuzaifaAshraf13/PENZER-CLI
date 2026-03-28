@@ -163,6 +163,10 @@ class LLM:
                         return "api"
                     else:
                         print("❌ Invalid choice. Please enter 1 or 2.")
+                except (EOFError, KeyboardInterrupt):
+                    # Non-interactive or cancelled - default to local
+                    print("[AUTO] Defaulting to local GGUF model.")
+                    return "local"
                 except KeyboardInterrupt:
                     raise RuntimeError("Model selection cancelled by user")
         

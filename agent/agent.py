@@ -7,7 +7,6 @@ from typing import Dict, Any, List, Optional
 from agent.core import mcp, init_reme, cleanup_reme
 from agent.llm import LLM
 from agent.skill_selector import (
-    PentestPhaseDetector,
     SkillSelector,
     create_skill_aware_system_prompt
 )
@@ -48,14 +47,11 @@ class Agent:
         self.resource_uris = self._load_resource_uris()
         self.formatted_system_prompt = self._build_system_prompt()
         
-        # Load modular skill system (all skills from separate files)
-        self.all_skills = load_all_skills()
-        
-        # Initialize phase-specific skill selector with modular skills
+        # Initialize skill selector with loaded skills
         self.skill_selector = SkillSelector(self.all_skills)
         
-        print(f"[AGENT] Initialized with phase-specific pentest skills")
-        print(f"[AGENT] Available phases: {', '.join([p.value for p in PentestPhase if p != PentestPhase.UNKNOWN])}")
+        # Skills are loaded in __init__, just report status
+        print(f"[AGENT] Loaded {sum(len(s) for s in self.all_skills.values())} skills across {len(self.all_skills)} phases")
         return self
 
     # -----------------------------------------------------------
@@ -218,6 +214,7 @@ class Agent:
         Handles:
         - Valid JSON
         - JSON wrapped in markdown backticks
+        - Nested JSON (JSON string inside JSON object)
         - Partial JSON (extracts first valid JSON object)
         - Non-JSON responses (wraps as thought)
         
@@ -242,6 +239,23 @@ class Agent:
         try:
             result = json.loads(txt)
             if isinstance(result, dict):
+                # Check for nested JSON in 'thought' field
+                if "thought" in result and isinstance(result["thought"], str):
+                    try:
+                        # Try to parse the thought as JSON
+                        nested = json.loads(result["thought"])
+                        if isinstance(nested, dict):
+                            # Merge nested JSON into result, preserving outer keys
+                            for key in ["tool", "args", "final_answer"]:
+                                if key not in result and key in nested:
+                                    result[key] = nested[key]
+                            # Use nested thought if outer thought is just JSON representation
+                            if "thought" in nested:
+                                result["thought"] = nested["thought"]
+                    except json.JSONDecodeError:
+                        # Thought is not JSON, keep as is
+                        pass
+                
                 # Ensure 'thought' is present
                 if "thought" not in result:
                     result["thought"] = json.dumps({k: v for k, v in result.items() if k not in ["tool", "args", "final_answer"]})
@@ -262,6 +276,19 @@ class Agent:
                 extracted = txt[start_idx:end_idx + 1]
                 result = json.loads(extracted)
                 if isinstance(result, dict):
+                    # Check for nested JSON again
+                    if "thought" in result and isinstance(result["thought"], str):
+                        try:
+                            nested = json.loads(result["thought"])
+                            if isinstance(nested, dict):
+                                for key in ["tool", "args", "final_answer"]:
+                                    if key not in result and key in nested:
+                                        result[key] = nested[key]
+                                if "thought" in nested:
+                                    result["thought"] = nested["thought"]
+                        except json.JSONDecodeError:
+                            pass
+                    
                     if "thought" not in result:
                         result["thought"] = json.dumps({k: v for k, v in result.items() if k not in ["tool", "args", "final_answer"]})
                     return result
@@ -277,25 +304,22 @@ class Agent:
         return None
             
     # -----------------------------------------------------------
-    # LLM DECISION PARSER — AUTONOMOUS ReAct LOOP WITH PHASE-SPECIFIC SKILLS
+    # UNIFIED SKILL-DRIVEN WORKFLOW
     # -----------------------------------------------------------
     async def process_input(self, user_input: str):
         """
-        Autonomous ReAct framework with phase-specific Claude Agent Skills.
-        Workflow: Scan → Enumeration → Exploitation → Post-Exploitation → Reporting
+        Skill-driven autonomous workflow.
+        1. Select appropriate skill based on user intent
+        2. Use skill's agent_behavior for LLM instructions
+        3. Execute tool calls from LLM response
+        4. Continue until LLM returns final_answer
         """
         workspace_id = "pentest_1"
-        max_iterations = 10  # Prevent infinite loops
+        max_iterations = 10
         iteration = 0
-        
-        # Initialize message history
         messages: List[Dict[str, Any]] = []
         
-        # 1️⃣ DETECT PENTEST PHASE
-        detected_phase = PentestPhaseDetector.detect_phase(user_input)
-        self.current_phase = detected_phase
-        
-        # 2️⃣ SELECT SKILL FOR PHASE
+        # 1️⃣ SELECT SKILL BASED ON USER INPUT
         if not self.skill_selector:
             print("[AGENT] Skill selector not initialized")
             return
@@ -311,8 +335,7 @@ class Agent:
         
         if selected_skill:
             skill_name = self.current_skill.get('name', 'Unknown')
-            print(f"[PHASE DETECTOR] Phase: {phase.value}")
-            print(f"[SKILL SELECTOR] Selected '{skill_name}'")
+            print(f"[SKILL SELECTED] {skill_name}")
         else:
             print("[SKILL SELECTOR] No matching skill found")
             return
@@ -368,6 +391,25 @@ class Agent:
             "role": "user",
             "content": user_input
         })
+        
+        # 5️⃣ PRE-CHECK: Automatically check available tools on first iteration
+        print("\n[PRE-CHECK] Checking available tools for this phase...")
+        available_tools_result = await self.run_tool("check_available_tools", {"tool_category": "all"})
+        if available_tools_result.get("status") == "success":
+            available_tools_data = available_tools_result.get("data", {})
+            available_list = available_tools_data.get("available_tools", {})
+            print(f"[PRE-CHECK] Found {len(available_list)} available tools: {', '.join(available_list.keys())}")
+            
+            # Add to system prompt so LLM knows what's available
+            available_tools_info = f"\n[AVAILABLE TOOLS] These security tools are available on this system:\n"
+            for tool_name in sorted(available_list.keys()):
+                available_tools_info += f"  - {tool_name}\n"
+            available_tools_info += f"Use these tools when appropriate. If a tool you want is not listed, use alternatives that ARE available.\n"
+            
+            system_prompt_with_context = f"""{system_prompt_with_context}
+
+{available_tools_info}
+"""
         
         while iteration < max_iterations:
             iteration += 1

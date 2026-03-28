@@ -20,26 +20,27 @@ class ScanSkills(SkillModule):
                 keywords=["scan", "nmap", "host discovery", "port scan", "network", "reconnaissance", "ping"],
                 mcp_tools=["execute_system_command", "check_available_tools"],
                 agent_behavior="""
-OBJECTIVE: Discover live hosts and open ports on the target network.
+OBJECTIVE: Discover live hosts on the target network.
 
-WORKFLOW:
-1. Parse the target network/IP from user request (e.g., 192.168.1.0/24, 10.0.0.1)
-2. Start with a ping sweep to discover live hosts (nmap -sn <target>)
-3. For each discovered host, perform a port scan (nmap -p- <host> or nmap -sV <host>)
-4. Record open ports, services, and versions
-5. If user wants detailed scanning, use nmap -A for aggressive scanning
+INSTRUCTIONS:
+1. Parse the target network or IP range from the user input (e.g., 192.168.1.0/24, 10.0.0.1)
+2. Use 'ping' tool to discover active hosts:
+   - For single IP: execute_system_command with "ping -c 1 <IP>"
+   - For network range: use ping or check_available_tools to see what's available
+3. Build a list of responding hosts
+4. Return results in JSON format with discovered hosts
 
-TOOLS TO USE:
-- nmap: Network mapping and port scanning
-- ping: Basic host discovery
-- masscan: Fast port scanning for large ranges
+AVAILABLE TOOLS:
+- execute_system_command: Run ping or other basic network commands
+- check_available_tools: Check what tools are installed (nmap, masscan, etc)
 
-OUTPUT EXPECTATIONS:
-- List of discovered hosts (IP addresses)
-- Open ports on each host
-- Service names and versions
-- OS detection if available
-- Potential vulnerabilities based on services
+JSON RESPONSE FORMAT:
+{
+  "thought": "Analysis of the scan results",
+  "tool": "execute_system_command",
+  "args": {"command": "ping -c 1 <target>"},
+  "final_answer": "List of discovered hosts: [IPs]" (only when done)
+}
 """,
                 next_phase="enumeration"
             ),
