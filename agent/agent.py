@@ -1,639 +1,666 @@
-# agent/agent.py
+# agent/agent_refactored.py
+"""
+Modular, async-safe pentesting agent with robust error handling and optimized memory management.
+Implements ReAct workflow with skill-driven planning, async-compatible tool execution, 
+and persistent memory consolidation.
+"""
+
 import json
 import asyncio
 import inspect
-from typing import Dict, Any, List, Optional
+import logging
+import time
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from enum import Enum
 
 from agent.core import mcp, init_reme, cleanup_reme
 from agent.llm import LLM
 from agent.skill_selector import (
     SkillSelector,
-    create_skill_aware_system_prompt
+    create_skill_aware_system_prompt,
+    PentestPhaseDetector
 )
 from agent.skills import PentestPhase, load_all_skills
 
-# Import and register prompts FIRST (before anything uses mcp)
-import session.sessionprompts  # registers session prompts
-import tools.ToolsPrompts      # registers tool prompts
+# Configure logging
+logger = logging.getLogger("penzer.agent")
+logger.setLevel(logging.DEBUG)
 
-# Import session tools and resources
-import session.session  # registers memory resources and tools
+# Optional imports with fallback
+try:
+    import session.sessionprompts
+except ImportError:
+    logger.debug("session.sessionprompts not available")
 
+try:
+    import tools.ToolsPrompts
+except ImportError:
+    logger.debug("tools.ToolsPrompts not available")
+
+try:
+    import session.session
+except ImportError:
+    logger.debug("session.session not available")
+
+
+# ================ DATA STRUCTURES ================
+
+class ToolExecutionStatus(Enum):
+    """Status of tool execution."""
+    SUCCESS = "success"
+    WARNING = "warning"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+    RETRYABLE = "retryable"
+
+
+@dataclass
+class ToolResult:
+    """Standardized result from tool execution."""
+    status: ToolExecutionStatus
+    data: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    execution_time_ms: float = 0.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "status": self.status.value,
+            "data": self.data,
+            "error": self.error,
+            "metadata": self.metadata,
+            "execution_time_ms": self.execution_time_ms
+        }
+    
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "ToolResult":
+        """Create from dictionary."""
+        return ToolResult(
+            status=ToolExecutionStatus(data.get("status", "error")),
+            data=data.get("data", {}),
+            error=data.get("error"),
+            metadata=data.get("metadata", {}),
+            execution_time_ms=data.get("execution_time_ms", 0.0)
+        )
+
+
+@dataclass
+class LLMDecision:
+    """Parsed decision from LLM."""
+    thought: str
+    tool: Optional[str] = None
+    args: Dict[str, Any] = field(default_factory=dict)
+    final_answer: Optional[str] = None
+    confidence: float = 0.8
+    raw_response: str = ""
+    
+    def is_complete(self) -> bool:
+        """Check if decision has final answer (workflow complete)."""
+        return self.final_answer is not None
+    
+    def has_action(self) -> bool:
+        """Check if decision specifies a tool to call."""
+        return self.tool is not None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "thought": self.thought,
+            "tool": self.tool,
+            "args": self.args,
+            "final_answer": self.final_answer,
+            "confidence": self.confidence
+        }
+
+
+@dataclass
+class ExecutionMetrics:
+    """Metrics for workflow execution."""
+    total_iterations: int = 0
+    successful_tools: int = 0
+    failed_tools: int = 0
+    total_execution_time_ms: float = 0.0
+    tool_executions: Dict[str, int] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+
+# ================ AGENT CLASS ================
 
 class Agent:
-    def __init__(self):
+    """
+    Autonomous pentesting agent with ReAct workflow, skill-driven planning,
+    and async-safe tool execution.
+    """
+    
+    # Constants
+    DEFAULT_MEMORY_FETCH_TIMEOUT_SEC = 2.0
+    DEFAULT_MEMORY_DISPLAY_LIMIT = 5
+    DEFAULT_LONG_TERM_MEMORY_DISPLAY_LIMIT = 3
+    
+    def __init__(
+        self,
+        max_iterations: int = 10,
+        llm_timeout_sec: float = 30.0,
+        tool_timeout_sec: float = 60.0,
+        tool_retries: int = 2,
+        workspace_id: str = "default"
+    ):
+        """
+        Initialize Agent with configuration.
+        
+        Args:
+            max_iterations: Maximum workflow iterations
+            llm_timeout_sec: Timeout for LLM calls
+            tool_timeout_sec: Timeout for tool execution
+            tool_retries: Number of retry attempts for tools
+            workspace_id: Session workspace identifier
+        """
+        self.max_iterations = max_iterations
+        self.llm_timeout_sec = llm_timeout_sec
+        self.tool_timeout_sec = tool_timeout_sec
+        self.tool_retries = tool_retries
+        self.workspace_id = workspace_id
+        
+        # State
         self.llm = LLM()
         self.mcp_client = mcp
-
-        # Keep empty for now; async_init will fill them
         self.tool_schema: Dict[str, Any] = {}
         self.resource_uris: List[str] = []
         self.formatted_system_prompt: str = ""
-        
-        # Load all skills from modular system
         self.all_skills = load_all_skills()
         self.skill_selector: Optional[SkillSelector] = None
         self.current_phase: Optional[PentestPhase] = None
         self.current_skill: Optional[Dict[str, Any]] = None
-
-    async def async_init(self):
-        # Initialize ReMeApp for long-term memory
+        self.message_history: List[Dict[str, str]] = []
+        self.metrics = ExecutionMetrics()
+    
+    async def async_init(self) -> "Agent":
+        """Async initialization of agent."""
+        logger.info("Initializing Penzer Agent...")
+        
+        # Initialize memory
         reme_success = await init_reme()
         if not reme_success:
-            print("[WARN] Long-term memory unavailable, continuing with short-term only")
+            logger.warning("Long-term memory unavailable, using short-term only")
         
-        # Async-safe initialization
+        # Load tools and resources
         self.tool_schema = await self._load_tool_schema()
         self.resource_uris = self._load_resource_uris()
-        self.formatted_system_prompt = self._build_system_prompt()
         
-        # Initialize skill selector with loaded skills
+        # Initialize skill selector
         self.skill_selector = SkillSelector(self.all_skills)
         
-        # Skills are loaded in __init__, just report status
-        print(f"[AGENT] Loaded {sum(len(s) for s in self.all_skills.values())} skills across {len(self.all_skills)} phases")
+        logger.info(f"✓ Agent initialized: {len(self.tool_schema)} tools, {len(self.resource_uris)} resources")
         return self
-
-    # -----------------------------------------------------------
-    # LOADERS
-    # -----------------------------------------------------------
-    async def _load_tool_schema(self) -> Dict[str, Any]:
-        """FastMCP exposes get_tools(), not .tools on some versions."""
-        try:
-            if hasattr(self.mcp_client, "get_tools"):
-                return await self.mcp_client.get_tools()
-            return getattr(self.mcp_client, "tools", {})
-        except Exception as e:
-            print("Error loading tool schema:", e)
-            return {}
-
-    def _load_resource_uris(self) -> List[str]:
-        return list(getattr(self.mcp_client, "resources", {}).keys())
-
-    def _serialize_tools_for_prompt(self, tools_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Convert FastMCP tool objects into a JSON-serializable dict that contains
-        only tool names and parameter lists (no function objects).
-        """
-        serial = {}
-        for name, tool_obj in tools_dict.items():
-            # try to find the underlying callable
-            fn = getattr(tool_obj, "fn", tool_obj)
-            # try common wrappers
-            if hasattr(fn, "__wrapped__"):
-                fn = fn.__wrapped__
-            params = []
-            try:
-                sig = inspect.signature(fn)
-                params = [p for p in sig.parameters.keys()]
-            except Exception:
-                # fallback: look for annotations if available
-                ann = getattr(fn, "__annotations__", {}) or {}
-                params = list(ann.keys())
-            serial[name] = {"args": params}
-        return serial
-
-    def _build_memory_context(self, short_term: Dict[str, Any], long_term: Dict[str, Any]) -> str:
-        """
-        Build compact memory context from both short-term and long-term memory.
-        Optimized for minimal token usage.
-        """
-        memory_lines = ["# === MEMORY ==="]
-        
-        # SHORT-TERM (current discoveries - max 5 entries)
-        if short_term:
-            memory_lines.append("## Short-term (Current)")
-            for i, (key, value) in enumerate(short_term.items()):
-                if i >= 5:  # Limit to 5 entries
-                    break
-                if isinstance(value, dict):
-                    memory_lines.append(f"- {key}: {json.dumps(value)[:100]}")
-                else:
-                    memory_lines.append(f"- {key}: {str(value)[:100]}")
-        
-        # LONG-TERM (learned knowledge - max 3 entries)
-        if long_term:
-            memory_lines.append("## Long-term (Learned)")
-            for i, (key, value) in enumerate(long_term.items()):
-                if i >= 3:  # Limit to 3 entries
-                    break
-                if key not in ["timestamp", "metadata"]:
-                    if isinstance(value, dict):
-                        memory_lines.append(f"- {key}: {json.dumps(value)[:100]}")
-                    else:
-                        memory_lines.append(f"- {key}: {str(value)[:100]}")
-        
-        return "\n".join(memory_lines)
-
-    def _build_system_prompt(self) -> str:
-        """Minimal system prompt - skills handle all instructions on-demand."""
-        return "You are Penzer, an autonomous pentesting agent. Return ONLY valid JSON."
-
-    def _build_skill_filtered_system_prompt(self, phase: PentestPhase) -> str:
-        """
-        Minimal phase context - Claude Skills load full instructions on-demand.
-        """
-        return f"Pentest Phase: {phase.value.upper()}"
-
-    # -----------------------------------------------------------
-    # TOOL EXECUTION (supports FastMCP.get_tools())
-    # -----------------------------------------------------------
-  
-
-    async def run_tool(self, tool_name: str, args: Dict) -> Dict:
-        """
-        Execute a tool via MCP.
-        
-        Returns:
-            Standardized ToolResult dict with status, data, error, metadata
-        """
-        workspace_id = "pentest_1"
-        if "workspace_id" not in args:
-            args["workspace_id"] = workspace_id
-
-        try:
-            tools_dict = (
-                await self.mcp_client.get_tools()
-                if hasattr(self.mcp_client, "get_tools")
-                else getattr(self.mcp_client, "tools", {})
-            )
-        except Exception as e:
-            return {"status": "error", "error": f"Cannot fetch MCP tools: {e}"}
-
-        tool = tools_dict.get(tool_name)
-        if not tool:
-            return {"status": "error", "error": f"Unknown tool: {tool_name}"}
-
-        callable_obj = getattr(tool, "fn", tool)
-
-        try:
-            # Signature-aware argument filtering
-            sig = inspect.signature(callable_obj)
-            filtered_args = {k: v for k, v in args.items() if k in sig.parameters}
-
-            # Ensure workspace_id is included if needed
-            if "workspace_id" in sig.parameters and "workspace_id" not in filtered_args:
-                filtered_args["workspace_id"] = workspace_id
-
-            # Async or sync execution
-            if asyncio.iscoroutinefunction(callable_obj):
-                result = await callable_obj(**filtered_args)
-            else:
-                result = callable_obj(**filtered_args)
-            
-            # Ensure result is a dict with status field
-            if not isinstance(result, dict):
-                return {"status": "error", "error": f"Tool returned non-dict: {type(result)}"}
-            
-            # Wrap result if it doesn't have status field (backwards compatibility)
-            if "status" not in result:
-                return {"status": "success", "data": result}
-            
-            return result
-
-        except TypeError as e:
-            return {
-                "status": "error",
-                "error": f"Tool invocation failed (TypeError): {e}",
-                "metadata": {
-                    "tool_name": tool_name,
-                    "provided_args": list(args.keys()),
-                    "filtered_args": list(filtered_args.keys()) if 'filtered_args' in locals() else []
-                }
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": f"Tool execution failed: {type(e).__name__}: {str(e)[:200]}"
-            }
     
-    def _parse_llm_decision(self, raw: str) -> dict | None:
-        """
-        Convert LLM raw output (JSON) into a Python dict.
-        
-        Handles:
-        - Valid JSON
-        - JSON wrapped in markdown backticks
-        - Nested JSON (JSON string inside JSON object)
-        - Partial JSON (extracts first valid JSON object)
-        - Non-JSON responses (wraps as thought)
-        
-        Returns:
-            Dict with required "thought" field, or None if parsing completely fails
-        """
-        if not raw or not isinstance(raw, str):
-            return None
-        
-        txt = raw.strip()
-        
-        # If it's already a dict, return it
-        if isinstance(txt, dict):
-            return txt if "thought" in txt else {"thought": json.dumps(txt)}
-        
-        # Try 1: Remove markdown-style code blocks
-        if txt.startswith("```") and txt.endswith("```"):
-            lines = txt.split("\n")
-            txt = "\n".join(lines[1:-1]).strip()
-        
-        # Try 2: Direct JSON parse
+    async def _load_tool_schema(self) -> Dict[str, Any]:
+        """Load tool schema from MCP with robust fallbacks."""
         try:
-            result = json.loads(txt)
-            if isinstance(result, dict):
-                # Check for nested JSON in 'thought' field
-                if "thought" in result and isinstance(result["thought"], str):
-                    try:
-                        # Try to parse the thought as JSON
-                        nested = json.loads(result["thought"])
-                        if isinstance(nested, dict):
-                            # Merge nested JSON into result, preserving outer keys
-                            for key in ["tool", "args", "final_answer"]:
-                                if key not in result and key in nested:
-                                    result[key] = nested[key]
-                            # Use nested thought if outer thought is just JSON representation
-                            if "thought" in nested:
-                                result["thought"] = nested["thought"]
-                    except json.JSONDecodeError:
-                        # Thought is not JSON, keep as is
-                        pass
-                
-                # Ensure 'thought' is present
-                if "thought" not in result:
-                    result["thought"] = json.dumps({k: v for k, v in result.items() if k not in ["tool", "args", "final_answer"]})
-                return result
+            # Try 1: Async get_tools() method
+            if hasattr(self.mcp_client, "get_tools") and callable(getattr(self.mcp_client, "get_tools")):
+                try:
+                    tools_dict = await self.mcp_client.get_tools()
+                    logger.debug(f"✓ Loaded {len(tools_dict)} tools via async get_tools()")
+                    return tools_dict
+                except Exception as e:
+                    logger.debug(f"get_tools() failed: {e}")
+            
+            # Try 2: Direct .tools attribute
+            if hasattr(self.mcp_client, "tools"):
+                tools_dict = getattr(self.mcp_client, "tools", {})
+                if tools_dict:
+                    logger.debug(f"✓ Loaded {len(tools_dict)} tools via .tools attribute")
+                    return tools_dict
+            
+            # Try 3: Internal ._tools attribute
+            if hasattr(self.mcp_client, "_tools"):
+                tools_dict = getattr(self.mcp_client, "_tools", {})
+                if tools_dict:
+                    logger.debug(f"✓ Loaded {len(tools_dict)} tools via ._tools attribute")
+                    return tools_dict
+        
+        except Exception as e:
+            logger.error(f"Error loading tool schema: {e}")
+        
+        logger.warning("No tools loaded from MCP")
+        return {}
+    
+    def _load_resource_uris(self) -> List[str]:
+        """Load resource URIs from MCP."""
+        try:
+            resources = getattr(self.mcp_client, "resources", {})
+            uris = list(resources.keys())
+            logger.debug(f"✓ Loaded {len(uris)} resources")
+            return uris
+        except Exception as e:
+            logger.warning(f"Error loading resources: {e}")
+            return []
+    
+    async def run_tool(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        retry_count: int = 0
+    ) -> ToolResult:
+        """
+        Execute an MCP tool with retry logic and timeout handling.
+        
+        Args:
+            tool_name: Name of the tool to execute
+            args: Arguments to pass to the tool
+            retry_count: Current retry attempt
+            
+        Returns:
+            ToolResult with status, data, and metadata
+        """
+        start_time = time.time()
+        
+        try:
+            # Get tools dict
+            tools_dict = self.tool_schema or {}
+            if not tools_dict:
+                tools_dict = await self._load_tool_schema()
+            
+            # Lookup tool
+            if tool_name not in tools_dict:
+                available = ", ".join(sorted(tools_dict.keys())[:10])
+                error_msg = f"Tool '{tool_name}' not found. Available: {available}"
+                logger.error(error_msg)
+                self.metrics.failed_tools += 1
+                self.metrics.errors.append(error_msg)
+                return ToolResult(
+                    status=ToolExecutionStatus.ERROR,
+                    error=error_msg,
+                    execution_time_ms=(time.time() - start_time) * 1000
+                )
+            
+            tool = tools_dict[tool_name]
+            
+            # Extract callable object
+            callable_obj = tool
+            if hasattr(tool, "fn"):
+                callable_obj = tool.fn
+            elif hasattr(tool, "__wrapped__"):
+                callable_obj = tool.__wrapped__
+            elif hasattr(tool, "func"):
+                callable_obj = tool.func
+            
+            # Filter args to match function signature
+            try:
+                sig = inspect.signature(callable_obj)
+                params = set(sig.parameters.keys())
+                filtered_args = {k: v for k, v in args.items() if k in params}
+            except (ValueError, TypeError):
+                filtered_args = args
+            
+            # Execute tool
+            logger.debug(f"Executing tool: {tool_name} with args: {filtered_args}")
+            
+            if asyncio.iscoroutinefunction(callable_obj):
+                # Async tool
+                result = await asyncio.wait_for(
+                    callable_obj(**filtered_args),
+                    timeout=self.tool_timeout_sec
+                )
             else:
-                # Non-dict JSON (array, string, number, etc)
-                return {"thought": json.dumps(result)}
+                # Sync tool - run in thread pool
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(callable_obj, **filtered_args),
+                    timeout=self.tool_timeout_sec
+                )
+            
+            execution_time_ms = (time.time() - start_time) * 1000
+            self.metrics.successful_tools += 1
+            self.metrics.tool_executions[tool_name] = self.metrics.tool_executions.get(tool_name, 0) + 1
+            
+            logger.info(f"✓ Tool '{tool_name}' completed in {execution_time_ms:.0f}ms")
+            
+            return ToolResult(
+                status=ToolExecutionStatus.SUCCESS,
+                data=result if isinstance(result, dict) else {"result": result},
+                execution_time_ms=execution_time_ms
+            )
+        
+        except asyncio.TimeoutError:
+            execution_time_ms = (time.time() - start_time) * 1000
+            logger.warning(f"⏱ Tool '{tool_name}' timed out after {execution_time_ms:.0f}ms")
+            
+            # Retry on timeout
+            if retry_count < self.tool_retries:
+                await asyncio.sleep(0.5 * (retry_count + 1))
+                logger.info(f"Retrying '{tool_name}' (attempt {retry_count + 1}/{self.tool_retries})")
+                return await self.run_tool(tool_name, args, retry_count + 1)
+            
+            self.metrics.failed_tools += 1
+            self.metrics.errors.append(f"Timeout: {tool_name}")
+            return ToolResult(
+                status=ToolExecutionStatus.TIMEOUT,
+                error=f"Tool execution timed out after {self.tool_timeout_sec}s",
+                execution_time_ms=execution_time_ms
+            )
+        
+        except (ConnectionError, OSError) as e:
+            execution_time_ms = (time.time() - start_time) * 1000
+            logger.warning(f"⚠ Retryable error in '{tool_name}': {type(e).__name__}")
+            
+            # Retry on connection errors
+            if retry_count < self.tool_retries:
+                await asyncio.sleep(0.5 * (retry_count + 1))
+                logger.info(f"Retrying '{tool_name}' (attempt {retry_count + 1}/{self.tool_retries})")
+                return await self.run_tool(tool_name, args, retry_count + 1)
+            
+            self.metrics.failed_tools += 1
+            self.metrics.errors.append(f"{type(e).__name__}: {tool_name}")
+            return ToolResult(
+                status=ToolExecutionStatus.RETRYABLE,
+                error=str(e),
+                execution_time_ms=execution_time_ms
+            )
+        
+        except Exception as e:
+            execution_time_ms = (time.time() - start_time) * 1000
+            logger.error(f"✗ Tool '{tool_name}' failed: {e}", exc_info=True)
+            self.metrics.failed_tools += 1
+            self.metrics.errors.append(f"{type(e).__name__}: {str(e)[:100]}")
+            return ToolResult(
+                status=ToolExecutionStatus.ERROR,
+                error=str(e),
+                execution_time_ms=execution_time_ms
+            )
+    
+    def _parse_llm_decision(self, raw: str) -> LLMDecision:
+        """
+        Parse LLM response with robust JSON handling.
+        
+        Implements 5-tier fallback strategy:
+        1. Direct JSON parse
+        2. Markdown code block removal
+        3. Nested JSON extraction
+        4. Partial JSON extraction
+        5. Wrap as thought field
+        """
+        raw = raw.strip()
+        
+        # Try 1: Direct JSON parse
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return LLMDecision(
+                    thought=data.get("thought", ""),
+                    tool=data.get("tool"),
+                    args=data.get("args", {}),
+                    final_answer=data.get("final_answer"),
+                    raw_response=raw
+                )
         except json.JSONDecodeError:
             pass
         
-        # Try 3: Extract JSON from partial/malformed input
-        # Find first { and last }
-        start_idx = txt.find("{")
-        end_idx = txt.rfind("}")
+        # Try 2: Remove markdown code blocks
+        try:
+            cleaned = raw.replace("```json", "").replace("```", "").strip()
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                return LLMDecision(
+                    thought=data.get("thought", ""),
+                    tool=data.get("tool"),
+                    args=data.get("args", {}),
+                    final_answer=data.get("final_answer"),
+                    raw_response=raw
+                )
+        except json.JSONDecodeError:
+            pass
         
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            try:
-                extracted = txt[start_idx:end_idx + 1]
-                result = json.loads(extracted)
-                if isinstance(result, dict):
-                    # Check for nested JSON again
-                    if "thought" in result and isinstance(result["thought"], str):
-                        try:
-                            nested = json.loads(result["thought"])
-                            if isinstance(nested, dict):
-                                for key in ["tool", "args", "final_answer"]:
-                                    if key not in result and key in nested:
-                                        result[key] = nested[key]
-                                if "thought" in nested:
-                                    result["thought"] = nested["thought"]
-                        except json.JSONDecodeError:
-                            pass
-                    
-                    if "thought" not in result:
-                        result["thought"] = json.dumps({k: v for k, v in result.items() if k not in ["tool", "args", "final_answer"]})
-                    return result
-            except json.JSONDecodeError:
-                pass
+        # Try 3: Extract nested JSON from thought
+        try:
+            start_idx = raw.find('{')
+            end_idx = raw.rfind('}') + 1
+            if start_idx != -1 and end_idx > start_idx:
+                json_str = raw[start_idx:end_idx]
+                data = json.loads(json_str)
+                if isinstance(data, dict):
+                    return LLMDecision(
+                        thought=data.get("thought", raw),
+                        tool=data.get("tool"),
+                        args=data.get("args", {}),
+                        final_answer=data.get("final_answer"),
+                        raw_response=raw
+                    )
+        except json.JSONDecodeError:
+            pass
         
-        # Try 4: Wrap raw text as thought (last resort)
-        # Only if it looks like it might be a valid response
-        if any(keyword in txt.lower() for keyword in ["thought", "tool", "final_answer", "action"]):
-            return {"thought": txt[:500]}
+        # Try 4: Extract partial JSON (first { to last })
+        try:
+            start_idx = raw.find('{')
+            end_idx = raw.rfind('}')
+            if start_idx != -1 and end_idx > start_idx:
+                json_str = raw[start_idx:end_idx + 1]
+                data = json.loads(json_str)
+                if isinstance(data, dict):
+                    return LLMDecision(
+                        thought=data.get("thought", raw),
+                        tool=data.get("tool"),
+                        args=data.get("args", {}),
+                        final_answer=data.get("final_answer"),
+                        raw_response=raw
+                    )
+        except json.JSONDecodeError:
+            pass
         
-        # Completely unparseable
-        return None
+        # Try 5: Wrap entire response as thought
+        logger.warning("Failed to parse LLM response, wrapping as thought")
+        return LLMDecision(
+            thought=raw,
+            tool=None,
+            args={},
+            final_answer=None,
+            raw_response=raw
+        )
+    
+    async def process_input(
+        self,
+        user_request: str,
+        workspace_id: Optional[str] = None
+    ) -> str:
+        """
+        Process user input through ReAct workflow.
+        
+        Args:
+            user_request: User's request or query
+            workspace_id: Optional workspace identifier
             
-    # -----------------------------------------------------------
-    # UNIFIED SKILL-DRIVEN WORKFLOW
-    # -----------------------------------------------------------
-    async def process_input(self, user_input: str):
+        Returns:
+            Final answer from the workflow
         """
-        Skill-driven autonomous workflow.
-        1. Select appropriate skill based on user intent
-        2. Use skill's agent_behavior for LLM instructions
-        3. Execute tool calls from LLM response
-        4. Continue until LLM returns final_answer
-        """
-        workspace_id = "pentest_1"
-        max_iterations = 10
-        iteration = 0
-        messages: List[Dict[str, Any]] = []
+        workspace_id = workspace_id or self.workspace_id
+        self.message_history = []
+        self.metrics = ExecutionMetrics()
         
-        # 1️⃣ SELECT SKILL BASED ON USER INPUT
+        logger.info(f"Starting workflow for: {user_request[:100]}")
+        
+        # 1. Detect phase and select skill
         if not self.skill_selector:
-            print("[AGENT] Skill selector not initialized")
-            return
+            self.skill_selector = SkillSelector(self.all_skills)
         
-        selected_skill, phase = self.skill_selector.select_skill(user_request=user_input)
+        skill, phase, confidence = self.skill_selector.select_skill(user_request)
         self.current_phase = phase
+        self.current_skill = self.skill_selector.skill_to_dict(skill) if skill else None
         
-        # Convert Skill object to dict for backward compatibility
-        if selected_skill:
-            self.current_skill = self.skill_selector.skill_to_dict(selected_skill)
-        else:
-            self.current_skill = None
+        logger.info(f"Selected phase: {phase.value} (confidence: {confidence:.2f})")
+        logger.info(f"Selected skill: {self.current_skill.get('name', 'Unknown') if self.current_skill else 'None'}")
         
-        if selected_skill:
-            skill_name = self.current_skill.get('name', 'Unknown')
-            print(f"[SKILL SELECTED] {skill_name}")
-        else:
-            print("[SKILL SELECTOR] No matching skill found")
-            return
-        
-        # 3️⃣ Fetch SHORT-TERM memory (current session discoveries) - QUICK
-        short_mem_result = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
-
-        # Extract data from standardized result format
-        if short_mem_result.get("status") == "success":
-            short_term_context = short_mem_result.get("data", {})
-        else:
-            print(f"[WARN] Short-term memory fetch failed: {short_mem_result.get('error', 'unknown error')}")
-            short_term_context = {}
-        
-        # 4️⃣ Fetch LONG-TERM memory ASYNC (don't block on this, try in background)
-        long_term_context = {}
+        # 2. Fetch memory
+        short_term_memory = {}
         try:
-            # Use a timeout to avoid waiting too long for ReMeApp
-            long_mem_task = asyncio.create_task(
-                self.run_tool("mem_get_long", {"workspace_id": workspace_id})
-            )
-            # Don't wait if it takes more than 2 seconds
+            mem_result = await self.run_tool("mem_get_short", {"workspace_id": workspace_id})
+            if mem_result.status == ToolExecutionStatus.SUCCESS:
+                short_term_memory = mem_result.data
+        except Exception as e:
+            logger.warning(f"Failed to fetch short-term memory: {e}")
+        
+        # 3. Build system prompt
+        base_context = f"Workspace: {workspace_id}\nPhase: {phase.value}"
+        if short_term_memory:
+            base_context += f"\nCurrent Memory: {json.dumps(short_term_memory, indent=2)[:500]}"
+        
+        system_prompt = create_skill_aware_system_prompt(self.current_skill, base_context)
+        
+        # 4. Main ReAct loop
+        for iteration in range(self.max_iterations):
+            logger.debug(f"Iteration {iteration + 1}/{self.max_iterations}")
+            self.metrics.total_iterations = iteration + 1
+            
+            # Get LLM decision
             try:
-                long_mem_result = await asyncio.wait_for(long_mem_task, timeout=2.0)
-                # Extract data from standardized result format
-                if long_mem_result.get("status") == "success":
-                    long_term_context = long_mem_result.get("data", {})
-                else:
-                    print(f"[WARN] Long-term memory error: {long_mem_result.get('error')}")
+                llm_input = f"{system_prompt}\n\nUser: {user_request}"
+                decision_raw = await asyncio.wait_for(
+                    asyncio.to_thread(self.llm.generate_content, llm_input),
+                    timeout=self.llm_timeout_sec
+                )
+                decision = self._parse_llm_decision(decision_raw)
+                logger.debug(f"Decision: thought='{decision.thought[:50]}...', tool={decision.tool}, final_answer={decision.final_answer is not None}")
+            
             except asyncio.TimeoutError:
-                print("[WARN] Long-term memory fetch timeout, proceeding with short-term only")
-                long_term_context = {}
-        except Exception as e:
-            print(f"[WARN] Long-term memory error: {e}, using short-term only")
-        
-        # 5️⃣ Build skill context with available memory
-        # Use current_skill (dict format) for backward compatibility with ClaudeSkillsAPIBuilder
-        system_prompt_with_skills = create_skill_aware_system_prompt(
-            self.current_skill,
-            base_context=""
-        )
-        
-        # 6️⃣ Combine memory contexts (lightweight)
-        memory_section = self._build_memory_context(short_term_context, long_term_context)
-        
-        system_prompt_with_context = f"""{system_prompt_with_skills}
-
-{memory_section}
-"""
-        
-        # Add initial user message to history
-        messages.append({
-            "role": "user",
-            "content": user_input
-        })
-        
-        # 5️⃣ PRE-CHECK: Automatically check available tools on first iteration
-        print("\n[PRE-CHECK] Checking available tools for this phase...")
-        available_tools_result = await self.run_tool("check_available_tools", {"tool_category": "all"})
-        if available_tools_result.get("status") == "success":
-            available_tools_data = available_tools_result.get("data", {})
-            available_list = available_tools_data.get("available_tools", {})
-            print(f"[PRE-CHECK] Found {len(available_list)} available tools: {', '.join(available_list.keys())}")
+                logger.error("LLM call timed out")
+                return "Error: LLM call timed out"
+            except Exception as e:
+                logger.error(f"LLM error: {e}")
+                return f"Error: {str(e)}"
             
-            # Add to system prompt so LLM knows what's available
-            available_tools_info = f"\n[AVAILABLE TOOLS] These security tools are available on this system:\n"
-            for tool_name in sorted(available_list.keys()):
-                available_tools_info += f"  - {tool_name}\n"
-            available_tools_info += f"Use these tools when appropriate. If a tool you want is not listed, use alternatives that ARE available.\n"
+            # Check if complete
+            if decision.is_complete():
+                logger.info(f"Workflow complete: {decision.final_answer[:100]}")
+                return decision.final_answer
             
-            system_prompt_with_context = f"""{system_prompt_with_context}
-
-{available_tools_info}
-"""
-        
-        while iteration < max_iterations:
-            iteration += 1
-            print(f"\n[ITERATION {iteration}/{max_iterations}]")
-            
-            # 6️⃣ Build conversation prompt with message history
-            conversation_text = self._build_conversation_prompt(messages)
-            
-            # 7️⃣ LLM Call with Claude Skills (full instructions loaded on-demand)
-            decision_raw = await asyncio.to_thread(
-                self.llm.generate_content,
-                system_instruction=system_prompt_with_context,
-                prompt=conversation_text
-            )
-            
-            print(f"[DEBUG] LLM Raw Response: {decision_raw[:100]}...")
-            
-            decision = self._parse_llm_decision(decision_raw)
-            if not decision:
-                print("\n[ERROR] Agent: Invalid LLM output. Expected JSON with 'thought' key.")
-                print(f"[DEBUG] Full response was:\n{decision_raw}\n")
-                print("[DEBUG] Attempting fallback: wrapping as thought...")
-                # Fallback: wrap the raw response as thought
-                fallback_thought = str(decision_raw)[:500]
-                if fallback_thought.strip():
-                    decision = {"thought": fallback_thought}
-                else:
-                    print("[ERROR] Fallback failed - empty response. Exiting.")
-                    return
-            
-            # Validate decision has required 'thought' field
-            if not isinstance(decision, dict) or "thought" not in decision:
-                print("[ERROR] Decision missing 'thought' field after parsing. Exiting.")
-                return
-            
-            # Extract ReAct components
-            thought = decision.get("thought", "")
-            tool_name = decision.get("tool")
-            tool_args = decision.get("args", {}) or {}
-            final_answer = decision.get("final_answer")
-            
-            # Append thought to message history
-            if thought:
-                messages.append({
+            # Execute tool if specified
+            if decision.has_action():
+                tool_result = await self.run_tool(decision.tool, decision.args)
+                logger.info(f"Tool result: {tool_result.status.value}")
+                
+                # Auto-save to memory
+                await self._auto_save_to_memory(workspace_id, decision.tool, tool_result)
+                
+                # Add to message history
+                self.message_history.append({
                     "role": "assistant",
-                    "content": f"[THOUGHT] {thought}"
+                    "content": decision.raw_response
                 })
-            
-            # 8️⃣ Check if task is complete
-            if final_answer:
-                messages.append({
-                    "role": "assistant",
-                    "content": f"[FINAL ANSWER] {final_answer}"
+                self.message_history.append({
+                    "role": "tool",
+                    "tool": decision.tool,
+                    "content": json.dumps(tool_result.to_dict())
                 })
-                print(f"\nAgent: {final_answer}")
-                
-                # Auto-consolidate findings (async, non-blocking)
-                asyncio.create_task(self._consolidate_phase_findings(workspace_id, final_answer))
-                return
-            
-            # 9️⃣ Execute tool if specified
-            if tool_name:
-                print(f"\n[ACTION] Executing: {tool_name}")
-                result = await self.run_tool(tool_name, tool_args)
-                
-                # 🔟 Check for errors using standardized status format
-                result_status = result.get("status", "unknown")
-                
-                if result_status == "error":
-                    error_msg = result.get("error", "Unknown error")
-                    print(f"[ERROR] {error_msg}")
-                    # Append error as observation so LLM can self-correct
-                    messages.append({
-                        "role": "user",
-                        "content": f"[OBSERVATION - ERROR] Tool '{tool_name}' failed: {error_msg}. Please try a different approach."
-                    })
-                elif result_status == "warning":
-                    # Warning = partial success, still proceed but log warning
-                    warning_msg = result.get("error", "Warning during execution")
-                    print(f"[WARNING] {warning_msg}")
-                    print(f"[OBSERVATION] {json.dumps(result.get('data', {}), indent=2)[:500]}...")
-                    messages.append({
-                        "role": "user",
-                        "content": f"[OBSERVATION - WARNING] Tool '{tool_name}' completed with warning: {warning_msg}\nData: {json.dumps(result.get('data', {}))}"
-                    })
-                    
-                    # Save partial result to memory
-                    asyncio.create_task(self._auto_save_to_memory(workspace_id, tool_name, result))
-                else:
-                    # Success: append result as observation
-                    data = result.get("data", result)  # Extract data if wrapped
-                    print(f"[OBSERVATION] {json.dumps(data, indent=2)[:500]}...")
-                    messages.append({
-                        "role": "user",
-                        "content": f"[OBSERVATION] Tool '{tool_name}' succeeded. Data:\n{json.dumps(data, indent=2)}"
-                    })
-                    
-                    # Save tool result to memory (async, non-blocking)
-                    asyncio.create_task(self._auto_save_to_memory(workspace_id, tool_name, result))
             else:
-                # No tool specified and no final answer — provide a default completion
-                print("[AGENT] No action specified. Generating final response...")
-                final_answer = f"Completed {self.current_phase.value} phase analysis. Ready for next phase."
-                messages.append({
-                    "role": "assistant",
-                    "content": f"[FINAL ANSWER] {final_answer}"
-                })
-                print(f"\nAgent: {final_answer}")
-                return
+                logger.warning("No action specified, using final answer as thought")
+                return decision.thought
         
-        # Max iterations reached
-        print(f"Agent: Reached maximum iterations ({max_iterations}). Ending session.")
-        return
+        logger.warning(f"Reached max iterations ({self.max_iterations})")
+        return "Max iterations reached without completion"
     
-    def _build_conversation_prompt(self, messages: List[Dict[str, Any]]) -> str:
-        """
-        Convert message history into a prompt string.
-        Format: role: content
-        """
-        prompt_lines = []
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            prompt_lines.append(f"{role}: {content}")
-        
-        # Explicit instruction for next decision
-        prompt_lines.append("\n" + "="*60)
-        prompt_lines.append("NEXT DECISION (respond ONLY with JSON):")
-        prompt_lines.append("="*60)
-        prompt_lines.append("Respond with JSON:")
-        prompt_lines.append('{"thought": "...", "tool": "...", "args": {...}, "final_answer": "..."}')
-        return "\n".join(prompt_lines)
-    
-    async def _consolidate_phase_findings(self, workspace_id: str, phase_summary: str) -> None:
-        """
-        Consolidate phase findings into long-term memory at phase completion.
-        Ensures discoveries are persisted for future sessions.
-        """
+    async def _auto_save_to_memory(
+        self,
+        workspace_id: str,
+        tool_name: str,
+        result: ToolResult
+    ) -> None:
+        """Auto-save tool results to memory."""
         try:
-            consolidation_data = {
-                "phase": self.current_phase.value if self.current_phase else "unknown",
-                "skill": self.current_skill.get("name") if self.current_skill else "unknown",
-                "summary": phase_summary,
-                "timestamp": str(__import__('datetime').datetime.now()),
-                "status": "completed"
-            }
-            
-            # Save to long-term memory for persistent knowledge
-            await self.run_tool("mem_set_long", {
+            # Short-term save
+            await self.run_tool("mem_set_short", {
                 "workspace_id": workspace_id,
-                f"phase_{self.current_phase.value}_findings": consolidation_data
+                f"{tool_name}_result": {
+                    "status": result.status.value,
+                    "timestamp": datetime.now().isoformat(),
+                    "data_summary": str(result.data)[:200]
+                }
             })
-            
-            print(f"[MEMORY] Phase {self.current_phase.value} findings saved to long-term memory")
-            
         except Exception as e:
-            print(f"[DEBUG] Phase consolidation failed: {e}")
-
-    async def _auto_save_to_memory(self, workspace_id: str, tool_name: str, result: Any) -> None:
-        """
-        Automatically save tool execution result to BOTH short-term and long-term memory.
+            logger.warning(f"Failed to save to short-term memory: {e}")
         
-        Short-term: Quick access during current session
-        Long-term: Persistent knowledge for future sessions via ReMeApp
-        """
         try:
-            # Prepare memory data
-            memory_entry = {
-                "tool": tool_name,
-                "timestamp": str(__import__('datetime').datetime.now()),
-                "phase": self.current_phase.value if self.current_phase else "unknown",
-                "skill": self.current_skill.get("name") if self.current_skill else "unknown"
-            }
-            
-            # Add result summary
-            if isinstance(result, dict):
-                memory_entry["result"] = {k: v for k, v in result.items() if k != "error"}[:500]
-            else:
-                memory_entry["result"] = str(result)[:200]
-            
-            # 1️⃣ SAVE TO SHORT-TERM MEMORY (in-memory, fast access)
-            try:
-                await self.run_tool("mem_set_short", {
+            # Long-term save with timeout
+            await asyncio.wait_for(
+                self.run_tool("mem_set_long", {
                     "workspace_id": workspace_id,
-                    f"{tool_name}_execution": memory_entry
-                })
-            except Exception as e:
-                print(f"[DEBUG] Short-term memory save failed: {e}")
-            
-            # 2️⃣ SAVE TO LONG-TERM MEMORY (ReMeApp, persistent)
-            try:
-                await self.run_tool("mem_set_long", {
-                    "workspace_id": workspace_id,
-                    f"{tool_name}_{self.current_phase.value}": memory_entry
-                })
-            except Exception as e:
-                print(f"[DEBUG] Long-term memory save failed: {e}")
-                
+                    f"{tool_name}_{self.current_phase.value if self.current_phase else 'unknown'}": {
+                        "status": result.status.value,
+                        "timestamp": datetime.now().isoformat(),
+                        "tool": tool_name,
+                        "data": result.data
+                    }
+                }),
+                timeout=self.DEFAULT_MEMORY_FETCH_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Long-term memory save timed out (non-blocking)")
         except Exception as e:
-            # Fail silently for auto-save errors
-            print(f"[DEBUG] Auto-save to memory failed: {e}")
+            logger.warning(f"Failed to save to long-term memory: {e}")
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get execution metrics."""
+        return self.metrics.to_dict()
+    
+    async def cleanup(self) -> None:
+        """Cleanup agent resources."""
+        try:
+            await cleanup_reme()
+            logger.info("✓ Agent cleanup complete")
+        except Exception as e:
+            logger.warning(f"Cleanup error: {e}")
 
-# -----------------------------------------------------------
-# ENTRY POINT
-# -----------------------------------------------------------
+
+# ================ USAGE EXAMPLES ================
+
+async def example_basic_usage():
+    """Example 1: Basic initialization and usage."""
+    agent = await Agent().async_init()
+    result = await agent.process_input("Scan 192.168.1.0/24")
+    print(f"Result: {result}")
+    await agent.cleanup()
+
+
+async def example_custom_config():
+    """Example 2: Custom configuration."""
+    agent = await Agent(
+        max_iterations=20,
+        llm_timeout_sec=45,
+        tool_timeout_sec=90,
+        tool_retries=3
+    ).async_init()
+    result = await agent.process_input("Enumerate services on 192.168.1.1")
+    print(f"Result: {result}")
+    await agent.cleanup()
+
+
+async def example_metrics():
+    """Example 3: Access execution metrics."""
+    agent = await Agent().async_init()
+    await agent.process_input("Check available tools")
+    metrics = agent.get_metrics()
+    print(f"Iterations: {metrics['total_iterations']}")
+    print(f"Successful tools: {metrics['successful_tools']}")
+    print(f"Tool usage: {metrics['tool_executions']}")
+    await agent.cleanup()
+
+
+async def example_direct_tool():
+    """Example 4: Direct tool execution."""
+    agent = await Agent().async_init()
+    result = await agent.run_tool(
+        "execute_system_command",
+        {"command": "whoami"}
+    )
+    print(f"Status: {result.status.value}")
+    print(f"Output: {result.data}")
+    await agent.cleanup()
+
+
 if __name__ == "__main__":
-    print("Starting Penzer Security Agent...")
-
-    async def main():
-        # Async-safe agent creation
-        agent = await Agent().async_init()
-        print(
-            f"Agent ready with {len(agent.tool_schema)} tools "
-            f"and {len(agent.resource_uris)} resources."
-        )
-
-        while True:
-            q = input("\nUser: ")
-            if q.lower() in ("quit", "exit"):
-                print("Shutting down.")
-                break
-            await agent.process_input(q)  # ✅ async call
-
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        print("Fatal startup error:", e)
+    import asyncio
+    asyncio.run(example_basic_usage())
