@@ -185,6 +185,20 @@ class Agent:
         """Async initialization of agent."""
         logger.info("Initializing Penzer Agent...")
         
+        # CRITICAL: Import tool modules to register them with MCP
+        # Must happen BEFORE _load_tool_schema() so @mcp.tool() decorators are registered
+        try:
+            import session.session
+            logger.debug("✓ Registered session.session (memory tools)")
+        except Exception as e:
+            logger.debug(f"Failed to import session.session: {e}")
+        
+        try:
+            import tools.tools
+            logger.debug("✓ Registered tools.tools (security tools)")
+        except Exception as e:
+            logger.debug(f"Failed to import tools.tools: {e}")
+        
         # Initialize memory
         reme_success = await init_reme()
         if not reme_success:
