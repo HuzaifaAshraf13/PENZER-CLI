@@ -248,5 +248,28 @@ def search_exploit_db(query: str) -> dict:
 #  DEBUG — Show registered tools
 # ======================================================================
 @mcp.tool()
-def list_registered_tools() -> list:
-    return list(mcp.tools.keys())
+def list_registered_tools() -> dict:
+    """
+    Lists all registered MCP tools available to the agent.
+    
+    Returns:
+        Standardized ToolResult with tool list
+    """
+    try:
+        # Access tools from the FastMCP tool manager
+        if hasattr(mcp, '_tool_manager') and hasattr(mcp._tool_manager, '_tools'):
+            tools_dict = mcp._tool_manager._tools
+            tools_list = sorted(list(tools_dict.keys()))
+            
+            return success(
+                data={
+                    "total_tools": len(tools_list),
+                    "tools": tools_list
+                },
+                metadata={"operation": "list_registered_tools"}
+            )
+        else:
+            return error("Tool manager not accessible")
+    except Exception as e:
+        return error(f"Failed to list tools: {str(e)}")
+
