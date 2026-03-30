@@ -34,7 +34,7 @@ def suppress_reme_logs():
 # ---------------- SHORT-TERM MEMORY ----------------
 session_memory = {}
 
-@mcp.tool("mem_get_short")
+@mcp.tool()
 async def mem_get_short(workspace_id: str):
     """Retrieve all short-term memory for a workspace."""
     try:
@@ -46,7 +46,7 @@ async def mem_get_short(workspace_id: str):
     except Exception as e:
         return error(f"Failed to get short-term memory: {str(e)}")
 
-@mcp.tool("mem_set_short")
+@mcp.tool()
 async def mem_set_short(workspace_id: str, data: dict):
     """Set short-term memory with a dictionary of key-value pairs."""
     try:
@@ -59,7 +59,7 @@ async def mem_set_short(workspace_id: str, data: dict):
         return error(f"Failed to set short-term memory: {str(e)}")
 
 # ---------------- LONG-TERM MEMORY ----------------
-@mcp.tool("mem_get_long")
+@mcp.tool()
 async def mem_get_long(workspace_id: str):
     """Retrieve all long-term memory for a workspace."""
     try:
@@ -77,7 +77,7 @@ async def mem_get_long(workspace_id: str):
     except Exception as e:
         return error(f"Failed to get long-term memory: {str(e)}")
 
-@mcp.tool("mem_set_long")
+@mcp.tool()
 async def mem_set_long(workspace_id: str, data: dict):
     """Store data to long-term memory with a dictionary of key-value pairs."""
     try:
@@ -100,7 +100,7 @@ async def mem_set_long(workspace_id: str, data: dict):
         return error(f"Failed to set long-term memory: {str(e)}")
 
 # ---------------- UNIFIED MEMORY SEARCH ----------------
-@mcp.tool("mem_search")
+@mcp.tool()
 async def mem_search(workspace_id: str, query: str):
     """
     Search both short-term and long-term memory for relevant information.
@@ -144,7 +144,7 @@ async def mem_search(workspace_id: str, query: str):
     except Exception as e:
         return error(f"Failed to search memory: {str(e)}")
 
-@mcp.tool("mem_clear_short")
+@mcp.tool()
 async def mem_clear_short(workspace_id: str):
     """Clear all short-term memory for a workspace."""
     try:
