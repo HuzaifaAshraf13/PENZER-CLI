@@ -349,30 +349,77 @@ class SkillSelector:
 
 
 # Exported function for creating skill-aware system prompts
-def create_skill_aware_system_prompt(current_skill: Dict[str, Any], base_context: str = "") -> str:
+def create_skill_aware_system_prompt(current_skill: Dict[str, Any], available_tools: Dict[str, Any] = None, base_context: str = "") -> str:
     """
-    Create a system prompt that incorporates the current skill's instructions.
+    Create a system prompt that gives LLM full tool access and autonomy.
     
     Args:
-        current_skill: Skill dict from skill_to_dict()
+        current_skill: Skill dict from skill_to_dict() (can be None for full autonomy)
+        available_tools: Dict of all available tools {name: {args: [...]}}
         base_context: Additional context to include
         
     Returns:
         Formatted system prompt string
     """
-    if not current_skill:
-        return base_context or "You are Penzer, an autonomous pentesting agent."
+    # Build tools reference for LLM
+    tools_reference = ""
+    if available_tools:
+        tools_reference = "\n## AVAILABLE TOOLS:\n"
+        for tool_name, tool_info in available_tools.items():
+            args = ", ".join(tool_info.get("args", []))
+            tools_reference += f"- {tool_name}({args})\n"
     
-    prompt = f"""You are Penzer, an autonomous pentesting agent.
-Current Skill: {current_skill.get('name', 'Unknown')}
-Phase: {current_skill.get('phase', 'unknown').upper()}
+    if not current_skill:
+        prompt = f"""You are Penzer, an autonomous pentesting agent with full autonomy.
 
-{current_skill.get('agent_behavior', '')}
+You have complete access to the system. Analyze the user's request and decide the best course of action.
+You can use ANY available tool based on your judgment.
+
+{tools_reference}
+
+USER REQUEST ANALYSIS:
+- Understand what the user is asking
+- Decide which tools are most appropriate
+- Execute tools in logical sequence
+- Provide clear findings
 
 {base_context}
 
-IMPORTANT: Respond ONLY with valid JSON in this format:
+RESPONSE FORMAT (ONLY valid JSON):
 {{"thought": "your analysis", "tool": "tool_name", "args": {{...}}, "final_answer": "..."}}
+
+Rules:
+- tool: name of tool to use (optional if providing final_answer)
+- args: dictionary of arguments for the tool (required if tool is specified)
+- final_answer: provide when task is complete (optional)
+- Always include "thought" explaining your reasoning
 """
+    else:
+        phase = current_skill.get('phase', 'unknown').upper()
+        skill_name = current_skill.get('name', 'Unknown')
+        
+        prompt = f"""You are Penzer, an autonomous pentesting agent.
+
+CURRENT PHASE: {phase}
+CURRENT SKILL: {skill_name}
+
+You have full access to all available tools. Use your judgment to accomplish the task.
+{current_skill.get('agent_behavior', '')}
+
+{tools_reference}
+
+{base_context}
+
+RESPONSE FORMAT (ONLY valid JSON):
+{{"thought": "your analysis", "tool": "tool_name", "args": {{...}}, "final_answer": "..."}}
+
+Rules:
+- Use any tool you deem necessary based on the task
+- tool: name of tool to use (optional if providing final_answer)
+- args: dictionary of arguments for the tool (required if tool is specified)
+- final_answer: provide when task is complete (optional)
+- Always include "thought" explaining your reasoning
+"""
+    
     return prompt
 

@@ -32,22 +32,10 @@ except Exception as e:
     logger.warning(f"Failed to load tools.tools: {e}")
 
 try:
-    import tools.ToolsPrompts   # Registers tool prompts
-    logger.info("✓ Loaded tools.ToolsPrompts")
-except Exception as e:
-    logger.warning(f"Failed to load tools.ToolsPrompts: {e}")
-
-try:
     import session.session      # Registers memory tools (mem_get_short, mem_set_short, mem_get_long, mem_set_long)
     logger.info("✓ Loaded session.session")
 except Exception as e:
     logger.warning(f"Failed to load session.session: {e}")
-
-try:
-    import session.sessionprompts  # Registers session prompts
-    logger.info("✓ Loaded session.sessionprompts")
-except Exception as e:
-    logger.warning(f"Failed to load session.sessionprompts: {e}")
 
 # ---------------- HELPER TO LIST TOOLS ----------------
 async def _get_mcp_tool_keys():

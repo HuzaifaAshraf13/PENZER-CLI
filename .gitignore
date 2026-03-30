@@ -41,3 +41,6 @@ memory_store/
 data/
 chromma_vector_store/
 model/
+__pycache__/
+*.pyc
+.env

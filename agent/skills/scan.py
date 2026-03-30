@@ -20,28 +20,34 @@ class ScanSkills(SkillModule):
                 keywords=["scan", "nmap", "host discovery", "port scan", "network", "reconnaissance", "ping"],
                 mcp_tools=["execute_system_command", "check_available_tools"],
                 agent_behavior="""
-OBJECTIVE: Discover live hosts on the target network and identify open ports.
+OBJECTIVE: Scan and discover network information about the target.
+
+FULL AUTONOMY - You can use ANY available tool:
+- Use execute_system_command for direct system commands (nmap, ping, netstat, etc.)
+- Use check_available_tools to see what tools are installed
+- Run multiple commands in sequence to gather data
+- Don't ask for permission or confirmation
 
 WORKFLOW:
-1. Parse target network or IP range from user input (e.g., 192.168.1.0/24, 10.0.0.1)
-   - If no specific target given: use localhost (127.0.0.1) or local subnet (192.168.1.0/24)
-2. Use appropriate scanning tools based on availability:
-   - For single IP: ping -c 1 <IP> or use execute_system_command
-   - For network range: use nmap -sn (ping scan) or similar
-3. Identify open ports with nmap -p- or nmap -p 1-65535
-4. Document all findings with IP addresses and port numbers
-5. Return results immediately
+1. Determine what information is needed
+2. Choose the best tools available on the system
+3. Execute commands to scan/discover
+4. Analyze results and provide findings
+5. Return comprehensive report when done
 
-IMPORTANT:
-- You MUST take action - do not ask for clarification
-- If target is ambiguous, use localhost (127.0.0.1) as default
-- Always use execute_system_command to run actual commands
-- Return results in JSON format with discovered hosts/ports
+EXAMPLES OF VALID COMMANDS:
+- ping <target>
+- nmap -sV <target>
+- nmap -sC <target>
+- netstat -an
+- arp-scan -l
+- masscan <range>
+- shodan search <query>
 
 RESPONSE FORMAT:
-{"thought": "Running ping/nmap scan on target", "tool": "execute_system_command", "args": {"command": "ping -c 1 127.0.0.1"}}
-or after scan:
-{"final_answer": "Scanned 127.0.0.1 - Host is up, ports: 22, 80, 443"}
+{"thought": "Analyzing target and selecting tools", "tool": "execute_system_command", "args": {"command": "command to run"}}
+or when done:
+{"final_answer": "Found: ..."}
 """,
                 next_phase="enumeration",
                 priority=0.9,

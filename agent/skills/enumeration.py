@@ -20,29 +20,30 @@ class EnumerationSkills(SkillModule):
                 keywords=["enumerate", "service", "version", "detection", "banner", "probe", "identify"],
                 mcp_tools=["execute_system_command"],
                 agent_behavior="""
-OBJECTIVE: Identify services, versions, and technologies running on open ports.
+OBJECTIVE: Enumerate and identify all services, versions, and information on the target.
 
-WORKFLOW:
-1. For each discovered open port from SCAN phase:
-2. Connect to the service (telnet, nc) to grab banners
-3. Use nmap -sV for detailed version detection
-4. Probe specific service ports (e.g., 80=HTTP, 445=SMB, 389=LDAP)
-5. Identify technologies (web frameworks, databases, AD servers)
-6. Build a detailed inventory of all services and versions
+FULL AUTONOMY - You can use ANY available tool:
+- Execute any enumeration commands
+- Use check_available_tools to see what's installed
+- Chain multiple tools for comprehensive enumeration
+- Run smb, ldap, web, dns enumeration as needed
+- Make independent decisions on what to probe
 
-TOOLS TO USE:
-- nmap -sV: Service version detection
-- telnet/nc: Banner grabbing
-- http probes: For web services
-- smb-related tools: For SMB/CIFS services
-- ldap tools: For directory services
+TOOLS YOU CAN USE:
+- nmap -sV for version detection
+- enum4linux for AD enumeration
+- ldapsearch for LDAP queries
+- nikto for web vulnerabilities
+- gobuster/ffuf for directory bruting
+- telnet/nc for banner grabbing
+- crackmapexec for AD verification
+- dig/nslookup for DNS enumeration
+- Any other enumeration tools available
 
-OUTPUT EXPECTATIONS:
-- Service name and version for each port
-- Technology stack identification
-- Potential vulnerabilities based on versions
-- Configuration details (if available)
-- Recommended next steps based on services
+RESPONSE FORMAT:
+{"thought": "Enumerating services on discovered ports", "tool": "execute_system_command", "args": {"command": "command to run"}}
+or when done:
+{"final_answer": "Discovered: ..."}
 """,
                 next_phase="exploitation",
                 priority=0.85,
@@ -56,29 +57,19 @@ OUTPUT EXPECTATIONS:
                 keywords=["active directory", "ldap", "kerberos", "samba", "enum4linux", "smb", "users", "groups"],
                 mcp_tools=["execute_system_command"],
                 agent_behavior="""
-OBJECTIVE: Extract Active Directory structure, users, groups, and security information.
+OBJECTIVE: Enumerate Active Directory structure and extract security information.
 
-WORKFLOW:
-1. Detect if target is Windows/AD environment (port 389 LDAP, 445 SMB, 88 Kerberos)
-2. Use enum4linux to enumerate shares, users, groups, and policies
-3. Use ldapsearch to query LDAP structure, users, and SPN records
-4. Use rpcclient to enumerate users and RID cycling
-5. Identify privileged users, service accounts, and domain admins
-6. Map out trust relationships and security policies
+FULL AUTONOMY - Use ANY tools you judge necessary:
+- enum4linux for comprehensive AD enumeration
+- ldapsearch for directory queries
+- rpcclient for RPC enumeration
+- Any other AD/network enumeration tools available
+- Make decisions independently
 
-TOOLS TO USE:
-- enum4linux: Primary AD enumeration tool
-- ldapsearch: LDAP directory queries
-- rpcclient: RPC enumeration
-- crackmapexec: AD scanning and verification
-
-OUTPUT EXPECTATIONS:
-- Complete user list with descriptions
-- Group memberships and roles
-- Service Principal Names (SPNs)
-- Domain trust relationships
-- Potentially weak passwords or misconfigurations
-- Security policies and hardening status
+RESPONSE FORMAT:
+{"thought": "Enumerating AD on target", "tool": "execute_system_command", "args": {"command": "command to run"}}
+or when done:
+{"final_answer": "AD enumeration complete: ..."}
 """,
                 next_phase="exploitation",
                 priority=0.75,
@@ -92,30 +83,19 @@ OUTPUT EXPECTATIONS:
                 keywords=["web", "http", "directory", "enumeration", "nikto", "burp", "endpoint", "technology"],
                 mcp_tools=["execute_system_command"],
                 agent_behavior="""
-OBJECTIVE: Map web application structure, technologies, and potential vulnerabilities.
+OBJECTIVE: Enumerate web application structure, technologies, and vulnerabilities.
 
-WORKFLOW:
-1. Identify web service (HTTP/HTTPS on ports 80, 443, 8080, etc.)
-2. Use nikto for vulnerability scanning
-3. Use directory bruting (dirbuster, ffuf, gobuster) to discover hidden endpoints
-4. Identify web technologies (cms, framework, server software)
-5. Check for common misconfigurations (directory listing, .git, .env files)
-6. Analyze SSL/TLS certificates
-7. Test for basic web vulnerabilities (SQL injection indicators, XSS, etc.)
+FULL AUTONOMY - Use any web enumeration tools:
+- nikto for vulnerability scanning
+- gobuster/ffuf for directory bruting
+- curl/wget for manual probing
+- Any other web enumeration tools available
+- Make independent decisions
 
-TOOLS TO USE:
-- nikto: Web vulnerability scanner
-- gobuster/ffuf/dirbuster: Directory bruting
-- curl/wget: Manual probing
-- ssl_scan: SSL/TLS analysis
-
-OUTPUT EXPECTATIONS:
-- Complete list of discovered endpoints
-- Identified web technologies and versions
-- Potential vulnerabilities
-- SSL/TLS certificate information
-- Configuration issues and misconfigurations
-- Technology stack and dependencies
+RESPONSE FORMAT:
+{"thought": "Enumerating web application", "tool": "execute_system_command", "args": {"command": "command to run"}}
+or when done:
+{"final_answer": "Web enumeration complete: ..."}
 """,
                 next_phase="exploitation",
                 priority=0.8,

@@ -20,36 +20,19 @@ class ReportingSkills(SkillModule):
                 keywords=["report", "findings", "remediation", "summary", "executive", "vulnerability"],
                 mcp_tools=["execute_system_command"],
                 agent_behavior="""
-OBJECTIVE: Create comprehensive penetration testing report for stakeholders.
+OBJECTIVE: Generate comprehensive penetration testing report.
 
-WORKFLOW:
-1. Gather all findings from previous phases
-2. Organize vulnerabilities by severity (Critical, High, Medium, Low)
-3. Document each vulnerability with:
-   - Description and impact
-   - CVSS score
-   - Proof of concept / exploitation path
-   - Remediation steps
-4. Calculate overall risk assessment
-5. Create executive summary for management
-6. Provide technical details for IT/security teams
-7. Include timeline and methodology
-8. Generate final PDF/document report
+FULL AUTONOMY - Create reports as needed:
+- Compile all findings
+- Document vulnerabilities
+- Provide remediation guidance
+- Generate report output
+- Make independent decisions on report format
 
-REPORT SECTIONS:
-- Executive Summary (high-level findings)
-- Methodology (tools, techniques used)
-- Findings (organized by severity)
-- Risk Assessment (overall security posture)
-- Remediation Roadmap (prioritized fixes)
-- Appendices (technical details, logs)
-
-OUTPUT FORMAT:
-- Professional report document
-- Risk ratings and prioritization
-- Clear remediation guidance
-- Timeline for fixes
-- Follow-up testing recommendations
+RESPONSE FORMAT:
+{"thought": "Generating pentest report", "tool": "execute_system_command", "args": {"command": "command"}}
+or when done:
+{"final_answer": "Report generated: ..."}
 """,
                 next_phase="reporting",
                 priority=0.75,

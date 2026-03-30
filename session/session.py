@@ -36,7 +36,17 @@ session_memory = {}
 
 @mcp.tool()
 async def mem_get_short(workspace_id: str):
-    """Retrieve all short-term memory for a workspace."""
+    """
+    Retrieve short-term memory for the current workspace.
+    Use this to recall recent findings, discovered information, etc.
+    Short-term memory persists within the current session.
+    
+    Args:
+        workspace_id: Workspace identifier (e.g., "pentest_1")
+    
+    Returns:
+        {"status": "success", "data": {...}} containing all stored short-term memory
+    """
     try:
         data = session_memory.get(workspace_id, {})
         return success(
@@ -48,7 +58,17 @@ async def mem_get_short(workspace_id: str):
 
 @mcp.tool()
 async def mem_set_short(workspace_id: str, data: dict):
-    """Set short-term memory with a dictionary of key-value pairs."""
+    """
+    Store information to short-term memory for later recall.
+    Use this to save discoveries, results, findings, etc.
+    
+    Args:
+        workspace_id: Workspace identifier (e.g., "pentest_1")
+        data: Dictionary of key-value pairs to store
+    
+    Returns:
+        {"status": "success", "data": {...}} confirming storage
+    """
     try:
         session_memory.setdefault(workspace_id, {}).update(data)
         return success(
@@ -61,7 +81,17 @@ async def mem_set_short(workspace_id: str, data: dict):
 # ---------------- LONG-TERM MEMORY ----------------
 @mcp.tool()
 async def mem_get_long(workspace_id: str):
-    """Retrieve all long-term memory for a workspace."""
+    """
+    Retrieve long-term memory for the workspace.
+    This persists across sessions and stores consolidated findings.
+    Use this for persistent knowledge about targets, vulnerabilities, etc.
+    
+    Args:
+        workspace_id: Workspace identifier (e.g., "pentest_1")
+    
+    Returns:
+        {"status": "success", "data": {...}} containing consolidated long-term memory
+    """
     try:
         with suppress_reme_logs():
             res = await reme_app.async_execute(
@@ -79,7 +109,17 @@ async def mem_get_long(workspace_id: str):
 
 @mcp.tool()
 async def mem_set_long(workspace_id: str, data: dict):
-    """Store data to long-term memory with a dictionary of key-value pairs."""
+    """
+    Store consolidated findings to long-term memory for persistent knowledge.
+    Use this to save phase summaries, critical findings, etc.
+    
+    Args:
+        workspace_id: Workspace identifier (e.g., "pentest_1")
+        data: Dictionary of key-value pairs to persistently store
+    
+    Returns:
+        {"status": "success", "data": {...}} confirming persistent storage
+    """
     try:
         # Format trajectories from data dict
         trajectories = [{
@@ -104,7 +144,14 @@ async def mem_set_long(workspace_id: str, data: dict):
 async def mem_search(workspace_id: str, query: str):
     """
     Search both short-term and long-term memory for relevant information.
-    Returns combined results from both memory types.
+    Use this to find previous findings, discoveries, or stored data.
+    
+    Args:
+        workspace_id: Workspace identifier (e.g., "pentest_1")
+        query: Search query/keywords to find in memory
+    
+    Returns:
+        {"status": "success", "data": {"short_term": {...}, "long_term": {...}}} with matched results
     """
     try:
         combined_results = {
@@ -146,7 +193,15 @@ async def mem_search(workspace_id: str, query: str):
 
 @mcp.tool()
 async def mem_clear_short(workspace_id: str):
-    """Clear all short-term memory for a workspace."""
+    """
+    Clear all short-term memory for a workspace (reset session memory).
+    
+    Args:
+        workspace_id: Workspace identifier (e.g., "pentest_1")
+    
+    Returns:
+        {"status": "success"} or {"status": "warning"} if no memory to clear
+    """
     try:
         if workspace_id in session_memory:
             count = len(session_memory[workspace_id])
