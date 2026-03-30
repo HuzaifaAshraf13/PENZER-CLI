@@ -1,127 +1,80 @@
 """
-Penzer Autonomous Pentesting Agent - Refactored with Reason → Plan → Act Cycle
-Modern agent architecture with clear separation of concerns
+Penzer Autonomous Pentesting Agent
+Simple ReAct loop (Reason → Act → Observe) using skills
 """
 
 import json
 import asyncio
 import logging
-import uuid
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from enum import Enum
 
-from agent.core import mcp, init_reme, cleanup_reme
+from agent.core import mcp
 from agent.llm import LLM
-from agent.agent_state import AgentStateManager, AgentState, AgentPhase
-from agent.reasoning_engine import ReasoningEngine
-from agent.planning_engine import PlanningEngine
-from agent.action_executor import ActionExecutor
-from agent.observation_engine import ObservationEngine
-from agent.memory_manager import MemoryManager
-from agent.skill_selector import SkillSelector, create_skill_aware_system_prompt
-from agent.skills import PentestPhase, load_all_skills
-from config import MAX_ITERATIONS, REQUEST_TIMEOUT, DEFAULT_WORKSPACE
+from agent.skills import load_all_skills, PentestPhase
 
-# Import session tools and resources
-import session.session  # registers memory resources and tools
-
-# Setup logging
 logger = logging.getLogger(__name__)
+
+
+class LoopPhase(Enum):
+    """Current phase in ReAct loop"""
+    REASON = "reason"
+    ACT = "act"
+    OBSERVE = "observe"
 
 
 class PenzerAgent:
     """
-    Modern autonomous pentesting agent with Reason → Plan → Act cycle.
-    
-    Architecture:
-    - ReasoningEngine: Analyzes context and formulates understanding
-    - PlanningEngine: Creates step-by-step action plans
-    - ActionExecutor: Executes tools and handles results
-    - ObservationEngine: Interprets results and guides reflection
-    - MemoryManager: Manages short and long-term learning
+    Autonomous pentesting agent with Reason → Act → Observe loop.
+    Uses skills to guide decision-making.
     """
     
     def __init__(self):
-        """Initialize agent components"""
+        """Initialize agent"""
         self.llm = LLM()
         self.mcp_client = mcp
-        self.workspace_id = DEFAULT_WORKSPACE
         
-        # Initialize engines
-        self.reasoning_engine: Optional[ReasoningEngine] = None
-        self.planning_engine: Optional[PlanningEngine] = None
-        self.action_executor: Optional[ActionExecutor] = None
-        self.observation_engine: Optional[ObservationEngine] = None
-        self.memory_manager: Optional[MemoryManager] = None
-        
-        # Tool schema
-        self.tool_schema: Dict[str, Any] = {}
+        # Load skills by phase
+        self.skills = load_all_skills()
         self.available_tools: Dict[str, Any] = {}
+        self.tool_schema: Dict[str, Any] = {}
         
-        # Skills (for reference)
-        self.all_skills = load_all_skills()
-        self.skill_selector: Optional[SkillSelector] = None
+        # State tracking
+        self.iteration = 0
+        self.max_iterations = 10
+        self.action_history: List[Dict[str, Any]] = []
+        self.reasoning_history: List[str] = []
         
         logger.info("PenzerAgent initialized")
     
     async def async_init(self) -> 'PenzerAgent':
-        """
-        Async initialization of agent components.
-        Must be called before using agent.
-        """
-        logger.info("Starting async initialization")
-        
+        """Async initialization - load tools"""
         try:
-            # Initialize ReMeApp for memory
-            reme_success = await init_reme()
-            if not reme_success:
-                logger.warning("Long-term memory unavailable, using short-term only")
-            
-            # Load tools
             await self._load_tools()
-            
-            # Initialize engines with loaded tools
-            self.reasoning_engine = ReasoningEngine(self.llm)
-            self.planning_engine = PlanningEngine(self.llm, self.available_tools)
-            self.action_executor = ActionExecutor(self.llm, self)
-            self.observation_engine = ObservationEngine(self.llm)
-            self.memory_manager = MemoryManager(self)
-            
-            # Load existing memory
-            await self.memory_manager.load_memory(self.workspace_id)
-            
-            # Initialize skill selector
-            self.skill_selector = SkillSelector(self.all_skills)
-            
-            tool_count = len(self.tool_schema)
-            logger.info(f"Agent ready: {tool_count} tools loaded")
-            
+            logger.info(f"Agent ready: {len(self.available_tools)} tools loaded")
             return self
-        
         except Exception as e:
-            logger.error(f"Async initialization failed: {e}")
+            logger.error(f"Async init failed: {e}")
             raise
     
     async def _load_tools(self) -> None:
-        """Load MCP tools into agent"""
+        """Load MCP tools"""
         try:
             if hasattr(self.mcp_client, "get_tools"):
                 tools = await self.mcp_client.get_tools()
             else:
                 tools = getattr(self.mcp_client, "tools", {})
             
-            self.tool_schema = self._serialize_tools_for_prompt(tools)
             self.available_tools = tools
-            
+            self.tool_schema = self._serialize_tools(tools)
             logger.info(f"Loaded {len(self.tool_schema)} tools")
-        
         except Exception as e:
-            logger.error(f"Failed to load tools: {e}")
-            self.tool_schema = {}
+            logger.error(f"Tool loading failed: {e}")
             self.available_tools = {}
+            self.tool_schema = {}
     
-    def _serialize_tools_for_prompt(self, tools_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Serialize tools for LLM comprehension"""
+    def _serialize_tools(self, tools_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract tool signatures for LLM"""
         serial = {}
         for name, tool_obj in tools_dict.items():
             try:
@@ -129,179 +82,262 @@ class PenzerAgent:
                 fn = getattr(tool_obj, "fn", tool_obj)
                 if hasattr(fn, "__wrapped__"):
                     fn = fn.__wrapped__
-                
                 sig = inspect.signature(fn)
                 params = list(sig.parameters.keys())
-                
                 serial[name] = {"args": params}
             except Exception:
                 serial[name] = {"args": []}
-        
         return serial
     
     async def execute_user_request(self, user_request: str) -> Dict[str, str]:
         """
-        Execute user request through Reason → Plan → Act cycle.
+        Execute user request through ReAct loop.
         
         Returns:
             {"status": "success|error", "response": "..."}
         """
+        logger.info(f"Executing: {user_request}")
+        self.iteration = 0
+        self.action_history = []
+        self.reasoning_history = []
+        
         try:
-            # Create state manager
-            session_id = str(uuid.uuid4())[:8]
-            state_manager = AgentStateManager(session_id, user_request, MAX_ITERATIONS)
+            # Main ReAct loop
+            while self.iteration < self.max_iterations:
+                self.iteration += 1
+                logger.info(f"\n{'='*60}")
+                logger.info(f"ITERATION {self.iteration}/{self.max_iterations}")
+                logger.info(f"{'='*60}")
+                
+                # ===== REASON =====
+                logger.info("→ REASON")
+                reasoning = await self._reason_phase(user_request)
+                self.reasoning_history.append(reasoning)
+                logger.info(f"  Reasoning: {reasoning[:100]}")
+                
+                # Check if done reasoning
+                if "goal_achieved" in reasoning.lower() or "complete" in reasoning.lower():
+                    logger.info("  Goal marked as achieved in reasoning")
+                    return {"status": "success", "response": reasoning}
+                
+                # ===== ACT =====
+                logger.info("→ ACT")
+                action = await self._act_phase(user_request, reasoning)
+                
+                if not action:
+                    logger.warning("  No action to take")
+                    break
+                
+                self.action_history.append(action)
+                logger.info(f"  Tool: {action.get('tool_name')}")
+                
+                # ===== OBSERVE =====
+                logger.info("→ OBSERVE")
+                observation = await self._observe_phase(action, user_request)
+                logger.info(f"  Observation: {observation[:100]}")
+                
+                # Check if goal achieved
+                if "goal_achieved" in observation.lower() or "complete" in observation.lower():
+                    logger.info("  Goal achieved!")
+                    final_answer = await self._synthesize_answer(user_request)
+                    return {"status": "success", "response": final_answer}
             
-            logger.info(f"Executing request: {user_request[:100]}")
-            
-            # Run main loop with timeout
-            try:
-                await asyncio.wait_for(
-                    self._reason_plan_act_loop(state_manager),
-                    timeout=REQUEST_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                state_manager.set_timeout()
-                logger.warning(f"Request timed out after {REQUEST_TIMEOUT}s")
-            
-            # Return result
-            if state_manager.state.final_answer:
-                return {
-                    "status": "success",
-                    "response": state_manager.state.final_answer
-                }
-            else:
-                error_msg = state_manager.state.error_message or "No result generated"
-                return {
-                    "status": "error",
-                    "response": error_msg
-                }
+            # Max iterations reached
+            logger.warning(f"Max iterations ({self.max_iterations}) reached")
+            final_answer = await self._synthesize_answer(user_request)
+            return {"status": "success", "response": final_answer}
         
         except Exception as e:
             logger.error(f"Request execution failed: {e}")
-            return {
-                "status": "error",
-                "response": f"Fatal error: {str(e)}"
-            }
+            return {"status": "error", "response": str(e)}
     
-    async def _reason_plan_act_loop(self, state_manager: AgentStateManager) -> None:
+    async def _reason_phase(self, user_request: str) -> str:
         """
-        Main Reason → Plan → Act cycle loop.
-        Continues until goal achieved or max iterations reached.
+        Reason phase: Analyze goal and constraints.
+        Consider available skills and tools.
+        
+        Returns reasoning string.
         """
+        # Build available skills summary
+        skills_summary = self._build_skills_summary()
+        tools_summary = json.dumps(list(self.tool_schema.keys())[:15], indent=2)
         
-        while state_manager.state.iteration < state_manager.state.max_iterations:
-            
-            state_manager.increment_iteration()
-            logger.info(f"\n{'='*60}")
-            logger.info(f"ITERATION {state_manager.state.iteration}/{state_manager.state.max_iterations}")
-            logger.info(f"{'='*60}")
-            
-            try:
-                # ===== PHASE 1: REASONING =====
-                logger.info("→ REASONING PHASE")
-                reasoning_output = await self.reasoning_engine.reason(
-                    state_manager.state.user_request,
-                    state_manager.state,
-                    self.memory_manager.get_short_term_context(),
-                    self.memory_manager.get_long_term_context()
-                )
-                state_manager.state.add_reasoning(reasoning_output)
-                logger.info(f"  Goal: {reasoning_output.goal_analysis[:80]}")
-                
-                # ===== PHASE 2: PLANNING =====
-                logger.info("→ PLANNING PHASE")
-                planning_output = await self.planning_engine.plan(
-                    state_manager.state.user_request,
-                    reasoning_output,
-                    state_manager.state
-                )
-                state_manager.state.add_planning(planning_output)
-                logger.info(f"  Strategy: {planning_output.overall_strategy[:80]}")
-                logger.info(f"  Steps planned: {len(planning_output.step_by_step_plan)}")
-                
-                # ===== PHASE 3: ACTING =====
-                logger.info("→ ACTION PHASE")
-                action_output = await self.action_executor.execute(planning_output)
-                state_manager.state.add_action(action_output)
-                
-                if action_output.success:
-                    logger.info(f"  ✓ Tool executed: {action_output.tool_name}")
-                    
-                    # Auto-save to memory
-                    await self.memory_manager.save_short_term(
-                        self.workspace_id,
-                        f"action_{state_manager.state.iteration}",
-                        {
-                            "tool": action_output.tool_name,
-                            "result": action_output.result.get("data", {})
-                        }
-                    )
-                else:
-                    logger.warning(f"  ✗ Tool failed: {action_output.error_message}")
-                
-                # ===== PHASE 4: OBSERVATION =====
-                logger.info("→ OBSERVATION PHASE")
-                observation_output = await self.observation_engine.observe(
-                    action_output,
-                    planning_output.success_criteria,
-                    state_manager.state,
-                    state_manager.state.user_request
-                )
-                state_manager.state.add_observation(observation_output)
-                
-                # Check if goal achieved
-                if observation_output.iteration_complete:
-                    logger.info(f"  ✓ Goal achieved!")
-                    state_manager.set_complete(
-                        f"Goal achieved. Key findings: {', '.join(observation_output.key_findings)}"
-                    )
-                    break
-                
-                logger.info(f"  Findings: {', '.join(observation_output.key_findings[:2]) or 'None yet'}")
-            
-            except Exception as e:
-                logger.error(f"Iteration failed: {e}")
-                state_manager.set_failed(str(e))
-                break
+        prompt = f"""
+You are an autonomous pentesting agent. Analyze the user request and reasoning.
+
+## User Request
+{user_request}
+
+## Available Pentesting Skills (by phase)
+{skills_summary}
+
+## Available Tools
+{tools_summary}
+
+## Previous Actions
+{json.dumps([a.get('tool_name') for a in self.action_history[-3:]], indent=2) if self.action_history else "None yet"}
+
+## Task
+Reason about:
+1. What is the goal?
+2. What constraints exist?
+3. What skills are relevant?
+4. What's the next step?
+5. Have we achieved the goal?
+
+Respond with clear reasoning. If goal is achieved, say "GOAL_ACHIEVED: [summary]"
+"""
         
-        # Check max iterations
-        if state_manager.state.iteration >= state_manager.state.max_iterations:
-            logger.warning(f"Reached max iterations ({MAX_ITERATIONS})")
-            if not state_manager.state.final_answer:
-                state_manager.set_complete(
-                    "Max iterations reached. Review collected findings above."
-                )
+        system = "You are a pentesting agent reasoning engine. Be precise and tactical."
+        response = await self._llm_call(system, prompt)
+        return response
+    
+    async def _act_phase(self, user_request: str, reasoning: str) -> Optional[Dict[str, Any]]:
+        """
+        Act phase: Select and execute a tool or skill.
         
-        # Consolidate learning
+        Returns action dict or None if no action.
+        """
+        available_actions = self._build_available_actions()
+        
+        prompt = f"""
+You are selecting which tool/skill to execute next.
+
+## Current Goal
+{user_request}
+
+## Current Reasoning
+{reasoning[:500]}
+
+## Available Actions
+{json.dumps(available_actions, indent=2)}
+
+## Your Task
+Select ONE action to execute next. Respond with JSON:
+{{"tool_name": "tool_name", "args": {{}}, "description": "why we're doing this"}}
+
+Important: tool_name MUST be from the available list above.
+Only respond with JSON, no other text.
+"""
+        
+        system = "You are selecting actions to execute. Respond only with valid JSON."
+        response = await self._llm_call(system, prompt)
+        
         try:
-            await self.memory_manager.consolidate_learning(
-                self.workspace_id,
-                {
-                    "actions_taken": len(state_manager.state.action_history),
-                    "tools_used": [a.tool_name for a in state_manager.state.action_history],
-                    "findings": self._extract_findings(state_manager.state)
-                }
-            )
+            action = json.loads(response)
+            # Validate tool exists
+            if action.get("tool_name") not in self.available_tools:
+                logger.warning(f"Invalid tool selected: {action.get('tool_name')}")
+                return None
+            
+            # Execute tool
+            args = action.get("args", {})
+            result = await self.run_tool(action.get("tool_name"), args)
+            action["result"] = result
+            action["success"] = result.get("status") == "success"
+            
+            return action
         except Exception as e:
-            logger.warning(f"Failed to consolidate learning: {e}")
+            logger.error(f"Action phase failed: {e}")
+            return None
     
-    def _extract_findings(self, state: AgentState) -> List[str]:
-        """Extract key findings from observations"""
-        findings = []
-        for obs in state.observation_history:
-            findings.extend(obs.key_findings)
-        return findings[:10]  # Limit to 10 findings
+    async def _observe_phase(self, action: Dict[str, Any], user_request: str) -> str:
+        """
+        Observe phase: Interpret action results.
+        Determine if goal is achieved.
+        
+        Returns observation string.
+        """
+        result = action.get("result", {})
+        
+        prompt = f"""
+Analyze the result of executing a tool.
+
+## User Request
+{user_request}
+
+## Action Executed
+Tool: {action.get('tool_name')}
+Description: {action.get('description')}
+
+## Result
+{json.dumps(result, indent=2)[:1000]}
+
+## Your Task
+1. What did this result tell us?
+2. Did it help toward the goal?
+3. Do we have enough information to declare goal achieved?
+4. What should we do next?
+
+If goal is achieved, say "GOAL_ACHIEVED: [summary]"
+Respond conversationally with observations.
+"""
+        
+        system = "You are analyzing tool execution results. Be insightful."
+        response = await self._llm_call(system, prompt)
+        return response
+    
+    async def _synthesize_answer(self, user_request: str) -> str:
+        """Synthesize final answer from all actions taken"""
+        if not self.action_history:
+            return "No actions were taken."
+        
+        prompt = f"""
+Synthesize a final answer based on all actions taken.
+
+## Original Request
+{user_request}
+
+## Actions Taken
+{json.dumps([{"tool": a.get('tool_name'), "success": a.get('success')} for a in self.action_history], indent=2)}
+
+## Reasoning History
+{json.dumps(self.reasoning_history[-3:], indent=2)}
+
+Provide a concise final answer to the user's request based on what we learned.
+"""
+        
+        system = "You are synthesizing a final answer. Be concise and direct."
+        response = await self._llm_call(system, prompt)
+        return response
+    
+    def _build_skills_summary(self) -> str:
+        """Build summary of available skills by phase"""
+        summary = ""
+        for phase in PentestPhase:
+            skills = self.skills.get(phase, [])
+            if skills:
+                summary += f"\n**{phase.value.upper()}:**\n"
+                for skill in skills[:3]:  # Limit to 3 per phase
+                    name = getattr(skill, 'name', 'Unknown')
+                    desc = getattr(skill, 'description', '')
+                    summary += f"  - {name}: {desc[:80]}\n"
+        return summary or "No skills loaded"
+    
+    def _build_available_actions(self) -> List[Dict[str, str]]:
+        """Build list of available tools/skills for action selection"""
+        actions = []
+        for tool_name in self.available_tools.keys():
+            args_info = self.tool_schema.get(tool_name, {}).get("args", [])
+            actions.append({
+                "tool_name": tool_name,
+                "args": args_info
+            })
+        return actions[:20]  # Limit to 20 tools
+    
+    async def _llm_call(self, system: str, prompt: str) -> str:
+        """Make async LLM call"""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            self.llm.generate_content,
+            system,
+            prompt
+        )
     
     async def run_tool(self, tool_name: str, args: Dict) -> Dict:
-        """
-        Execute a tool via MCP.
-        
-        Returns:
-            Standardized ToolResult dict
-        """
-        if "workspace_id" not in args:
-            args["workspace_id"] = self.workspace_id
-        
+        """Execute a tool via MCP"""
         try:
             tool = self.available_tools.get(tool_name)
             if not tool:
@@ -317,16 +353,15 @@ class PenzerAgent:
             except Exception:
                 filtered_args = args
             
-            # Execute tool
+            # Execute
             import asyncio
             if asyncio.iscoroutinefunction(callable_obj):
                 result = await callable_obj(**filtered_args)
             else:
                 result = callable_obj(**filtered_args)
             
-            # Ensure dict response
             if not isinstance(result, dict):
-                return {"status": "error", "error": f"Tool returned non-dict: {type(result)}"}
+                return {"status": "success", "data": result}
             
             if "status" not in result:
                 return {"status": "success", "data": result}
@@ -339,29 +374,23 @@ class PenzerAgent:
 
 
 # ============================================================================
-# LEGACY COMPATIBILITY - Keep old Agent class as wrapper
+# LEGACY COMPATIBILITY
 # ============================================================================
 
 class Agent(PenzerAgent):
-    """Legacy Agent class - now extends PenzerAgent for backward compatibility"""
+    """Legacy wrapper for backward compatibility"""
     pass
 
 
 if __name__ == "__main__":
-    """Test agent locally"""
+    """Test agent"""
     
     async def test():
-        logger.info("Testing PenzerAgent...")
         agent = await PenzerAgent().async_init()
-        
-        test_request = "List available system tools"
-        result = await agent.execute_user_request(test_request)
-        
+        result = await agent.execute_user_request("List available system tools")
         logger.info(f"Result: {result}")
     
     try:
         asyncio.run(test())
-    except KeyboardInterrupt:
-        logger.info("Test interrupted")
     except Exception as e:
         logger.error(f"Test failed: {e}")
