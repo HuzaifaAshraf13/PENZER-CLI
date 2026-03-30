@@ -44,7 +44,9 @@ OUTPUT EXPECTATIONS:
 - Configuration details (if available)
 - Recommended next steps based on services
 """,
-                next_phase="exploitation"
+                next_phase="exploitation",
+                priority=0.85,
+                version="1.1"
             ),
             Skill(
                 skill_id="pentest_enum_active_directory",
@@ -78,7 +80,9 @@ OUTPUT EXPECTATIONS:
 - Potentially weak passwords or misconfigurations
 - Security policies and hardening status
 """,
-                next_phase="exploitation"
+                next_phase="exploitation",
+                priority=0.75,
+                version="1.1"
             ),
             Skill(
                 skill_id="pentest_enum_web",
@@ -113,6 +117,8 @@ OUTPUT EXPECTATIONS:
 - Configuration issues and misconfigurations
 - Technology stack and dependencies
 """,
-                next_phase="exploitation"
+                next_phase="exploitation",
+                priority=0.8,
+                version="1.1"
             ),
         ]

@@ -51,6 +51,8 @@ OUTPUT FORMAT:
 - Timeline for fixes
 - Follow-up testing recommendations
 """,
-                next_phase="scan"
+                next_phase="reporting",
+                priority=0.75,
+                version="1.1"
             ),
         ]
