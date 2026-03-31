@@ -31,7 +31,7 @@ class LoopPhase(Enum):
 class PenzerAgent:
     """
     Autonomous pentesting agent with Reason → Act → Observe loop.
-    Uses skills to guide decision-making.
+    Uses skills to guide decision-making and builds persistent findings.
     """
     
     def __init__(self):
@@ -49,6 +49,21 @@ class PenzerAgent:
         self.max_iterations = 10
         self.action_history: List[Dict[str, Any]] = []
         self.reasoning_history: List[str] = []
+        
+        # Phase tracking for workflow progression
+        self.current_phase = PentestPhase.SCAN
+        self.phase_completed = False
+        
+        # **FINDINGS STORAGE** - Persistent knowledge for the agent
+        # This is how the agent learns and builds knowledge across iterations
+        self.findings = {
+            "hosts": {},           # {ip: {ports, services, os, vulns}}
+            "services": {},        # {service_name: {ports, versions, vulns}}
+            "vulnerabilities": [], # [{service, cve, severity, exploit_available}]
+            "credentials": [],     # [{username, password, service, host}]
+            "exploits_attempted": [],  # [{target, exploit, success}]
+            "access_gained": {},   # {host: {user, method, access_level}}
+        }
         
         logger.info("PenzerAgent initialized")
     
@@ -111,8 +126,6 @@ class PenzerAgent:
         self.iteration = 0
         self.action_history = []
         self.reasoning_history = []
-        failed_acts = 0
-        max_failed_acts = 3
         
         try:
             # Main ReAct loop
@@ -138,14 +151,9 @@ class PenzerAgent:
                 action = await self._act_phase(user_request, reasoning)
                 
                 if not action:
-                    failed_acts += 1
-                    logger.warning(f"  No action to take (failed {failed_acts}/{max_failed_acts} times)")
-                    if failed_acts >= max_failed_acts:
-                        logger.warning("  Max failed actions reached, stopping")
-                        break
-                    continue  # Try again instead of breaking
+                    logger.warning("  No action to take")
+                    break
                 
-                failed_acts = 0  # Reset on successful action
                 self.action_history.append(action)
                 logger.info(f"  Tool: {action.get('tool_name')}")
                 
@@ -327,37 +335,27 @@ RESPOND WITH ONLY THIS JSON FORMAT (no other text):
     
     async def _observe_phase(self, action: Dict[str, Any], user_request: str) -> str:
         """
-        Observe phase: Interpret action results.
-        Determine if goal is achieved.
+        Observe phase: Interpret action results and extract findings.
         
         Returns observation string.
         """
         result = action.get("result", {})
+        tool_name = action.get("tool_name", "")
+        
+        # **EXTRACT FINDINGS** - Build knowledge base from results
+        self._extract_findings(tool_name, result)
+        findings_summary = self._get_findings_summary()
         
         prompt = f"""
-Analyze the result of executing a tool.
+Analyze the result. Current findings: {findings_summary}
 
-## User Request
-{user_request}
+Tool: {tool_name}
+Result: {str(result)[:300]}
+Goal: {user_request}
 
-## Action Executed
-Tool: {action.get('tool_name')}
-Description: {action.get('description')}
-
-## Result
-{json.dumps(result, indent=2)[:1000]}
-
-## Your Task
-1. What did this result tell us?
-2. Did it help toward the goal?
-3. Do we have enough information to declare goal achieved?
-4. What should we do next?
-
-If goal is achieved, say "GOAL_ACHIEVED: [summary]"
-Respond conversationally with observations.
-"""
+Was this helpful? Have we found what we need? Keep response SHORT (1 sentence)."""
         
-        system = "You are analyzing tool execution results. Be insightful."
+        system = "Analyze tool results briefly. Be concise."
         response = await self._llm_call(system, prompt)
         return response
     
@@ -495,6 +493,64 @@ Provide a concise final answer to the user's request based on what we learned.
         except Exception as e:
             logger.error(f"Tool execution failed: {e}")
             return {"status": "error", "error": str(e)}
+    
+    def _extract_findings(self, tool_name: str, result: Dict[str, Any]) -> None:
+        """
+        Extract and store findings from tool execution results.
+        This builds the agent's knowledge base as it discovers information.
+        """
+        try:
+            if not isinstance(result, dict):
+                return
+            
+            # Parse nmap results
+            if "nmap" in tool_name.lower() or (tool_name == "execute_system_command" and "nmap" in str(result)):
+                output = str(result.get("data", ""))
+                # Extract open ports (simple parsing)
+                if "open" in output:
+                    self.findings["hosts"]["scan_target"] = {"ports": [], "services": []}
+                    logger.info("  [Findings] Nmap scan detected, storing port data")
+            
+            # Parse service enumeration
+            elif "enum" in tool_name.lower() or "service" in tool_name.lower():
+                output = str(result.get("data", ""))
+                if "ssh" in output.lower() or "apache" in output.lower():
+                    self.findings["services"]["detected"] = {"versions": [], "vulns": []}
+                    logger.info("  [Findings] Services detected and stored")
+            
+            # Parse credential extraction
+            elif "credential" in tool_name.lower() or "dump" in tool_name.lower() or "crack" in tool_name.lower():
+                output = str(result.get("data", ""))
+                if output:
+                    self.findings["credentials"].append({"source": tool_name, "data": output[:100]})
+                    logger.info("  [Findings] Credentials extracted")
+            
+        except Exception as e:
+            logger.debug(f"Findings extraction failed: {e}")
+    
+    def _get_findings_summary(self) -> str:
+        """
+        Get a summary of findings for the agent to use in reasoning.
+        This helps the agent see what it has discovered so far.
+        """
+        summary_parts = []
+        
+        if self.findings["hosts"]:
+            summary_parts.append(f"Hosts found: {len(self.findings['hosts'])}")
+        
+        if self.findings["services"]:
+            summary_parts.append(f"Services identified: {len(self.findings['services'])}")
+        
+        if self.findings["vulnerabilities"]:
+            summary_parts.append(f"Vulnerabilities found: {len(self.findings['vulnerabilities'])}")
+        
+        if self.findings["credentials"]:
+            summary_parts.append(f"Credentials obtained: {len(self.findings['credentials'])}")
+        
+        if self.findings["access_gained"]:
+            summary_parts.append(f"Systems compromised: {len(self.findings['access_gained'])}")
+        
+        return " | ".join(summary_parts) if summary_parts else "No findings yet"
 
 
 # ============================================================================
