@@ -12,6 +12,11 @@ from enum import Enum
 from agent.core import mcp
 from agent.llm import LLM
 from agent.skills import load_all_skills, PentestPhase
+from agent.skills.base import Skill
+
+# Register tools with FastMCP when agent is imported
+import tools.tools
+import session.session
 
 logger = logging.getLogger(__name__)
 
@@ -58,16 +63,22 @@ class PenzerAgent:
             raise
     
     async def _load_tools(self) -> None:
-        """Load MCP tools"""
+        """Load MCP tools from FastMCP instance"""
         try:
-            if hasattr(self.mcp_client, "get_tools"):
-                tools = await self.mcp_client.get_tools()
-            else:
-                tools = getattr(self.mcp_client, "tools", {})
+            # FastMCP stores tools in _tools dictionary
+            tools = getattr(self.mcp_client, "_tools", {})
+            
+            if not tools:
+                # Fallback: try get_tools() method
+                if hasattr(self.mcp_client, "get_tools") and callable(self.mcp_client.get_tools):
+                    try:
+                        tools = await self.mcp_client.get_tools()
+                    except:
+                        tools = {}
             
             self.available_tools = tools
             self.tool_schema = self._serialize_tools(tools)
-            logger.info(f"Loaded {len(self.tool_schema)} tools")
+            logger.info(f"Loaded {len(self.tool_schema)} tools: {list(tools.keys())[:5]}")
         except Exception as e:
             logger.error(f"Tool loading failed: {e}")
             self.available_tools = {}
@@ -100,6 +111,8 @@ class PenzerAgent:
         self.iteration = 0
         self.action_history = []
         self.reasoning_history = []
+        failed_acts = 0
+        max_failed_acts = 3
         
         try:
             # Main ReAct loop
@@ -125,9 +138,14 @@ class PenzerAgent:
                 action = await self._act_phase(user_request, reasoning)
                 
                 if not action:
-                    logger.warning("  No action to take")
-                    break
+                    failed_acts += 1
+                    logger.warning(f"  No action to take (failed {failed_acts}/{max_failed_acts} times)")
+                    if failed_acts >= max_failed_acts:
+                        logger.warning("  Max failed actions reached, stopping")
+                        break
+                    continue  # Try again instead of breaking
                 
+                failed_acts = 0  # Reset on successful action
                 self.action_history.append(action)
                 logger.info(f"  Tool: {action.get('tool_name')}")
                 
@@ -153,23 +171,33 @@ class PenzerAgent:
     
     async def _reason_phase(self, user_request: str) -> str:
         """
-        Reason phase: Analyze goal and constraints.
-        Consider available skills and tools.
+        Reason phase: Analyze goal using relevant skills.
+        Selects skills based on user request keywords and uses their agent_behavior.
         
         Returns reasoning string.
         """
-        # Build available skills summary
-        skills_summary = self._build_skills_summary()
+        # Select relevant skills based on user request
+        relevant_skills = self._select_relevant_skills(user_request)
+        
+        # Build skill guidance from agent_behavior
+        skill_guidance = ""
+        if relevant_skills:
+            skill_guidance = "\n## Relevant Skills & Guidance\n"
+            for i, skill in enumerate(relevant_skills, 1):
+                skill_guidance += f"\n### Skill {i}: {skill.name} ({skill.phase.value})\n"
+                skill_guidance += f"Description: {skill.description}\n"
+                skill_guidance += f"Available Tools: {', '.join(skill.mcp_tools)}\n"
+                skill_guidance += f"Guidance:\n{skill.agent_behavior}\n"
+        
         tools_summary = json.dumps(list(self.tool_schema.keys())[:15], indent=2)
         
         prompt = f"""
-You are an autonomous pentesting agent. Analyze the user request and reasoning.
+You are an autonomous pentesting agent. Analyze the user request and reason about the approach.
 
 ## User Request
 {user_request}
 
-## Available Pentesting Skills (by phase)
-{skills_summary}
+{skill_guidance}
 
 ## Available Tools
 {tools_summary}
@@ -181,64 +209,120 @@ You are an autonomous pentesting agent. Analyze the user request and reasoning.
 Reason about:
 1. What is the goal?
 2. What constraints exist?
-3. What skills are relevant?
+3. Which skill guidance should we follow?
 4. What's the next step?
 5. Have we achieved the goal?
 
 Respond with clear reasoning. If goal is achieved, say "GOAL_ACHIEVED: [summary]"
 """
         
-        system = "You are a pentesting agent reasoning engine. Be precise and tactical."
+        system = "You are a pentesting agent reasoning engine guided by skill instructions. Be precise and tactical."
         response = await self._llm_call(system, prompt)
         return response
     
     async def _act_phase(self, user_request: str, reasoning: str) -> Optional[Dict[str, Any]]:
         """
         Act phase: Select and execute a tool or skill.
+        Only uses tools from relevant skills.
         
         Returns action dict or None if no action.
         """
-        available_actions = self._build_available_actions()
+        # Select relevant skills and their tools
+        relevant_skills = self._select_relevant_skills(user_request)
+        available_actions = self._build_skill_guided_actions(relevant_skills)
         
-        prompt = f"""
-You are selecting which tool/skill to execute next.
-
-## Current Goal
-{user_request}
-
-## Current Reasoning
-{reasoning[:500]}
-
-## Available Actions
-{json.dumps(available_actions, indent=2)}
-
-## Your Task
-Select ONE action to execute next. Respond with JSON:
-{{"tool_name": "tool_name", "args": {{}}, "description": "why we're doing this"}}
-
-Important: tool_name MUST be from the available list above.
-Only respond with JSON, no other text.
-"""
+        if not available_actions:
+            logger.warning("No relevant skill tools available")
+            available_actions = self._build_available_actions()
         
-        system = "You are selecting actions to execute. Respond only with valid JSON."
+        # Build action examples based on available tools
+        action_examples = []
+        for action in available_actions[:3]:
+            tool = action.get("tool_name")
+            if tool == "execute_system_command":
+                action_examples.append(f'{{"tool_name": "execute_system_command", "args": {{"command": "nmap -p- target.com"}}, "description": "Run network scan"}}')
+            elif tool == "check_available_tools":
+                action_examples.append(f'{{"tool_name": "check_available_tools", "args": {{"tool_category": "network"}}, "description": "List available tools"}}')
+            else:
+                action_examples.append(f'{{"tool_name": "{tool}", "args": {{}}, "description": "Execute {tool}"}}')
+        
+        examples_str = "\n".join(action_examples) if action_examples else ""
+        
+        prompt = f"""Based on the goal and reasoning, select ONE tool to execute next.
+
+AVAILABLE TOOLS:
+{json.dumps([a.get('tool_name') for a in available_actions], indent=2)}
+
+EXAMPLES:
+{examples_str}
+
+RESPOND WITH ONLY THIS JSON FORMAT (no other text):
+{{"tool_name": "TOOL_NAME", "args": {{"key": "value"}}, "description": "description"}}"""
+        
+        system = "You MUST respond with ONLY valid JSON. No explanations, no other text. Just the JSON object."
         response = await self._llm_call(system, prompt)
         
         try:
+            # Try to parse JSON - handle various response formats
+            response = response.strip()
+            
+            # If response contains JSON in code block, extract it
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0].strip()
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0].strip()
+            
+            # Remove any leading/trailing whitespace and newlines
+            response = response.strip()
+            
+            # Try to find JSON object in response (handle cases where LLM adds text around JSON)
+            if response.startswith("{"):
+                # Find the matching closing brace
+                brace_count = 0
+                json_end = 0
+                for i, char in enumerate(response):
+                    if char == "{":
+                        brace_count += 1
+                    elif char == "}":
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_end = i + 1
+                            break
+                
+                if json_end > 0:
+                    response = response[:json_end]
+            
+            logger.debug(f"Parsing JSON response: {response[:100]}")
             action = json.loads(response)
+            
             # Validate tool exists
-            if action.get("tool_name") not in self.available_tools:
-                logger.warning(f"Invalid tool selected: {action.get('tool_name')}")
-                return None
+            tool_name = action.get("tool_name")
+            if tool_name not in self.available_tools:
+                logger.warning(f"Invalid tool selected: {tool_name}, available: {list(self.available_tools.keys())}")
+                # Fallback: pick first available tool if available
+                if self.available_tools:
+                    tool_name = list(self.available_tools.keys())[0]
+                    action["tool_name"] = tool_name
+                    logger.info(f"Fallback to tool: {tool_name}")
+                else:
+                    return None
             
             # Execute tool
             args = action.get("args", {})
-            result = await self.run_tool(action.get("tool_name"), args)
+            result = await self.run_tool(tool_name, args)
             action["result"] = result
             action["success"] = result.get("status") == "success"
             
             return action
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse LLM response as JSON: {response[:100]}")
+            logger.error(f"JSON decode error: {e}")
+            logger.debug(f"Full response was: {response}")
+            return None
         except Exception as e:
             logger.error(f"Action phase failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return None
     
     async def _observe_phase(self, action: Dict[str, Any], user_request: str) -> str:
@@ -301,6 +385,25 @@ Provide a concise final answer to the user's request based on what we learned.
         response = await self._llm_call(system, prompt)
         return response
     
+    def _select_relevant_skills(self, user_request: str) -> List[Skill]:
+        """
+        Select relevant skills based on user request keywords.
+        Matches against skill.keywords.
+        """
+        relevant_skills = []
+        request_words = user_request.lower().split()
+        
+        for phase_skills in self.skills.values():
+            for skill in phase_skills:
+                # Calculate keyword match score
+                matches = sum(1 for kw in skill.keywords if any(w in kw for w in request_words))
+                if matches > 0:
+                    relevant_skills.append((skill, matches))
+        
+        # Sort by match score, then by priority, return top 5
+        relevant_skills.sort(key=lambda x: (x[1], x[0].priority), reverse=True)
+        return [skill for skill, _ in relevant_skills[:5]]
+    
     def _build_skills_summary(self) -> str:
         """Build summary of available skills by phase"""
         summary = ""
@@ -324,6 +427,27 @@ Provide a concise final answer to the user's request based on what we learned.
                 "args": args_info
             })
         return actions[:20]  # Limit to 20 tools
+    
+    def _build_skill_guided_actions(self, relevant_skills: List[Skill]) -> List[Dict[str, str]]:
+        """
+        Build list of actions available from relevant skills.
+        Only includes tools specified in skill.mcp_tools.
+        """
+        actions = []
+        seen_tools = set()
+        
+        for skill in relevant_skills:
+            for tool_name in skill.mcp_tools:
+                if tool_name in self.available_tools and tool_name not in seen_tools:
+                    args_info = self.tool_schema.get(tool_name, {}).get("args", [])
+                    actions.append({
+                        "tool_name": tool_name,
+                        "args": args_info,
+                        "from_skill": skill.name
+                    })
+                    seen_tools.add(tool_name)
+        
+        return actions
     
     async def _llm_call(self, system: str, prompt: str) -> str:
         """Make async LLM call"""
