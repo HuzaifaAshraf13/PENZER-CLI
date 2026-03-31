@@ -1,6 +1,10 @@
 """
 Penzer Autonomous Pentesting Agent
-Simple ReAct loop (Reason → Act → Observe) using skills
+ReAct loop (Reason → Act → Observe) with Skill-Guided Decision Making
+
+The agent uses skills as tactical guidance for autonomous pentesting.
+Skills define WHAT the agent should do (scan, enumerate, exploit, etc.)
+System prompts separate from agent logic for modularity.
 """
 
 import json
@@ -13,6 +17,17 @@ from agent.core import mcp
 from agent.llm import LLM
 from agent.skills import load_all_skills, PentestPhase
 from agent.skills.base import Skill
+from agent.system_prompts import (
+    get_reason_system_prompt,
+    get_act_system_prompt,
+    get_observe_system_prompt,
+    get_synthesize_system_prompt,
+    build_all_skill_guidance,
+    REASON_PROMPT_TEMPLATE,
+    ACT_PROMPT_TEMPLATE,
+    OBSERVE_PROMPT_TEMPLATE,
+    SYNTHESIZE_PROMPT_TEMPLATE,
+)
 
 # Register tools with FastMCP when agent is imported
 import tools.tools
@@ -46,7 +61,7 @@ class PenzerAgent:
         
         # State tracking
         self.iteration = 0
-        self.max_iterations = 10
+        self.max_iterations = 5  # Reduced from 10 for faster execution
         self.action_history: List[Dict[str, Any]] = []
         self.reasoning_history: List[str] = []
         
@@ -117,7 +132,8 @@ class PenzerAgent:
     
     async def execute_user_request(self, user_request: str) -> Dict[str, str]:
         """
-        Execute user request through ReAct loop.
+        Execute user request through smart ReAct loop.
+        Agent decides when to stop or ask user for continuation.
         
         Returns:
             {"status": "success|error", "response": "..."}
@@ -128,50 +144,68 @@ class PenzerAgent:
         self.reasoning_history = []
         
         try:
-            # Main ReAct loop
-            while self.iteration < self.max_iterations:
+            # Smart ReAct loop - agent decides when to continue
+            while True:
                 self.iteration += 1
-                logger.info(f"\n{'='*60}")
-                logger.info(f"ITERATION {self.iteration}/{self.max_iterations}")
-                logger.info(f"{'='*60}")
                 
                 # ===== REASON =====
-                logger.info("→ REASON")
+                logger.info("\n→ REASON")
                 reasoning = await self._reason_phase(user_request)
                 self.reasoning_history.append(reasoning)
-                logger.info(f"  Reasoning: {reasoning[:100]}")
                 
-                # Check if done reasoning
-                if "goal_achieved" in reasoning.lower() or "complete" in reasoning.lower():
-                    logger.info("  Goal marked as achieved in reasoning")
-                    return {"status": "success", "response": reasoning}
+                # Check if agent thinks it should stop
+                should_stop, reason = self._check_should_stop(reasoning)
+                if should_stop:
+                    logger.info(f"Agent: {reason}")
+                    final_answer = await self._synthesize_answer(user_request)
+                    return {"status": "success", "response": final_answer}
                 
                 # ===== ACT =====
                 logger.info("→ ACT")
                 action = await self._act_phase(user_request, reasoning)
                 
                 if not action:
-                    logger.warning("  No action to take")
-                    break
+                    logger.warning("No action to take, stopping")
+                    final_answer = await self._synthesize_answer(user_request)
+                    return {"status": "success", "response": final_answer}
                 
                 self.action_history.append(action)
-                logger.info(f"  Tool: {action.get('tool_name')}")
+                logger.info(f"  Executed: {action.get('tool_name')}")
                 
                 # ===== OBSERVE =====
                 logger.info("→ OBSERVE")
                 observation = await self._observe_phase(action, user_request)
-                logger.info(f"  Observation: {observation[:100]}")
                 
-                # Check if goal achieved
-                if "goal_achieved" in observation.lower() or "complete" in observation.lower():
-                    logger.info("  Goal achieved!")
+                # Check if satisfied
+                if self._is_goal_satisfied(observation):
+                    logger.info("Goal satisfied!")
                     final_answer = await self._synthesize_answer(user_request)
                     return {"status": "success", "response": final_answer}
-            
-            # Max iterations reached
-            logger.warning(f"Max iterations ({self.max_iterations}) reached")
-            final_answer = await self._synthesize_answer(user_request)
-            return {"status": "success", "response": final_answer}
+                
+                # Check if too many iterations - ask user
+                if self.iteration >= self.max_iterations:
+                    logger.warning(f"Reached {self.max_iterations} iterations")
+                    summary = self._get_current_summary()
+                    print(f"\n{'='*70}")
+                    print(f"[AGENT STATUS]")
+                    print(f"Iterations: {self.iteration}")
+                    print(f"Actions: {len(self.action_history)}")
+                    print(f"Summary: {summary[:200]}")
+                    print(f"{'='*70}")
+                    print(f"\nContinue? (y/n): ", end="", flush=True)
+                    try:
+                        user_input = input().lower().strip()
+                        if user_input != 'y':
+                            logger.info("User stopped agent")
+                            final_answer = await self._synthesize_answer(user_request)
+                            return {"status": "success", "response": final_answer}
+                        else:
+                            self.iteration = 0  # Reset counter
+                            logger.info("Continuing...")
+                    except:
+                        # If no input available, stop
+                        final_answer = await self._synthesize_answer(user_request)
+                        return {"status": "success", "response": final_answer}
         
         except Exception as e:
             logger.error(f"Request execution failed: {e}")
@@ -179,113 +213,133 @@ class PenzerAgent:
     
     async def _reason_phase(self, user_request: str) -> str:
         """
-        Reason phase: Analyze goal using relevant skills.
-        Selects skills based on user request keywords and uses their agent_behavior.
+        Reason phase: Analyze goal using relevant SKILLS.
+        
+        This phase:
+        1. Selects most relevant skills based on user request keywords
+        2. Uses skill.agent_behavior as tactical guidance
+        3. Asks agent to reason about approach
+        4. Detects if goal has been achieved
         
         Returns reasoning string.
         """
-        # Select relevant skills based on user request
+        # STEP 1: SELECT RELEVANT SKILLS - these guide the reasoning
         relevant_skills = self._select_relevant_skills(user_request)
         
-        # Build skill guidance from agent_behavior
-        skill_guidance = ""
-        if relevant_skills:
-            skill_guidance = "\n## Relevant Skills & Guidance\n"
-            for i, skill in enumerate(relevant_skills, 1):
-                skill_guidance += f"\n### Skill {i}: {skill.name} ({skill.phase.value})\n"
-                skill_guidance += f"Description: {skill.description}\n"
-                skill_guidance += f"Available Tools: {', '.join(skill.mcp_tools)}\n"
-                skill_guidance += f"Guidance:\n{skill.agent_behavior}\n"
+        # STEP 2: BUILD SKILL GUIDANCE - convert skills to tactical instructions
+        skill_guidance = build_all_skill_guidance(relevant_skills)
         
+        # STEP 3: GET FINDINGS SUMMARY - what agent knows so far
+        findings_summary = self._get_findings_summary()
+        
+        # STEP 4: BUILD PROMPT with all context
         tools_summary = json.dumps(list(self.tool_schema.keys())[:15], indent=2)
+        previous_actions = json.dumps(
+            [a.get('tool_name') for a in self.action_history[-3:]],
+            indent=2
+        ) if self.action_history else "None yet"
         
-        prompt = f"""
-You are an autonomous pentesting agent. Analyze the user request and reason about the approach.
-
-## User Request
-{user_request}
-
-{skill_guidance}
-
-## Available Tools
-{tools_summary}
-
-## Previous Actions
-{json.dumps([a.get('tool_name') for a in self.action_history[-3:]], indent=2) if self.action_history else "None yet"}
-
-## Task
-Reason about:
-1. What is the goal?
-2. What constraints exist?
-3. Which skill guidance should we follow?
-4. What's the next step?
-5. Have we achieved the goal?
-
-Respond with clear reasoning. If goal is achieved, say "GOAL_ACHIEVED: [summary]"
-"""
+        prompt = REASON_PROMPT_TEMPLATE.format(
+            user_request=user_request,
+            findings_summary=findings_summary,
+            skill_guidance=skill_guidance,
+            tools_summary=tools_summary,
+            previous_actions=previous_actions,
+        )
         
-        system = "You are a pentesting agent reasoning engine guided by skill instructions. Be precise and tactical."
+        # STEP 5: CALL LLM with separated system prompt
+        system = get_reason_system_prompt()
         response = await self._llm_call(system, prompt)
+        
+        logger.info(f"Reason phase selected {len(relevant_skills)} relevant skills")
         return response
     
     async def _act_phase(self, user_request: str, reasoning: str) -> Optional[Dict[str, Any]]:
         """
-        Act phase: Select and execute a tool or skill.
-        Only uses tools from relevant skills.
+        Act phase: Generate and execute a shell command GUIDED BY SKILLS.
         
-        Returns action dict or None if no action.
+        This phase:
+        1. Selects relevant skills for current goal
+        2. LLM generates ONE shell command based on skill guidance
+        3. Executes the command via execute_system_command
+        4. Returns action with result
+        
+        Simplified architecture: No tool selection, just raw command generation.
         """
-        # Select relevant skills and their tools
+        # STEP 1: SELECT RELEVANT SKILLS - these guide command generation
         relevant_skills = self._select_relevant_skills(user_request)
-        available_actions = self._build_skill_guided_actions(relevant_skills)
         
-        if not available_actions:
-            logger.warning("No relevant skill tools available")
-            available_actions = self._build_available_actions()
+        # STEP 2: BUILD COMMAND EXAMPLES FROM ACTUAL SKILLS
+        # Generate example commands based on skill descriptions
+        command_examples = []
+        example_commands = {
+            "scan": "nmap -sn 192.168.1.0/24",
+            "enumeration": "enum4linux -a target.com",
+            "exploitation": "searchsploit --json wordpress 5.0",
+            "privilege": "sudo -l",
+            "data": "find / -name '*.zip' -o -name '*.tar.gz' 2>/dev/null",
+            "report": "cat /tmp/pentest_report.txt"
+        }
         
-        # Build action examples based on available tools
-        action_examples = []
-        for action in available_actions[:3]:
-            tool = action.get("tool_name")
-            if tool == "execute_system_command":
-                action_examples.append(f'{{"tool_name": "execute_system_command", "args": {{"command": "nmap -p- target.com"}}, "description": "Run network scan"}}')
-            elif tool == "check_available_tools":
-                action_examples.append(f'{{"tool_name": "check_available_tools", "args": {{"tool_category": "network"}}, "description": "List available tools"}}')
-            else:
-                action_examples.append(f'{{"tool_name": "{tool}", "args": {{}}, "description": "Execute {tool}"}}')
+        for skill in relevant_skills[:3]:
+            # Find relevant command based on skill phase
+            phase_key = skill.phase.value.split('_')[0]  # Get first part of phase
+            cmd = example_commands.get(phase_key, "nmap -h")
+            description = f"{skill.name}: {skill.description[:50]}"
+            example = json.dumps({
+                "command": cmd,
+                "description": description
+            })
+            command_examples.append(example)
         
-        examples_str = "\n".join(action_examples) if action_examples else ""
+        examples_str = "\n".join(command_examples) if command_examples else ""
         
-        prompt = f"""Based on the goal and reasoning, select ONE tool to execute next.
-
-AVAILABLE TOOLS:
-{json.dumps([a.get('tool_name') for a in available_actions], indent=2)}
-
-EXAMPLES:
-{examples_str}
-
-RESPOND WITH ONLY THIS JSON FORMAT (no other text):
-{{"tool_name": "TOOL_NAME", "args": {{"key": "value"}}, "description": "description"}}"""
+        # STEP 3: BUILD SKILL-GUIDED COMMANDS DESCRIPTION FROM ACTUAL SKILLS
+        # This shows LLM what each skill does and how to support it
+        skill_actions = ""
+        if relevant_skills:
+            skill_actions = "\n## Skill-Guided Commands (from selected skills):\n"
+            for skill in relevant_skills:
+                skill_actions += f"\n**{skill.name}** ({skill.phase.value}):\n"
+                skill_actions += f"  {skill.description}\n"
+                skill_actions += f"  Guidance: {skill.agent_behavior[:100]}...\n"
         
-        system = "You MUST respond with ONLY valid JSON. No explanations, no other text. Just the JSON object."
+        # STEP 4: BUILD PROMPT using separated template
+        prompt = ACT_PROMPT_TEMPLATE.format(
+            user_request=user_request,
+            skill_guided_actions=skill_actions,
+            examples=examples_str,
+        )
+        
+        # STEP 5: CALL LLM with separated system prompt
+        system = get_act_system_prompt()
         response = await self._llm_call(system, prompt)
         
         try:
-            # Try to parse JSON - handle various response formats
+            # STEP 6: PARSE JSON RESPONSE - extract command
             response = response.strip()
             
-            # If response contains JSON in code block, extract it
+            # Handle JSON in code blocks
             if "```json" in response:
                 response = response.split("```json")[1].split("```")[0].strip()
             elif "```" in response:
-                response = response.split("```")[1].split("```")[0].strip()
+                parts = response.split("```")
+                if len(parts) >= 2:
+                    response = parts[1].strip()
             
-            # Remove any leading/trailing whitespace and newlines
             response = response.strip()
             
-            # Try to find JSON object in response (handle cases where LLM adds text around JSON)
+            # Skip to first { if there's leading text
+            if not response.startswith("{"):
+                json_start = response.find("{")
+                if json_start != -1:
+                    response = response[json_start:]
+                else:
+                    logger.error(f"No JSON found in response: {response[:200]}")
+                    return None
+            
+            # Extract JSON object by brace matching
             if response.startswith("{"):
-                # Find the matching closing brace
                 brace_count = 0
                 json_end = 0
                 for i, char in enumerate(response):
@@ -300,26 +354,26 @@ RESPOND WITH ONLY THIS JSON FORMAT (no other text):
                 if json_end > 0:
                     response = response[:json_end]
             
-            logger.debug(f"Parsing JSON response: {response[:100]}")
-            action = json.loads(response)
+            logger.debug(f"Parsing command response: {response[:100]}")
+            action_data = json.loads(response)
             
-            # Validate tool exists
-            tool_name = action.get("tool_name")
-            if tool_name not in self.available_tools:
-                logger.warning(f"Invalid tool selected: {tool_name}, available: {list(self.available_tools.keys())}")
-                # Fallback: pick first available tool if available
-                if self.available_tools:
-                    tool_name = list(self.available_tools.keys())[0]
-                    action["tool_name"] = tool_name
-                    logger.info(f"Fallback to tool: {tool_name}")
-                else:
-                    return None
+            # STEP 7: EXECUTE COMMAND via execute_system_command tool
+            command = action_data.get("command", "echo 'No command generated'")
+            description = action_data.get("description", "Execute command")
             
-            # Execute tool
-            args = action.get("args", {})
-            result = await self.run_tool(tool_name, args)
-            action["result"] = result
-            action["success"] = result.get("status") == "success"
+            logger.info(f"Generated command: {command}")
+            
+            # Execute the command
+            result = await self.run_tool("execute_system_command", {"command": command, "timeout": 300})
+            
+            # Build action dict
+            action = {
+                "tool_name": "execute_system_command",
+                "command": command,
+                "description": description,
+                "result": result,
+                "success": result.get("status") == "success"
+            }
             
             return action
         except json.JSONDecodeError as e:
@@ -337,51 +391,136 @@ RESPOND WITH ONLY THIS JSON FORMAT (no other text):
         """
         Observe phase: Interpret action results and extract findings.
         
+        This phase:
+        1. Gets tool result from the action
+        2. Extracts findings from result (hosts, services, vulns, etc.)
+        3. Stores findings in self.findings dict
+        4. LLM analyzes if this was helpful
+        
         Returns observation string.
         """
         result = action.get("result", {})
         tool_name = action.get("tool_name", "")
         
-        # **EXTRACT FINDINGS** - Build knowledge base from results
+        # STEP 1: EXTRACT FINDINGS - store discoveries in knowledge base
         self._extract_findings(tool_name, result)
         findings_summary = self._get_findings_summary()
         
-        prompt = f"""
-Analyze the result. Current findings: {findings_summary}
-
-Tool: {tool_name}
-Result: {str(result)[:300]}
-Goal: {user_request}
-
-Was this helpful? Have we found what we need? Keep response SHORT (1 sentence)."""
+        # STEP 2: BUILD OBSERVATION PROMPT using separated template
+        prompt = OBSERVE_PROMPT_TEMPLATE.format(
+            findings_summary=findings_summary,
+            tool_name=tool_name,
+            result=str(result)[:300],
+            user_request=user_request,
+        )
         
-        system = "Analyze tool results briefly. Be concise."
+        # STEP 3: CALL LLM with separated system prompt
+        system = get_observe_system_prompt()
         response = await self._llm_call(system, prompt)
+        
+        logger.info(f"Observe: {tool_name} extracted {len(self._get_findings_summary())} bytes of findings")
         return response
     
     async def _synthesize_answer(self, user_request: str) -> str:
-        """Synthesize final answer from all actions taken"""
+        """
+        Synthesize final answer from all actions taken.
+        
+        This uses skills, findings, and action history to provide final summary.
+        """
         if not self.action_history:
             return "No actions were taken."
         
-        prompt = f"""
-Synthesize a final answer based on all actions taken.
-
-## Original Request
-{user_request}
-
-## Actions Taken
-{json.dumps([{"tool": a.get('tool_name'), "success": a.get('success')} for a in self.action_history], indent=2)}
-
-## Reasoning History
-{json.dumps(self.reasoning_history[-3:], indent=2)}
-
-Provide a concise final answer to the user's request based on what we learned.
-"""
+        # Get findings summary
+        findings_summary = self._get_findings_summary()
         
-        system = "You are synthesizing a final answer. Be concise and direct."
+        # Build actions summary
+        actions_taken = json.dumps(
+            [{"tool": a.get('tool_name'), "success": a.get('success')} for a in self.action_history],
+            indent=2
+        )
+        
+        # Get reasoning history
+        reasoning_history = json.dumps(self.reasoning_history[-3:], indent=2)
+        
+        # BUILD PROMPT using separated template
+        prompt = SYNTHESIZE_PROMPT_TEMPLATE.format(
+            user_request=user_request,
+            actions_taken=actions_taken,
+            findings_summary=findings_summary,
+            reasoning_history=reasoning_history,
+        )
+        
+        # CALL LLM with separated system prompt
+        system = get_synthesize_system_prompt()
         response = await self._llm_call(system, prompt)
         return response
+    
+    def _is_goal_satisfied(self, observation: str) -> bool:
+        """
+        Check if goal is satisfied based on observation.
+        Looks for explicit indicators only.
+        """
+        keywords = [
+            "goal_achieved:",
+            "successfully completed",
+            "task complete",
+            "all objectives met",
+            "mission accomplished"
+        ]
+        observation_lower = observation.lower()
+        return any(kw in observation_lower for kw in keywords)
+    
+    def _check_should_stop(self, reasoning: str) -> tuple:
+        """
+        Check if agent should stop based on its reasoning.
+        Returns (should_stop: bool, reason: str)
+        """
+        # Get current findings summary
+        findings_count = sum(len(v) for v in self.findings.values())
+        
+        # Extract confidence score if agent provides it
+        if "confidence:" in reasoning.lower():
+            try:
+                parts = reasoning.lower().split("confidence:")
+                if len(parts) > 1:
+                    conf_str = parts[1].split()[0].strip('%')
+                    confidence = int(conf_str) / 100
+                    
+                    if confidence >= 0.85:
+                        return True, f"High confidence ({int(confidence*100)}%) task complete"
+            except:
+                pass
+        
+        # Check for explicit stopping signals
+        stop_phrases = [
+            "task is complete",
+            "goal achieved",
+            "ready to provide results",
+            "assessment complete",
+            "no further actions",
+            "nothing more to do"
+        ]
+        
+        reasoning_lower = reasoning.lower()
+        for phrase in stop_phrases:
+            if phrase in reasoning_lower:
+                return True, f"Agent decided: {phrase}"
+        
+        return False, None
+    
+    def _get_current_summary(self) -> str:
+        """Get summary of current findings for user display."""
+        summary = []
+        if self.findings.get("hosts"):
+            summary.append(f"Hosts: {len(self.findings['hosts'])}")
+        if self.findings.get("services"):
+            summary.append(f"Services: {len(self.findings['services'])}")
+        if self.findings.get("vulnerabilities"):
+            summary.append(f"Vulns: {len(self.findings['vulnerabilities'])}")
+        if self.findings.get("credentials"):
+            summary.append(f"Creds: {len(self.findings['credentials'])}")
+        
+        return " | ".join(summary) if summary else "No findings yet"
     
     def _select_relevant_skills(self, user_request: str) -> List[Skill]:
         """

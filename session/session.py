@@ -4,6 +4,9 @@ import json
 import contextlib
 import os
 import sys
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Suppress ReMeApp verbose logging using file descriptor manipulation
 @contextlib.contextmanager
@@ -31,11 +34,30 @@ def suppress_reme_logs():
         # Reopen sys.stderr to the actual stderr
         sys.stderr = sys.__stderr__
 
+def _check_reme_availability() -> tuple:
+    """
+    Check if ReMeApp is available and initialized.
+    
+    Returns:
+        (bool, str) - (is_available, message)
+    """
+    if reme_app is None:
+        return False, "ReMeApp not initialized - long-term memory unavailable"
+    
+    try:
+        # Check if ReMeApp has been initialized
+        if not hasattr(reme_app, '_initialized'):
+            return False, "ReMeApp not fully initialized"
+        
+        return True, "ReMeApp available"
+    except Exception as e:
+        return False, f"ReMeApp error: {str(e)}"
+
 # ---------------- SHORT-TERM MEMORY ----------------
 session_memory = {}
 
 @mcp.tool()
-async def mem_get_short(workspace_id: str):
+async def mem_get_short(workspace_id: str) -> dict:
     """
     Retrieve short-term memory for the current workspace.
     Use this to recall recent findings, discovered information, etc.
@@ -57,7 +79,7 @@ async def mem_get_short(workspace_id: str):
         return error(f"Failed to get short-term memory: {str(e)}")
 
 @mcp.tool()
-async def mem_set_short(workspace_id: str, data: dict):
+async def mem_set_short(workspace_id: str, data: dict) -> dict:
     """
     Store information to short-term memory for later recall.
     Use this to save discoveries, results, findings, etc.
@@ -80,7 +102,7 @@ async def mem_set_short(workspace_id: str, data: dict):
 
 # ---------------- LONG-TERM MEMORY ----------------
 @mcp.tool()
-async def mem_get_long(workspace_id: str):
+async def mem_get_long(workspace_id: str) -> dict:
     """
     Retrieve long-term memory for the workspace.
     This persists across sessions and stores consolidated findings.
@@ -91,8 +113,26 @@ async def mem_get_long(workspace_id: str):
     
     Returns:
         {"status": "success", "data": {...}} containing consolidated long-term memory
+        Or {"status": "warning"} if ReMeApp unavailable (falls back to short-term)
     """
     try:
+        # Check ReMeApp availability
+        reme_available, reme_msg = _check_reme_availability()
+        if not reme_available:
+            logger.warning(f"ReMeApp unavailable: {reme_msg} - falling back to short-term memory")
+            # Fallback to short-term memory
+            data = session_memory.get(workspace_id, {})
+            return warning(
+                data=data,
+                metadata={
+                    "workspace_id": workspace_id,
+                    "type": "short_term",
+                    "fallback": True,
+                    "message": reme_msg
+                }
+            )
+        
+        # ReMeApp is available, use it
         with suppress_reme_logs():
             res = await reme_app.async_execute(
                 "retrieve_task_memory",
@@ -105,10 +145,22 @@ async def mem_get_long(workspace_id: str):
             metadata={"workspace_id": workspace_id, "type": "long_term"}
         )
     except Exception as e:
-        return error(f"Failed to get long-term memory: {str(e)}")
+        logger.error(f"Failed to get long-term memory: {e}")
+        # Fallback to short-term if error occurs
+        logger.info("Falling back to short-term memory")
+        data = session_memory.get(workspace_id, {})
+        return warning(
+            data=data,
+            metadata={
+                "workspace_id": workspace_id,
+                "type": "short_term",
+                "fallback": True,
+                "error": str(e)
+            }
+        )
 
 @mcp.tool()
-async def mem_set_long(workspace_id: str, data: dict):
+async def mem_set_long(workspace_id: str, data: dict) -> dict:
     """
     Store consolidated findings to long-term memory for persistent knowledge.
     Use this to save phase summaries, critical findings, etc.
@@ -119,9 +171,28 @@ async def mem_set_long(workspace_id: str, data: dict):
     
     Returns:
         {"status": "success", "data": {...}} confirming persistent storage
+        Or {"status": "warning"} if ReMeApp unavailable (stores in short-term instead)
     """
     try:
-        # Format trajectories from data dict
+        # Check ReMeApp availability
+        reme_available, reme_msg = _check_reme_availability()
+        
+        # Always also store in short-term as backup
+        session_memory.setdefault(workspace_id, {}).update(data)
+        
+        if not reme_available:
+            logger.warning(f"ReMeApp unavailable: {reme_msg} - storing in short-term only")
+            return warning(
+                data={"workspace_id": workspace_id, "updated_keys": list(data.keys())},
+                metadata={
+                    "type": "short_term",
+                    "fallback": True,
+                    "message": reme_msg,
+                    "keys_stored": len(data)
+                }
+            )
+        
+        # ReMeApp is available, use it
         trajectories = [{
             "role": "assistant",
             "content": json.dumps(data)
@@ -137,11 +208,21 @@ async def mem_set_long(workspace_id: str, data: dict):
             metadata={"workspace_id": workspace_id, "type": "long_term", "keys_stored": len(data)}
         )
     except Exception as e:
-        return error(f"Failed to set long-term memory: {str(e)}")
+        logger.error(f"Failed to set long-term memory: {e}")
+        # Already stored in short-term, return warning
+        return warning(
+            data={"workspace_id": workspace_id, "updated_keys": list(data.keys())},
+            metadata={
+                "type": "short_term",
+                "fallback": True,
+                "error": str(e),
+                "keys_stored": len(data)
+            }
+        )
 
 # ---------------- UNIFIED MEMORY SEARCH ----------------
 @mcp.tool()
-async def mem_search(workspace_id: str, query: str):
+async def mem_search(workspace_id: str, query: str) -> dict:
     """
     Search both short-term and long-term memory for relevant information.
     Use this to find previous findings, discoveries, or stored data.
@@ -168,16 +249,23 @@ async def mem_search(workspace_id: str, query: str):
                 combined_results["short_term"][key] = value
         
         # Search long-term memory
-        try:
-            with suppress_reme_logs():
-                long_res = await reme_app.async_execute(
-                    "retrieve_task_memory",
-                    workspace_id=workspace_id,
-                    query=query
-                )
-            combined_results["long_term"] = long_res.get("answer") or {}
-        except Exception as e:
-            combined_results["long_term"] = {"error": str(e)}
+        reme_available, reme_msg = _check_reme_availability()
+        if reme_available:
+            try:
+                with suppress_reme_logs():
+                    long_res = await reme_app.async_execute(
+                        "retrieve_task_memory",
+                        workspace_id=workspace_id,
+                        query=query
+                    )
+                combined_results["long_term"] = long_res.get("answer") or {}
+            except Exception as e:
+                logger.warning(f"Long-term memory search failed: {e}")
+                combined_results["long_term"] = {}
+        else:
+            logger.info(f"ReMeApp unavailable: {reme_msg}")
+            combined_results["long_term"] = {}
+
         
         return success(
             data=combined_results,
@@ -192,7 +280,7 @@ async def mem_search(workspace_id: str, query: str):
         return error(f"Failed to search memory: {str(e)}")
 
 @mcp.tool()
-async def mem_clear_short(workspace_id: str):
+async def mem_clear_short(workspace_id: str) -> dict:
     """
     Clear all short-term memory for a workspace (reset session memory).
     

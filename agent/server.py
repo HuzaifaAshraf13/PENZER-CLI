@@ -77,6 +77,49 @@ async def _get_mcp_resources():
         logger.debug(f"Failed to get resources: {e}")
         return []
 
+# ---------------- TOOL REGISTRATION VALIDATION ----------------
+REQUIRED_TOOLS = [
+    "execute_system_command",
+    "check_available_tools",
+    "list_registered_tools",
+    "mem_get_short",
+    "mem_set_short",
+    "mem_get_long",
+    "mem_set_long",
+    "mem_search",
+    "mem_clear_short"
+]
+
+def _validate_tool_registration():
+    """
+    Validate that all required tools are registered.
+    Raises ValueError if critical tools are missing.
+    
+    Returns:
+        (bool, list) - (all_valid, missing_tools)
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        registered = loop.run_until_complete(_get_mcp_tool_keys())
+        registered_set = set(registered)
+        
+        missing = []
+        for tool in REQUIRED_TOOLS:
+            if tool not in registered_set:
+                missing.append(tool)
+                logger.error(f"❌ CRITICAL: Required tool '{tool}' is NOT registered")
+        
+        if missing:
+            logger.error(f"❌ Missing {len(missing)} required tools: {missing}")
+            return False, missing
+        
+        logger.info(f"✓ All {len(REQUIRED_TOOLS)} required tools registered")
+        return True, []
+    
+    except Exception as e:
+        logger.error(f"Failed to validate tool registration: {e}")
+        return False, ["validation_error"]
+
 # ---------------- START SERVER ----------------
 def start_server():
     """Initialize and display MCP server status."""
@@ -96,6 +139,14 @@ def start_server():
         # Fetch tools
         tools_list = loop.run_until_complete(_get_mcp_tool_keys())
         resources_list = loop.run_until_complete(_get_mcp_resources())
+        
+        # VALIDATE REQUIRED TOOLS
+        all_valid, missing = _validate_tool_registration()
+        if not all_valid:
+            logger.warning(f"⚠️  Missing tools: {missing}")
+            print(f"\n⚠️  WARNING: Missing critical tools: {missing}")
+        else:
+            print(f"\n✓ All critical tools verified")
     
     except Exception as e:
         logger.error(f"FATAL MCP SETUP ERROR: {e}", exc_info=True)

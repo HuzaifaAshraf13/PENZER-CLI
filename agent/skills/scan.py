@@ -1,6 +1,7 @@
 # agent/skills/scan.py
 """Scan phase skills: network reconnaissance and discovery."""
 
+from typing import List
 from agent.skills.base import Skill, SkillModule, PentestPhase
 
 
@@ -10,7 +11,7 @@ class ScanSkills(SkillModule):
     phase = PentestPhase.SCAN
     
     @classmethod
-    def get_skills(cls) -> list:
+    def get_skills(cls) -> List[Skill]:
         return [
             Skill(
                 skill_id="pentest_scan_discovery",
@@ -45,9 +46,9 @@ EXAMPLES OF VALID COMMANDS:
 - shodan search <query>
 
 RESPONSE FORMAT:
-{"thought": "Analyzing target and selecting tools", "tool": "execute_system_command", "args": {"command": "command to run"}}
-or when done:
-{"final_answer": "Found: ..."}
+Use standard ReAct format: reason about next step in REASON phase.
+For actions, respond with proper JSON for ACT phase:
+{"tool_name": "execute_system_command", "arguments": {"command": "command to run"}}
 """,
                 next_phase="enumeration",
                 priority=0.9,

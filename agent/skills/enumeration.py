@@ -1,6 +1,7 @@
 # agent/skills/enumeration.py
 """Enumeration phase skills: service discovery, version detection, AD enumeration."""
 
+from typing import List
 from agent.skills.base import Skill, SkillModule, PentestPhase
 
 
@@ -10,7 +11,7 @@ class EnumerationSkills(SkillModule):
     phase = PentestPhase.ENUMERATION
     
     @classmethod
-    def get_skills(cls) -> list:
+    def get_skills(cls) -> List[Skill]:
         return [
             Skill(
                 skill_id="pentest_enum_services",
@@ -41,9 +42,9 @@ TOOLS YOU CAN USE:
 - Any other enumeration tools available
 
 RESPONSE FORMAT:
-{"thought": "Enumerating services on discovered ports", "tool": "execute_system_command", "args": {"command": "command to run"}}
-or when done:
-{"final_answer": "Discovered: ..."}
+Use standard ReAct format: reason about next step in REASON phase.
+For actions, respond with proper JSON for ACT phase:
+{"tool_name": "execute_system_command", "arguments": {"command": "command to run"}}
 """,
                 next_phase="exploitation",
                 priority=0.85,
@@ -67,9 +68,9 @@ FULL AUTONOMY - Use ANY tools you judge necessary:
 - Make decisions independently
 
 RESPONSE FORMAT:
-{"thought": "Enumerating AD on target", "tool": "execute_system_command", "args": {"command": "command to run"}}
-or when done:
-{"final_answer": "AD enumeration complete: ..."}
+Use standard ReAct format: reason about next step in REASON phase.
+For actions, respond with proper JSON for ACT phase:
+{"tool_name": "execute_system_command", "arguments": {"command": "command to run"}}
 """,
                 next_phase="exploitation",
                 priority=0.75,
@@ -93,9 +94,9 @@ FULL AUTONOMY - Use any web enumeration tools:
 - Make independent decisions
 
 RESPONSE FORMAT:
-{"thought": "Enumerating web application", "tool": "execute_system_command", "args": {"command": "command to run"}}
-or when done:
-{"final_answer": "Web enumeration complete: ..."}
+Use standard ReAct format: reason about next step in REASON phase.
+For actions, respond with proper JSON for ACT phase:
+{"tool_name": "execute_system_command", "arguments": {"command": "command to run"}}
 """,
                 next_phase="exploitation",
                 priority=0.8,

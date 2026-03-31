@@ -1,6 +1,7 @@
 # agent/skills/reporting.py
 """Reporting phase skills: report generation, findings compilation, remediation."""
 
+from typing import List
 from agent.skills.base import Skill, SkillModule, PentestPhase
 
 
@@ -10,7 +11,7 @@ class ReportingSkills(SkillModule):
     phase = PentestPhase.REPORTING
     
     @classmethod
-    def get_skills(cls) -> list:
+    def get_skills(cls) -> List[Skill]:
         return [
             Skill(
                 skill_id="pentest_report_generation",
@@ -30,9 +31,9 @@ FULL AUTONOMY - Create reports as needed:
 - Make independent decisions on report format
 
 RESPONSE FORMAT:
-{"thought": "Generating pentest report", "tool": "execute_system_command", "args": {"command": "command"}}
-or when done:
-{"final_answer": "Report generated: ..."}
+Use standard ReAct format: reason about next step in REASON phase.
+For actions, respond with proper JSON for ACT phase:
+{"tool_name": "execute_system_command", "arguments": {"command": "command"}}
 """,
                 next_phase="reporting",
                 priority=0.75,
