@@ -89,7 +89,7 @@ user> scan the network for active devices
 
 ---
 
-# API Mode (Recommended)
+# API Mode 
 
 API mode provides fastest performance and easiest setup.
 
