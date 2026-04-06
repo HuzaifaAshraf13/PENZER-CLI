@@ -29,13 +29,6 @@ git clone https://github.com/HuzaifaAshraf13/PENZER-CLI
 cd PENZER-CLI
 ```
 
-Create virtual environment (recommended):
-
-```bash
-python3 -m venv env
-source env/bin/activate
-```
-
 Run installer:
 
 ```bash
