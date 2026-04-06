@@ -2,7 +2,7 @@
 
 Penzer is a local cognitive shell built for AI-powered terminal workflows, reasoning tasks, and autonomous pentesting operations.
 
-**Version:** 0.2.0 - User-Driven ReAct Loop with Skill-Guided Intelligence
+**Version:** 1.0 - User-Driven ReAct Loop with Skill-Guided Intelligence
 
 ---
 
