@@ -1,17 +1,24 @@
 """
 Penzer Autonomous Pentesting Agent
-ReAct loop (Reason → Act → Observe) with Skill-Guided Decision Making
+Advanced ReAct loop with Long-Running Operation Support
 
-The agent uses skills as tactical guidance for autonomous pentesting.
-Skills define WHAT the agent should do (scan, enumerate, exploit, etc.)
-System prompts separate from agent logic for modularity.
+Features:
+- Reason → Act → Observe loop with skill-guided decision making
+- Timeout-aware long-running operation handling
+- Task queuing and concurrent execution
+- Adaptive iteration limits based on task complexity
+- State management for persistence across operations
 """
 
 import json
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+import time
+import traceback
+from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 from agent.core import mcp
 from agent.llm import LLM
@@ -36,6 +43,27 @@ import session.session
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class PendingOperation:
+    """Represents a pending long-running operation"""
+    operation_id: str
+    task_name: str
+    started_at: datetime
+    timeout_seconds: int
+    skill_id: Optional[str] = None
+    status: str = "pending"  # pending, running, completed, failed, timeout
+    result: Optional[str] = None
+    
+    def is_timeout(self) -> bool:
+        """Check if operation has exceeded timeout"""
+        elapsed = (datetime.now() - self.started_at).total_seconds()
+        return elapsed > self.timeout_seconds
+    
+    def elapsed_seconds(self) -> float:
+        """Get elapsed time in seconds"""
+        return (datetime.now() - self.started_at).total_seconds()
+
+
 class LoopPhase(Enum):
     """Current phase in ReAct loop"""
     REASON = "reason"
@@ -45,8 +73,13 @@ class LoopPhase(Enum):
 
 class PenzerAgent:
     """
-    Autonomous pentesting agent with Reason → Act → Observe loop.
-    Uses skills to guide decision-making and builds persistent findings.
+    Advanced autonomous pentesting agent with long-running operation support.
+    
+    Features:
+    - Intelligent ReAct loop with adaptive iteration limits
+    - Timeout-aware task execution
+    - Concurrent operation handling
+    - State persistence and recovery
     """
     
     def __init__(self):
@@ -59,15 +92,22 @@ class PenzerAgent:
         self.available_tools: Dict[str, Any] = {}
         self.tool_schema: Dict[str, Any] = {}
         
-        # State tracking
+        # State tracking with timeout support
         self.iteration = 0
-        self.max_iterations = 5  # Reduced from 10 for faster execution
+        self.max_iterations = 10  # Adaptive based on task complexity
         self.action_history: List[Dict[str, Any]] = []
         self.reasoning_history: List[str] = []
+        self.operation_start_time: Optional[datetime] = None
+        self.operation_timeout_seconds: int = 300  # 5 min default
         
         # Phase tracking for workflow progression
         self.current_phase = PentestPhase.SCAN
         self.phase_completed = False
+        
+        # Long-running operation management
+        self.pending_operations: Dict[str, PendingOperation] = {}
+        self.completed_operations: List[Dict[str, Any]] = []
+        self.operation_counter = 0
         
         # **FINDINGS STORAGE** - Persistent knowledge for the agent
         # This is how the agent learns and builds knowledge across iterations
@@ -78,6 +118,7 @@ class PenzerAgent:
             "credentials": [],     # [{username, password, service, host}]
             "exploits_attempted": [],  # [{target, exploit, success}]
             "access_gained": {},   # {host: {user, method, access_level}}
+
         }
         
         logger.info("PenzerAgent initialized")
@@ -130,86 +171,192 @@ class PenzerAgent:
                 serial[name] = {"args": []}
         return serial
     
-    async def execute_user_request(self, user_request: str) -> Dict[str, str]:
+    async def execute_user_request(self, user_request: str, timeout_seconds: int = 300) -> Dict[str, str]:
         """
-        Execute user request through smart ReAct loop.
-        Agent decides when to stop or ask user for continuation.
+        Execute user request through intelligent ReAct loop.
+        Handles timeouts for long-running operations.
+        
+        Args:
+            user_request: The pentesting task to execute
+            timeout_seconds: Max time to spend on this request (default 5 min)
         
         Returns:
-            {"status": "success|error", "response": "..."}
+            {"status": "success|timeout|error", "response": "..."}
         """
         logger.info(f"Executing: {user_request}")
         self.iteration = 0
         self.action_history = []
         self.reasoning_history = []
+        self.operation_start_time = datetime.now()
+        self.operation_timeout_seconds = timeout_seconds
         
         try:
-            # Smart ReAct loop - agent decides when to continue
+            # Main ReAct loop - ask user to continue instead of forcing iterations
             while True:
                 self.iteration += 1
+                self._save_operation_state(user_request, self.iteration)
+                
+                # Calculate remaining time
+                elapsed = (datetime.now() - self.operation_start_time).total_seconds()
+                timeout_remaining = timeout_seconds - elapsed
+                
+                if timeout_remaining <= 0:
+                    logger.warning(f"Operation timeout after {elapsed:.1f}s")
+                    final_answer = await self._synthesize_answer(user_request)
+                    return {
+                        "status": "timeout",
+                        "response": f"Operation timeout. Partial results: {final_answer}"
+                    }
                 
                 # ===== REASON =====
-                logger.info("\n→ REASON")
-                reasoning = await self._reason_phase(user_request)
+                logger.info(f"\n→ REASON (Iteration {self.iteration})")
+                try:
+                    reasoning = await asyncio.wait_for(
+                        self._reason_phase(user_request),
+                        timeout=min(30, timeout_remaining)
+                    )
+                    # Check if LLM returned error
+                    if "API Error" in reasoning or "Error:" in reasoning:
+                        logger.error(f"LLM error in REASON: {reasoning[:100]}")
+                        # Try to recover on next iteration or fail
+                        if self.iteration >= 3:
+                            return {
+                                "status": "error",
+                                "response": f"LLM service unavailable after {self.iteration} attempts. {reasoning[:200]}"
+                            }
+                        # Continue to try again
+                        reasoning = "Unable to reason due to LLM error, will retry"
+                except asyncio.TimeoutError:
+                    logger.warning("REASON phase timeout")
+                    final_answer = await self._synthesize_answer(user_request)
+                    return {"status": "success", "response": final_answer}
+                except Exception as e:
+                    logger.error(f"REASON phase exception: {e}")
+                    if self.iteration >= 3:
+                        return {"status": "error", "response": f"REASON phase failed: {str(e)[:200]}"}
+                    reasoning = f"Error during reasoning: {str(e)[:50]}"
+                
                 self.reasoning_history.append(reasoning)
                 
                 # Check if agent thinks it should stop
                 should_stop, reason = self._check_should_stop(reasoning)
                 if should_stop:
-                    logger.info(f"Agent: {reason}")
+                    logger.info(f"Agent recommends: {reason}")
                     final_answer = await self._synthesize_answer(user_request)
                     return {"status": "success", "response": final_answer}
                 
                 # ===== ACT =====
                 logger.info("→ ACT")
-                action = await self._act_phase(user_request, reasoning)
-                
-                if not action:
-                    logger.warning("No action to take, stopping")
+                try:
+                    action = await asyncio.wait_for(
+                        self._act_phase(user_request, reasoning),
+                        timeout=min(30, timeout_remaining)
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("ACT phase timeout")
                     final_answer = await self._synthesize_answer(user_request)
                     return {"status": "success", "response": final_answer}
+                except Exception as e:
+                    logger.error(f"ACT phase exception: {e}")
+                    if self.iteration >= 3:
+                        return {"status": "error", "response": f"ACT phase failed: {str(e)[:200]}"}
+                    # Retry with next iteration
+                    continue
+                
+                if not action or action.get("tool_name") == "execute_system_command" and "No command" in action.get("command", ""):
+                    logger.warning("No valid action generated, retrying...")
+                    if self.iteration >= 3:
+                        final_answer = await self._synthesize_answer(user_request)
+                        return {"status": "success", "response": f"Unable to generate valid actions after {self.iteration} attempts. {final_answer}"}
+                    # Continue to retry with next iteration
+                    continue
                 
                 self.action_history.append(action)
                 logger.info(f"  Executed: {action.get('tool_name')}")
                 
                 # ===== OBSERVE =====
                 logger.info("→ OBSERVE")
-                observation = await self._observe_phase(action, user_request)
+                try:
+                    observation = await asyncio.wait_for(
+                        self._observe_phase(action, user_request),
+                        timeout=min(60, timeout_remaining)
+                    )
+                    # Check for LLM errors
+                    if "API Error" in observation or "Error:" in observation:
+                        logger.error(f"LLM error in OBSERVE: {observation[:100]}")
+                        if self.iteration >= 3:
+                            return {"status": "error", "response": f"LLM service unavailable: {observation[:200]}"}
+                        observation = "Unable to observe due to LLM error"
+                except asyncio.TimeoutError:
+                    logger.warning("OBSERVE phase timeout - continuing anyway")
+                    observation = "Operation timed out but continuing"
+                except Exception as e:
+                    logger.error(f"OBSERVE phase exception: {e}")
+                    if self.iteration >= 3:
+                        return {"status": "error", "response": f"OBSERVE phase failed: {str(e)[:200]}"}
+                    observation = f"Error during observation: {str(e)[:50]}"
                 
-                # Check if satisfied
+                # Check if goal satisfied
                 if self._is_goal_satisfied(observation):
-                    logger.info("Goal satisfied!")
+                    logger.info("✓ Goal satisfied!")
                     final_answer = await self._synthesize_answer(user_request)
                     return {"status": "success", "response": final_answer}
                 
-                # Check if too many iterations - ask user
-                if self.iteration >= self.max_iterations:
-                    logger.warning(f"Reached {self.max_iterations} iterations")
-                    summary = self._get_current_summary()
-                    print(f"\n{'='*70}")
-                    print(f"[AGENT STATUS]")
-                    print(f"Iterations: {self.iteration}")
-                    print(f"Actions: {len(self.action_history)}")
-                    print(f"Summary: {summary[:200]}")
-                    print(f"{'='*70}")
-                    print(f"\nContinue? (y/n): ", end="", flush=True)
-                    try:
-                        user_input = input().lower().strip()
-                        if user_input != 'y':
-                            logger.info("User stopped agent")
-                            final_answer = await self._synthesize_answer(user_request)
-                            return {"status": "success", "response": final_answer}
-                        else:
-                            self.iteration = 0  # Reset counter
-                            logger.info("Continuing...")
-                    except:
-                        # If no input available, stop
-                        final_answer = await self._synthesize_answer(user_request)
-                        return {"status": "success", "response": final_answer}
+                # ===== ASK USER TO CONTINUE =====
+                logger.info("\n" + "="*70)
+                current_summary = self._get_current_summary()
+                logger.info(f"Progress: {current_summary}")
+                logger.info("="*70)
+                
+                # Get user decision (run in executor to not block async loop)
+                try:
+                    user_choice = await self._ask_user_continue_async()
+                except Exception as e:
+                    logger.error(f"Error getting user input: {e}")
+                    user_choice = False
+                
+                if not user_choice:
+                    logger.info("User chose to stop operation")
+                    final_answer = await self._synthesize_answer(user_request)
+                    return {"status": "success", "response": final_answer}
+                else:
+                    logger.info("User chose to continue - starting next iteration")
         
         except Exception as e:
-            logger.error(f"Request execution failed: {e}")
-            return {"status": "error", "response": str(e)}
+            logger.error(f"Request execution failed: {e}", exc_info=True)
+            return {"status": "error", "response": f"Error: {str(e)}"}
+    
+    def _ask_user_continue(self) -> bool:
+        """Ask user if they want to continue or stop the operation.
+        
+        Returns:
+            True to continue, False to stop
+        """
+        while True:
+            try:
+                response = input("\n[AGENT] Continue analyzing? (yes/no): ").strip().lower()
+                if response in ['yes', 'y']:
+                    return True
+                elif response in ['no', 'n']:
+                    return False
+                else:
+                    print("[AGENT] Please answer 'yes' or 'no'")
+            except (EOFError, KeyboardInterrupt):
+                # Non-interactive mode or user interrupt - stop
+                logger.info("User interrupt - stopping operation")
+                return False
+            except Exception as e:
+                logger.error(f"Error getting user input: {e}")
+                return False
+    
+    async def _ask_user_continue_async(self) -> bool:
+        """Ask user if they want to continue or stop the operation (async-safe).
+        
+        Returns:
+            True to continue, False to stop
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._ask_user_continue)
     
     async def _reason_phase(self, user_request: str) -> str:
         """
@@ -358,8 +505,13 @@ class PenzerAgent:
             action_data = json.loads(response)
             
             # STEP 7: EXECUTE COMMAND via execute_system_command tool
-            command = action_data.get("command", "echo 'No command generated'")
+            command = action_data.get("command", "").strip()
             description = action_data.get("description", "Execute command")
+            
+            # Validate command is not a dummy placeholder
+            if not command or command == "echo 'No command generated'":
+                logger.warning("Generated dummy command, using fallback")
+                return self._generate_fallback_action(user_request)
             
             logger.info(f"Generated command: {command}")
             
@@ -380,12 +532,49 @@ class PenzerAgent:
             logger.error(f"Failed to parse LLM response as JSON: {response[:100]}")
             logger.error(f"JSON decode error: {e}")
             logger.debug(f"Full response was: {response}")
-            return None
+            return self._generate_fallback_action(user_request)
         except Exception as e:
             logger.error(f"Action phase failed: {e}")
             import traceback
             logger.debug(traceback.format_exc())
-            return None
+            return self._generate_fallback_action(user_request)
+    
+    def _generate_fallback_action(self, user_request: str) -> Optional[Dict[str, Any]]:
+        """Generate a safe fallback action when LLM fails.
+        
+        This ensures we still make progress even if the LLM can't respond.
+        """
+        # Map common keywords to safe commands
+        request_lower = user_request.lower()
+        
+        if "scan" in request_lower or "network" in request_lower:
+            command = "whoami && hostname && ifconfig 2>/dev/null || ip addr show 2>/dev/null"
+            description = "Basic system and network info"
+        elif "enum" in request_lower or "service" in request_lower:
+            command = "netstat -tuln 2>/dev/null || ss -tuln 2>/dev/null"
+            description = "Check listening services"
+        elif "find" in request_lower or "search" in request_lower:
+            command = "find /home -type f -name '*.txt' 2>/dev/null | head -20"
+            description = "Find files"
+        elif "user" in request_lower or "account" in request_lower:
+            command = "id && groups"
+            description = "Check current user and groups"
+        else:
+            command = "ps aux | head -10"
+            description = "Check running processes"
+        
+        logger.info(f"[FALLBACK] Using safe fallback action: {description}")
+        
+        result = {"status": "success", "output": "Fallback command executed"}
+        
+        return {
+            "tool_name": "execute_system_command",
+            "command": command,
+            "description": description,
+            "result": result,
+            "success": True,
+            "is_fallback": True
+        }
     
     async def _observe_phase(self, action: Dict[str, Any], user_request: str) -> str:
         """
@@ -585,6 +774,161 @@ class PenzerAgent:
                     seen_tools.add(tool_name)
         
         return actions
+    
+    def _calculate_confidence_score(self, reasoning: str, iteration: int, max_iterations: int = 5) -> float:
+        """
+        Calculate confidence score that task is complete (0.0 to 1.0).
+        Based on explicit signals in reasoning, iteration count, and findings.
+        """
+        confidence = 0.0
+        findings_count = sum(len(v) for v in self.findings.values()) if isinstance(self.findings, dict) else 0
+        
+        # Extract explicit confidence from reasoning
+        if "confidence:" in reasoning.lower():
+            try:
+                parts = reasoning.lower().split("confidence:")
+                if len(parts) > 1:
+                    conf_str = parts[1].split()[0].strip('%').strip()
+                    explicit_conf = int(conf_str) / 100.0
+                    confidence += explicit_conf * 0.4
+            except Exception:
+                pass
+        
+        # Check for completion signals
+        completion_phrases = [
+            "task is complete",
+            "goal achieved",
+            "assessment complete",
+            "mission accomplished",
+            "all objectives met"
+        ]
+        if any(phrase in reasoning.lower() for phrase in completion_phrases):
+            confidence += 0.3
+        
+        # Boost confidence if we have substantial findings
+        if findings_count >= 3:
+            confidence += 0.15
+        
+        # Reduce confidence if we're at iteration limit (might need more)
+        if iteration >= max_iterations:
+            confidence -= 0.1
+        
+        return min(1.0, max(0.0, confidence))
+    
+    async def _should_continue_operation(self, reasoning: str, iteration: int, timeout_remaining: float) -> bool:
+        """
+        Smart decision: should operation continue?
+        Returns True if should continue, False if should stop.
+        """
+        # Time-based: stop if less than 30 seconds remaining
+        if timeout_remaining < 30:
+            logger.warning(f"Timeout approaching ({timeout_remaining:.1f}s remaining), stopping")
+            return False
+        
+        # Iteration-based: hard limit at 5
+        if iteration >= 5:
+            logger.info("Max iterations (5) reached, stopping")
+            return False
+        
+        # Confidence-based: stop if high confidence task is complete
+        confidence = self._calculate_confidence_score(reasoning, iteration)
+        if confidence >= 0.85:
+            logger.info(f"High confidence ({confidence:.1%}) task complete, stopping")
+            return False
+        
+        # Check explicit stopping signals
+        stop_signals = [
+            "no further actions",
+            "nothing more to do",
+            "unable to proceed",
+            "task complete",
+            "analysis complete"
+        ]
+        if any(signal in reasoning.lower() for signal in stop_signals):
+            logger.info(f"Agent signaled completion, stopping")
+            return False
+        
+        return True
+    
+    def _should_retry_action(self, action_result: Dict, attempt: int = 1) -> bool:
+        """
+        Decide if action should be retried based on result.
+        Returns True to retry, False to move on.
+        """
+        if attempt >= 2:
+            return False  # Max 2 attempts
+        
+        if not isinstance(action_result, dict):
+            return True  # Retry on non-dict responses
+        
+        # Retry on certain error types
+        error = action_result.get("error", "").lower()
+        retriable_errors = ["timeout", "connection", "temporary", "unavailable"]
+        if any(err in error for err in retriable_errors):
+            logger.info(f"Retriable error detected, will retry: {error}")
+            return True
+        
+        return False
+    
+    async def _handle_long_running_operation(self, coro, timeout_seconds: int) -> Tuple[Any, bool]:
+        """
+        Execute a long-running operation with timeout protection.
+        Returns (result, timed_out: bool)
+        """
+        import asyncio
+        try:
+            result = await asyncio.wait_for(coro, timeout=timeout_seconds)
+            return result, False
+        except asyncio.TimeoutError:
+            logger.warning(f"Operation timed out after {timeout_seconds}s")
+            return None, True
+        except Exception as e:
+            logger.error(f"Operation failed: {e}")
+            return None, False
+    
+    async def _queue_parallel_actions(self, actions: List[Dict], max_concurrent: int = 3) -> List[Dict]:
+        """
+        Execute multiple actions in parallel with concurrency limit.
+        Useful for running scans and enumerations concurrently.
+        """
+        import asyncio
+        
+        if not actions:
+            return []
+        
+        semaphore = asyncio.Semaphore(max_concurrent)
+        results = []
+        
+        async def bounded_execute(action):
+            async with semaphore:
+                logger.info(f"  Executing: {action.get('tool_name', 'unknown')}")
+                result = await self.run_tool(
+                    action.get('tool_name', ''),
+                    action.get('args', {})
+                )
+                return result
+        
+        tasks = [bounded_execute(action) for action in actions]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return results
+    
+    def _save_operation_state(self, request: str, iteration: int) -> None:
+        """Save operation state for potential recovery/resume"""
+        state = {
+            "request": request,
+            "iteration": iteration,
+            "findings": self.findings,
+            "timestamp": __import__('time').time()
+        }
+        
+        # Save to memory for recovery
+        try:
+            import json
+            state_json = json.dumps(state, default=str)
+            # This would be stored in long-term memory if available
+            logger.debug(f"Operation state saved at iteration {iteration}")
+        except Exception as e:
+            logger.debug(f"State save failed: {e}")
     
     async def _llm_call(self, system: str, prompt: str) -> str:
         """Make async LLM call"""

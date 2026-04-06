@@ -166,3 +166,4 @@ websocket-client==1.9.0
 websockets==15.0.1
 yarl==1.22.0
 zipp==3.23.0
+psutil==6.1.0

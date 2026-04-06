@@ -44,3 +44,4 @@ model/
 __pycache__/
 *.pyc
 .env
+test_agent_comprehensive.py
