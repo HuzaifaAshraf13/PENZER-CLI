@@ -10,8 +10,7 @@ Penzer is a local cognitive shell built for AI-powered terminal workflows, reaso
 
 * **User-Driven Loop**: Ask user to continue after each ReAct iteration (no forced iterations)
 * **Skill-Guided Intelligence**: 10 pentesting skills across 5 phases (scan, enumerate, exploit, post-exploit, reporting)
-* **Adaptive Token Configuration**: Auto-detects device RAM and optimizes token settings (512-2048 tokens)
-* **Local GGUF Model Support**: Full offline operation with llama.cpp optimization
+* **Local Server Support**: Compatible with llama.cpp, vLLM, ollama, LM Studio, text-generation-webui
 * **API Mode Support**: Google Generative AI, OpenAI, or custom API backends
 * **Error Recovery**: Fallback commands when LLM fails - agent continues operating
 * **ReAct Framework**: Reason → Act → Observe loop with tool orchestration
@@ -72,7 +71,7 @@ penzer
 Once started, Penzer will:
 
 1. Initialize the MCP server and load tools
-2. Detect available models (Local GGUF or API)
+2. Detect available models (Local Server or API)
 3. Prompt you to select model if both available
 4. Start interactive pentesting shell
 
@@ -89,9 +88,13 @@ user> scan the network for active devices
 
 ---
 
-# API Mode 
+# Model Configuration
 
-API mode provides fastest performance and easiest setup.
+Penzer supports two ways to run LLM models: **Local Servers** and **Cloud APIs**.
+
+## Cloud AI API Mode
+
+Cloud AI APIs provide fastest performance and easiest setup.
 
 ## Create `.env`
 
@@ -117,34 +120,111 @@ URL="https://api.example.com/v1/chat/completions"
 
 ---
 
-# Local Model Mode (Offline)
+# Local Server Mode (Advanced)
 
-Run Penzer fully offline using GGUF models with device-optimized settings.
+Run Penzer with a local AI server like **llama.cpp**, **vLLM**, **ollama**, or **text-generation-webui**.
 
-## Create model folder
+This allows you to use larger models that don't fit in memory as GGUF files, with full local control.
 
+## Setup Instructions
+
+### 1. Start Your Local Server
+
+**Using llama.cpp server:**
 ```bash
-mkdir model
+./llama-server -m model.gguf -p 8000
 ```
 
-## Download model
-
+**Using vLLM:**
 ```bash
-wget -O model/model-name.gguf <MODEL_URL>
+python -m vllm.entrypoints.openai.api_server --model model_name --port 8000
 ```
 
-## Device-Optimized Token Configuration
+**Using ollama:**
+```bash
+ollama serve
+```
 
-Penzer automatically detects your device and configures tokens:
+**Using LM Studio:**
+- Download and install LM Studio
+- Load a model and start the local server (default: http://localhost:1234)
 
-| Device RAM | Tokens | Context | Batch Size |
-|-----------|--------|---------|-----------|
-| < 8 GB    | 512    | 1024    | 128       |
-| 8-16 GB   | 1024   | 2048    | 256       |
-| 16-32 GB  | 1536   | 4096    | 512       |
-| 32+ GB    | 2048   | 8192    | 1024      |
+**Using text-generation-webui:**
+```bash
+python server.py --listen 0.0.0.0 --port 5000
+```
 
-**No configuration needed** - Penzer detects and optimizes automatically!
+### 2. Configure `.env`
+
+Add your local server URL:
+
+```env
+LOCAL_SERVER_URL="http://localhost:8000"
+```
+
+**Common Server URLs:**
+- llama.cpp: `http://localhost:8000`
+- vLLM: `http://localhost:8000`
+- ollama: `http://localhost:11434`
+- LM Studio: `http://localhost:1234`
+- text-generation-webui: `http://localhost:5000`
+
+### 3. Start Penzer
+
+```bash
+penzer
+```
+
+Penzer will automatically detect `LOCAL_SERVER_URL` and use it for inference.
+
+## Benefits of Local Server Mode
+
+- ✓ Use very large models (70B, 120B+) with offloading
+- ✓ Full local control and privacy
+- ✓ Compatible with OpenAI-compatible API servers
+- ✓ Flexible model switching without restart
+- ✓ Faster inference than traditional GGUF loading
+
+---
+
+# Model Selection Priority
+
+When starting Penzer, if multiple sources are available, you'll be prompted:
+
+```
+Multiple model sources detected. Choose which to use:
+  1. Local Server (llama.cpp, vLLM, ollama, LM Studio, etc)
+  2. Cloud AI API
+```
+
+Select based on your needs:
+- **Option 1**: Full local control, no external services
+- **Option 2**: Quickest setup, no local resources needed
+
+---
+
+# Recommended Models
+
+For best reasoning quality and tool accuracy:
+
+**Recommended Models:**
+* Qwen 2.5 Coder (7B-32B) - Excellent coding/tools
+* DeepSeek R1 (14B-671B) - Superior reasoning
+* Llama 3.1/3.2 (70B+) - Strong performance
+* Mistral Large (34B) - Good balance
+
+**Recommended Sizes:**
+* 7B (minimum for tools)
+* 14B (good balance)
+* 27B (recommended)
+* 32B+ (best reasoning)
+
+**Avoid:**
+* 3B models (too small for reasoning)
+* 8B models (limited tool accuracy)
+* 9B models (inconsistent)
+
+**Note:** Larger models work better with local servers (vLLM, ollama) for faster inference.
 
 ---
 
@@ -186,29 +266,6 @@ Skills are matched automatically - no manual configuration needed.
 
 ---
 
-For best reasoning quality and tool accuracy:
-
-**Recommended Models:**
-* Qwen 2.5 Coder (7B-32B) - Excellent coding/tools
-* DeepSeek R1 (14B-671B) - Superior reasoning
-* Llama 3.1/3.2 (70B+) - Strong performance
-* Mistral Large (34B) - Good balance
-
-**Recommended Sizes:**
-* 7B (minimum for tools)
-* 14B (good balance)
-* 27B (recommended)
-* 32B+ (best reasoning)
-
-**Avoid:**
-* 3B models (too small for reasoning)
-* 8B models (limited tool accuracy)
-* 9B models (inconsistent)
-
-**Note:** Smaller models work but may struggle with complex reasoning and tool usage. For pentesting tasks, 14B+ is strongly recommended.
-
----
-
 # Project Structure
 
 ```
@@ -222,7 +279,7 @@ PENZER-CLI/
 ├── model/                    # GGUF models folder
 ├── agent/
 │   ├── agent.py             # ReAct loop, user-driven control
-│   ├── llm.py               # LLM interface (local + API)
+│   ├── llm.py               # LLM interface (local server + API)
 │   ├── system_prompts.py    # REASON, ACT, OBSERVE, SYNTHESIZE prompts
 │   ├── core.py              # MCP server initialization
 │   └── skills/              # 10 pentesting skills (5 phases)
@@ -233,38 +290,30 @@ PENZER-CLI/
 
 ---
 
-# Local Model Placement
-
-```bash
-model/
-│── your-model.gguf
-```
-
-Only `.gguf` files should be inside `model/`.
-
----
-
 # Troubleshooting
 
-## Model not loading
+## Local Server Not Connecting
 
-Verify:
+Verify your local server is running and `.env` has correct `LOCAL_SERVER_URL`:
 
-```bash
-model/
+```env
+LOCAL_SERVER_URL="http://localhost:8000"
 ```
 
-contains a valid `.gguf` model.
-
-## API not working
-
-Verify:
+Test the connection:
 
 ```bash
-.env
+curl http://localhost:8000/v1/models
 ```
 
-exists and credentials are correct.
+## API Not Working
+
+Verify `.env` has correct API credentials:
+
+```env
+API_KEY="your-key-here"
+URL="your-api-url-here"
+```
 
 ---
 
@@ -278,14 +327,6 @@ pip install -e .
 
 ---
 
-# Updating Penzer
-
-For future updates, run:
-
-penzer update
-
-This pulls the latest version and refreshes Penzer.
-
 # Author
 
-Huzaifa Ashraf 
+Huzaifa Ashraf
