@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 PENZER-CLI: Local Cognitive Security Shell
-Modern terminal-based autonomous pentesting agent with rich UI
+Minimalist terminal-based autonomous pentesting agent - Red & White theme
 """
 
 import threading
@@ -10,132 +10,79 @@ import sys
 from pathlib import Path
 
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.spinner import Spinner
-from rich.live import Live
-from rich.layout import Layout
 from rich.text import Text
-from rich.syntax import Syntax
+from rich.prompt import Prompt
 
 # Initialize logging first
 from logger import get_logger
 logger = get_logger("cli")
 
-from agent.agent import Agent
+from agent.agent import PenzerAgent
 from agent.server import start_server
 from agent.core import cleanup_reme
 from config import Colors
 
-# Rich console for beautiful terminal output
-console = Console(force_terminal=True)
+# Rich console - clean, minimal style
+console = Console(force_terminal=True, width=100)
 
 
 def display_banner():
-    """Display stylish banner with ASCII art and info."""
-    banner = r"""
-╔═══════════════════════════════════════════════════════════╗
-║                                                           ║
-║          [red]╔═╗╔═╗╔╗╔╔═╗╔═╗╦═╗[/red]                          ║
-║          [red]╠═╝║╣ ║║║╔═╝║╣ ╠╦╝[/red]                          ║
-║          [red]╩  ╚═╝╝╚╝╚═╝╚═╝╩╚═[/red]                          ║
-║                                                           ║
-║              Autonomous Pentesting Agent                 ║
-║         Local Cognitive Security Shell v1.0              ║
-║                                                           ║
-╚═══════════════════════════════════════════════════════════╝
+    """Display clean red and white banner."""
+    banner = """
+    [red bold]╔════════════════════════════════════════╗[/red bold]
+    [red bold]║[/red bold]         [white bold]PENZER[/white bold] [red bold]Security Agent[/red bold]              [red bold]║[/red bold]
+    [red bold]║[/red bold]         [white]Autonomous Pentesting[/white]           [red bold]║[/red bold]
+    [red bold]╚════════════════════════════════════════╝[/red bold]
     """
-    console.print(banner, justify="center")
+    console.print(banner)
 
 
 async def boot_sequence():
-    """Animated boot sequence with spinners and status updates."""
-    console.print("\n", justify="center")
-    console.print(Panel(
-        "[bold cyan]PENZER INITIALIZATION SEQUENCE[/bold cyan]",
-        border_style="cyan",
-        expand=False
-    ), justify="center")
-    
-    boot_steps = [
-        ("Initializing quantum buffer", "cyan"),
-        ("Weaving neural filaments", "blue"),
-        ("Scanning entropy matrices", "yellow"),
-        ("Calibrating reasoning engines", "red"),
-        ("Establishing secure handshake", "green"),
-        ("Ready for operations", "magenta"),
-    ]
-    
-    for step, color in boot_steps:
-        with console.status(f"[{color}]{step}[/{color}]", spinner="dots"):
-            await asyncio.sleep(0.2)
-        console.print(f"[{color}]✓[/{color}] {step}", justify="center")
-    
-    console.print("\n[bold green]System online. The grid hums with potential.[/bold green]\n", justify="center")
+    """Quick initialization."""
+    console.print()
+    with console.status("[red bold]Initializing...[/red bold]", spinner="dots"):
+        await asyncio.sleep(0.5)
 
 
 def display_help():
-    """Display help information in a nice table."""
-    table = Table(
-        title="[bold cyan]AVAILABLE COMMANDS[/bold cyan]",
-        show_header=True,
-        header_style=HEADER_COLOR,
-        border_style="cyan",
-    )
-    table.add_column("Command", style="cyan", width=20)
-    table.add_column("Description", style="white")
-    
-    commands = [
-        ("exit / quit", "Shutdown the agent gracefully"),
-        ("help", "Display this help information"),
-        ("clear", "Clear the terminal screen"),
-        ("<any text>", "Send request to autonomous agent"),
-    ]
-    
-    for cmd, desc in commands:
-        table.add_row(cmd, desc)
-    
-    console.print(table)
-    console.print()
+    """Display available commands."""
+    help_text = """
+[red bold]COMMANDS:[/red bold]
+  [white]help[/white]  - Show this help
+  [white]clear[/white] - Clear screen
+  [white]quit[/white]  - Exit PENZER
+  [white]text[/white]  - Send to agent
+    """
+    console.print(help_text)
 
 
 async def main():
-    """Main CLI loop with modern terminal UI."""
+    """Main CLI loop with clean red and white theme."""
     try:
         # Display splash screen
         display_banner()
         await boot_sequence()
         
         # Start MCP server in background
-        console.print("[bold cyan]Starting Model Context Protocol server...[/bold cyan]")
         server_thread = threading.Thread(target=start_server, daemon=True)
         server_thread.start()
-        await asyncio.sleep(1)
-        console.print("[green]✓ MCP server started[/green]\n")
+        await asyncio.sleep(0.5)
         
         # Initialize agent
-        console.print("[bold cyan]Loading agent systems...[/bold cyan]")
-        with console.status("[cyan]Initializing agent...[/cyan]", spinner="dots"):
-            agent = await Agent().async_init()
-        console.print("[green]✓ Agent ready[/green]\n")
+        with console.status("[red bold]Loading agent...[/red bold]", spinner="dots"):
+            agent = await PenzerAgent().async_init()
         
-        console.print(
-            Panel(
-                "[bold]Ready to execute pentesting operations[/bold]\n"
-                "Type 'help' for commands or speak your intent.",
-                border_style="green",
-                style="green"
-            )
-        )
+        console.print("[white on red]  READY  [/white on red]\n")
         
         # Main interaction loop
         while True:
             try:
-                user_input = console.input("[bold cyan]user[/bold cyan]> ").strip()
+                user_input = console.input("[red bold]>>>[/red bold] [white]").strip()
             except EOFError:
                 break
             except KeyboardInterrupt:
-                console.print("\n[yellow]⚠ Interrupted by user[/yellow]")
+                console.print()
                 continue
             
             # Handle special commands
@@ -143,7 +90,6 @@ async def main():
                 continue
             
             if user_input.lower() in ["exit", "quit"]:
-                console.print("\n[bold yellow]Shutting down...[/bold yellow]")
                 break
             
             if user_input.lower() == "help":
@@ -154,47 +100,58 @@ async def main():
                 console.clear()
                 continue
             
-            # Process through agent with spinner
+            # Process through agent
             console.print()
-            with console.status(
-                "[bold cyan]Processing request through ReAct framework...[/bold cyan]",
-                spinner="dots",
-                spinner_style="cyan"
-            ):
-                response = await agent.execute_user_request(user_input)
+            with console.status("[red bold]Processing...[/red bold]", spinner="dots"):
+                response = await agent.run(user_input)
             
-            # Display result
             console.print()
-            if response.get("status") == "error":
-                console.print(Panel(
-                    f"[red]{response.get('response')}[/red]",
-                    title="[red][bold]ERROR[/bold][/red]",
-                    border_style="red",
-                    expand=False
-                ))
-            else:
-                console.print(Panel(
-                    f"[green]{response.get('response', 'Success')}[/green]",
-                    title="[green][bold]RESULT[/bold][/green]",
-                    border_style="green",
-                    expand=False
-                ))
+            
+            if not response:
+                console.print("[yellow]No response[/yellow]")
+                console.print()
+                continue
+            
+            # Split response into reasoning and action sections
+            reasoning_text = ""
+            action_text = response
+            
+            # Look for REASON and ACT markers
+            if "REASON:" in response and "ACT:" in response:
+                reason_idx = response.find("REASON:")
+                act_idx = response.find("ACT:")
+                
+                if reason_idx < act_idx:
+                    reasoning_text = response[reason_idx:act_idx].replace("REASON:", "").strip()
+                    action_text = response[act_idx:].replace("ACT:", "").strip().strip()
+            
+            # Display action text with proper formatting
+            console.print("[white bold]" + "─" * 100 + "[/white bold]")
+            console.print(f"[white]{action_text}[/white]", style="white")
+            console.print("[white bold]" + "─" * 100 + "[/white bold]")
+            
+            # Show thinking toggle if reasoning exists
+            if reasoning_text:
+                console.print(f"\n[dim][red]💭 Thinking[/red][/dim] (y to expand)", end=" ")
+                try:
+                    show_thinking = input(" ").strip().lower()
+                    if show_thinking in ["", "y", "yes"]:
+                        console.print("\n[dim red]─── THINKING ───[/dim red]")
+                        console.print(f"[dim]{reasoning_text}[/dim]")
+                        console.print("[dim red]──────────────────────[/dim red]")
+                except:
+                    pass
+            
             console.print()
     
     except Exception as e:
-        console.print(Panel(
-            f"[red]Fatal error: {str(e)}[/red]",
-            title="[red][bold]SYSTEM ERROR[/bold][/red]",
-            border_style="red"
-        ))
+        console.print(f"\n[red bold]ERROR: {str(e)}[/red bold]")
         import traceback
         traceback.print_exc()
     
     finally:
         # Cleanup
-        console.print("\n[bold yellow]Cleaning up resources...[/bold yellow]")
         await cleanup_reme()
-        console.print("[green]✓ Shutdown complete[/green]")
 
 
 if __name__ == "__main__":

@@ -3,8 +3,12 @@ import glob
 import json
 import requests
 import psutil
+from pathlib import Path
 from typing import Optional, Union
 from dotenv import load_dotenv
+
+# Get project root directory
+PROJECT_ROOT = Path(__file__).parent.parent
 
 # Suppress verbose logging
 import logging
@@ -193,11 +197,11 @@ class LLM:
     @staticmethod
     def _check_local_server_available() -> bool:
         """Check if .env contains LOCAL_SERVER_URL for llama.cpp/vLLM/ollama."""
-        env_path = ".env"
-        if not os.path.exists(env_path):
+        env_path = PROJECT_ROOT / ".env"
+        if not env_path.exists():
             return False
         
-        load_dotenv(env_path, override=False)
+        load_dotenv(str(env_path), override=False)
         local_url = os.getenv("LOCAL_SERVER_URL")
         
         return local_url is not None and local_url.strip() != ""
@@ -205,11 +209,11 @@ class LLM:
     @staticmethod
     def _check_api_credentials_available() -> bool:
         """Check if .env file contains API credentials."""
-        env_path = ".env"
-        if not os.path.exists(env_path):
+        env_path = PROJECT_ROOT / ".env"
+        if not env_path.exists():
             return False
         
-        load_dotenv(env_path, override=False)
+        load_dotenv(str(env_path), override=False)
         api_key = os.getenv("API_KEY")
         api_url = os.getenv("URL")
         
@@ -278,7 +282,7 @@ class LLM:
         Raises:
             ValueError: If credentials are missing
         """
-        load_dotenv(".env", override=False)
+        load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
         api_key = os.getenv("API_KEY")
         api_url = os.getenv("URL")
         
@@ -304,7 +308,7 @@ class LLM:
         Raises:
             ValueError: If server URL is missing
         """
-        load_dotenv(".env", override=False)
+        load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
         local_url = os.getenv("LOCAL_SERVER_URL")
         
         if not local_url or not local_url.strip():
@@ -405,6 +409,97 @@ class LLM:
         except Exception as e:
             print(f"[LLM] Error during generation: {e}")
             return json.dumps({"thought": f"Error: {str(e)[:100]}"})
+    
+    async def chat(self, system: str, messages: list) -> dict:
+        """Chat interface compatible with agent loop (async wrapper).
+        
+        Args:
+            system: System prompt/instructions
+            messages: List of message dicts with 'role' and 'content'
+            
+        Returns:
+            Dict with 'content' and optional 'tool_calls' keys
+        """
+        # Convert message history to a single prompt for generate_content
+        prompt = ""
+        for msg in messages:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                prompt += f"{role}: {content}\n"
+            else:
+                # Handle tool responses or other complex messages
+                prompt += f"{role}: {json.dumps(content) if content else ''}\n"
+        
+        # Call generate_content with system instruction
+        response_json = self.generate_content(
+            prompt=prompt.strip(),
+            system_instruction=system
+        )
+        
+        try:
+            response_data = json.loads(response_json)
+        except json.JSONDecodeError:
+            response_data = {"thought": response_json}
+        
+        # Parse response for tool calls and content
+        content = response_data.get("thought", "")
+        tool_calls = []
+        
+        # Check for tool calls in the response (new format: "tool" and "args")
+        if "tool" in response_data and response_data.get("tool"):
+            print(f"[LLM] Found tool in response: {response_data['tool']}")
+            tool_calls.append({
+                "id": "tool_call_1",
+                "name": response_data["tool"],
+                "arguments": response_data.get("args", {}),
+            })
+        
+        # Also check for legacy "tool_code" format (string like "memory(...)" or "terminal(...)")
+        elif "tool_code" in response_data and response_data.get("tool_code"):
+            tool_code = response_data["tool_code"].strip()
+            print(f"[LLM] Found tool_code: {tool_code}")
+            # Parse tool_code like "memory(...)" or "terminal(...)"
+            if "(" in tool_code and ")" in tool_code:
+                tool_name = tool_code.split("(")[0].strip()
+                # Extract arguments string and parse
+                args_str = tool_code[tool_code.index("(")+1:tool_code.rindex(")")]
+                try:
+                    import re
+                    args = {}
+                    
+                    # First, handle simple string arguments: key="value"
+                    for match in re.finditer(r'(\w+)="([^"]*)"', args_str):
+                        key = match.group(1)
+                        value = match.group(2)
+                        args[key] = value
+                    
+                    # Handle dict arguments: key={...}
+                    # Find all {...} blocks and their preceding keys
+                    dict_pattern = r'(\w+)=(\{[^{}]*\})'
+                    for match in re.finditer(dict_pattern, args_str):
+                        key = match.group(1)
+                        dict_str = match.group(2)
+                        try:
+                            args[key] = eval(dict_str)
+                        except:
+                            # If eval fails, keep as string
+                            args[key] = dict_str
+                    
+                    print(f"[LLM] Parsed tool_code -> {tool_name} with args {args}")
+                    tool_calls.append({
+                        "id": "tool_call_1",
+                        "name": tool_name,
+                        "arguments": args,
+                    })
+                except Exception as e:
+                    print(f"[LLM] Failed to parse tool_code: {e}")
+        
+        print(f"[LLM] Chat response: tool_calls={len(tool_calls)}, content_len={len(content)}")
+        return {
+            "content": content,
+            "tool_calls": tool_calls,
+        }
     
     def test_model(self) -> bool:
         """Test if model is working properly with token generation.

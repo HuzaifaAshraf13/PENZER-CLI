@@ -45,3 +45,11 @@ __pycache__/
 *.pyc
 .env
 test_agent_comprehensive.py
+.penzer_session.json
+session.json
+coherence_test.py
+direct_tool_test.py
+final_coherence_report.py
+TEST_RESULTS.txt
+COHERENCE_TEST_REPORT.md
+COHERENCE_TEST_SUMMARY.md

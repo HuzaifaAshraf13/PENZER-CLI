@@ -2,19 +2,14 @@
 """Skill modules for pentesting phases."""
 
 from agent.skills.base import Skill, PentestPhase, SkillModule
-from agent.skills.scan import ScanSkills
-from agent.skills.enumeration import EnumerationSkills
-from agent.skills.exploitation import ExploitationSkills
-from agent.skills.post_exploitation import PostExploitationSkills
-from agent.skills.reporting import ReportingSkills
 
-# Map phases to their skill modules
+# Legacy prebuilt modules are intentionally not registered by default.
+# The MarkdownSkillModule loads all .skill.md definitions as Skill objects.
+from agent.skills.md_loader import MarkdownSkillModule
+
+# Register a single loader that sources skills from markdown files.
 PHASE_SKILL_MODULES = {
-    PentestPhase.SCAN: ScanSkills,
-    PentestPhase.ENUMERATION: EnumerationSkills,
-    PentestPhase.EXPLOITATION: ExploitationSkills,
-    PentestPhase.POST_EXPLOITATION: PostExploitationSkills,
-    PentestPhase.REPORTING: ReportingSkills,
+    PentestPhase.UNKNOWN: MarkdownSkillModule,
 }
 
 
@@ -28,6 +23,7 @@ def load_skills_for_phase(phase: PentestPhase) -> list:
 
 def load_all_skills() -> dict:
     """Load all skills across all phases."""
+    # Return a dict with a single key (UNKNOWN) containing all markdown skills
     all_skills = {}
     for phase, module in PHASE_SKILL_MODULES.items():
         all_skills[phase] = module.get_skills()
@@ -38,11 +34,7 @@ __all__ = [
     "Skill",
     "PentestPhase",
     "SkillModule",
-    "ScanSkills",
-    "EnumerationSkills",
-    "ExploitationSkills",
-    "PostExploitationSkills",
-    "ReportingSkills",
+    "MarkdownSkillModule",
     "load_skills_for_phase",
     "load_all_skills",
 ]

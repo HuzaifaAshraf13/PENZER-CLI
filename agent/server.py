@@ -79,15 +79,8 @@ async def _get_mcp_resources():
 
 # ---------------- TOOL REGISTRATION VALIDATION ----------------
 REQUIRED_TOOLS = [
-    "execute_system_command",
-    "check_available_tools",
-    "list_registered_tools",
-    "mem_get_short",
-    "mem_set_short",
-    "mem_get_long",
-    "mem_set_long",
-    "mem_search",
-    "mem_clear_short"
+    "terminal",
+    "memory"
 ]
 
 def _validate_tool_registration():
