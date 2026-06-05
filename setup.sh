@@ -27,7 +27,7 @@ if [[ ":$PATH:" != *":$LOCAL_BIN:"* ]]; then
 fi
 
 echo ""
-echo "[✓] Penzer installed successfully with all system dependencies"
+echo "[✓] Penzer installed successfully"
 echo ""
 echo "Run:"
 echo "penzer"
