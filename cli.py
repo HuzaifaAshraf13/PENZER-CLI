@@ -112,36 +112,10 @@ async def main():
                 console.print()
                 continue
             
-            # Split response into reasoning and action sections
-            reasoning_text = ""
-            action_text = response
-            
-            # Look for REASON and ACT markers
-            if "REASON:" in response and "ACT:" in response:
-                reason_idx = response.find("REASON:")
-                act_idx = response.find("ACT:")
-                
-                if reason_idx < act_idx:
-                    reasoning_text = response[reason_idx:act_idx].replace("REASON:", "").strip()
-                    action_text = response[act_idx:].replace("ACT:", "").strip().strip()
-            
-            # Display action text with proper formatting
+            # Clean output - just display the response
             console.print("[white bold]" + "─" * 100 + "[/white bold]")
-            console.print(f"[white]{action_text}[/white]", style="white")
+            console.print(f"[white]{response}[/white]")
             console.print("[white bold]" + "─" * 100 + "[/white bold]")
-            
-            # Show thinking toggle if reasoning exists
-            if reasoning_text:
-                console.print(f"\n[dim][red]💭 Thinking[/red][/dim] (y to expand)", end=" ")
-                try:
-                    show_thinking = input(" ").strip().lower()
-                    if show_thinking in ["", "y", "yes"]:
-                        console.print("\n[dim red]─── THINKING ───[/dim red]")
-                        console.print(f"[dim]{reasoning_text}[/dim]")
-                        console.print("[dim red]──────────────────────[/dim red]")
-                except:
-                    pass
-            
             console.print()
     
     except Exception as e:
