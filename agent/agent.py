@@ -14,6 +14,10 @@ from agent.memory import load_memory, save_memory
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills
 from agent.skills.search import semantic_search_skills, format_relevant_skills_for_prompt
+from tools.terminal_tool import terminal
+from tools.browser_tool import browser
+from tools.ui_tool import ui
+from tools.file_editor_tool import file_editor
 
 logger = logging.getLogger(__name__)
 SESSION_FILE = Path(".penzer_session.json")
@@ -29,13 +33,18 @@ class PenzerAgent:
 
     async def async_init(self) -> "PenzerAgent":
         """Initialize agent with tools from MCP server."""
+        # Import tools to register them with MCP
         try:
             import tools.tools
-            logger.info("✓ Loaded tools.tools")
         except Exception as e:
             logger.warning(f"Failed to load tools: {e}")
         
-        self.tools = getattr(mcp, "_tools", None) or getattr(mcp, "tools", {})
+        # Get tools from MCP using get_tools()
+        try:
+            self.tools = await mcp.get_tools() or {}
+        except Exception as e:
+            logger.warning(f"Failed to get tools from MCP: {e}")
+            self.tools = {}
         
         logger.info(f"Agent ready — {len(self.tools)} tools loaded")
         if self.tools:
@@ -46,7 +55,7 @@ class PenzerAgent:
         """Single execution pass: think → act once → respond"""
         self.history.append({"role": "user", "content": user_input})
         
-        # Get relevant skills
+        # Get relevant skills only
         all_skills = []
         if self.skills:
             for phase, skills in self.skills.items():
@@ -60,13 +69,8 @@ class PenzerAgent:
             top_k=3
         )
         
-        skills_context = format_relevant_skills_for_prompt(relevant_skills)
-        system = build_system_prompt(
-            skills=relevant_skills,
-            tools=self.tools,
-            memory=self.memory,
-            extra=f"\n{skills_context}"
-        )
+        # Build minimal system prompt with only relevant skills
+        system = build_system_prompt(skills=relevant_skills)
         
         # Single pass: get response
         response = await self.llm.chat(system=system, messages=self.history)
