@@ -31,8 +31,8 @@ def display_banner():
     """Display clean red and white banner."""
     banner = """
     [red bold]╔════════════════════════════════════════╗[/red bold]
-    [red bold]║[/red bold]         [white bold]PENZER[/white bold] [red bold]Security Agent[/red bold]              [red bold]║[/red bold]
-    [red bold]║[/red bold]         [white]Autonomous Pentesting[/white]           [red bold]║[/red bold]
+    [red bold]║[/red bold]         [white bold]PENZER[/white bold] [red bold]terminal Agent[/red bold]              [red bold]║[/red bold]
+    [red bold]║[/red bold]         [white]Autonomous assitant [/white]           [red bold]║[/red bold]
     [red bold]╚════════════════════════════════════════╝[/red bold]
     """
     console.print(banner)
