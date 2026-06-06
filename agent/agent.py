@@ -16,7 +16,6 @@ from agent.skills import load_all_skills
 from agent.skills.search import semantic_search_skills, format_relevant_skills_for_prompt
 from tools.terminal_tool import terminal
 from tools.browser_tool import browser
-from tools.ui_tool import ui
 from tools.file_editor_tool import file_editor
 
 logger = logging.getLogger(__name__)
