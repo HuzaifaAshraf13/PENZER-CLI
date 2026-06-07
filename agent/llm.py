@@ -102,6 +102,8 @@ class LLM:
         self.model = self._init_model()
         self.model_name = getattr(self.model, 'model_name', 'unknown')
         self._plain_text_failures = 0
+        self.call_count = 0
+        self.token_estimate = 0
 
     def _init_model(self) -> LLMModel:
         load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
@@ -186,6 +188,8 @@ Never explain yourself in plain text. Just output the JSON immediately. One JSON
 
         try:
             raw = self._call_with_backoff(prompt_messages)
+            self.call_count += 1
+            self.token_estimate += sum(len(str(m.get("content","")).split()) for m in prompt_messages)
         except requests.HTTPError as e:
             if e.response.status_code == 429:
                 return {"content": "Rate limit reached — please wait a moment and try again.", "tool_calls": []}
@@ -200,6 +204,8 @@ Never explain yourself in plain text. Just output the JSON immediately. One JSON
             return {"content": raw.strip(), "tool_calls": []}
 
         self._plain_text_failures = 0
+        self.call_count = 0
+        self.token_estimate = 0
         thought = data.get("thought", "")
         tool_name = str(data.get("tool", "")).strip()
         tool_args = data.get("args", {})

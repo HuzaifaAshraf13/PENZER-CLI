@@ -13,7 +13,8 @@ from rich.panel import Panel
 import logging
 from logger import get_logger
 logger = get_logger("cli")
-logging.getLogger("agent.agent").setLevel(logging.WARNING)
+for _log in ["agent.agent", "penzer.core", "penzer.server", "agent.skills.search"]:
+    logging.getLogger(_log).setLevel(logging.WARNING)
 
 from agent.agent import PenzerAgent
 from agent.server import start_server
@@ -55,6 +56,7 @@ async def main():
     try:
         display_banner()
 
+        logging.getLogger("penzer.server").setLevel(logging.CRITICAL)
         server_thread = threading.Thread(target=start_server, daemon=True)
         server_thread.start()
         await asyncio.sleep(0.5)
@@ -95,6 +97,9 @@ async def main():
             response = clean_response(response or "No response")
             console.print()
             console.print(Markdown(response))
+            calls = agent.llm.call_count
+            tokens = agent.llm.token_estimate
+            console.print(f"[dim]  {calls} LLM calls · ~{tokens} tokens[/dim]")
             console.print()
 
     except Exception as e:
