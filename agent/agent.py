@@ -14,7 +14,7 @@ from agent.llm import LLM
 from agent.memory import load_memory, save_memory
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills
-from agent.skills.search import semantic_search_skills
+from agent.skills.search import semantic_search_skills, build_context_from_history
 
 logger = logging.getLogger(__name__)
 SESSION_FILE = Path(".penzer_session.json")
@@ -58,20 +58,23 @@ class PenzerAgent:
             for phase, skills in self.skills.items():
                 all_skills.extend(skills or [])
 
-        relevant_skills = semantic_search_skills(
-            user_request=user_input,
-            available_skills=all_skills,
-            memory=self.memory,
-            top_k=3
-        )
-
-        system = build_system_prompt(skills=relevant_skills)
         answer = "No response"
 
         for iteration in range(MAX_ITERATIONS):
             self._trim_history()
             self.on_status(f"Thinking... ({iteration + 1})")
             logger.info(f"Iteration {iteration + 1}/{MAX_ITERATIONS}")
+
+            # Dynamic skill search every iteration using live context
+            context = build_context_from_history(self.history)
+            relevant_skills = semantic_search_skills(
+                user_request=user_input,
+                available_skills=all_skills,
+                memory=self.memory,
+                top_k=3,
+                context=context
+            )
+            system = build_system_prompt(skills=relevant_skills)
 
             # Reliability: wrap every iteration so one failure never kills the session
             try:

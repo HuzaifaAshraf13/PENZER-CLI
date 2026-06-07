@@ -1,5 +1,4 @@
 """Semantic search for relevant skills based on user request and context."""
-
 from typing import List, Dict, Tuple
 from agent.skills.base import Skill
 import logging
@@ -11,93 +10,85 @@ def semantic_search_skills(
     user_request: str,
     available_skills: List[Skill],
     memory: Dict = None,
-    top_k: int = 3
+    top_k: int = 3,
+    context: str = ""
 ) -> List[Skill]:
     """
-    Perform semantic search to find the top-k most relevant skills for a user request.
-    
-    Uses simple keyword matching on skill metadata (keywords, description, name).
-    Can be extended with embedding-based similarity if needed.
-    
+    Find relevant skills for a request. Searches against user request + live context
+    so skills evolve as the task progresses across iterations.
+
     Args:
-        user_request: The user's pentesting request
-        available_skills: List of available Skill objects
-        memory: Optional memory dictionary for context
-        top_k: Number of top skills to return
-        
-    Returns:
-        List of top-k most relevant skills sorted by relevance score
+        user_request: The original user request
+        available_skills: All available Skill objects
+        memory: Optional memory dict for context
+        top_k: Max skills to return (no hard cap — returns all scoring above threshold)
+        context: Live context from current iteration (tool results, history summary)
     """
     if not available_skills:
-        logger.warning("No skills available for semantic search")
         return []
-    
-    # Normalize request text for matching
-    request_lower = user_request.lower()
-    request_tokens = set(request_lower.split())
-    
-    # Score each skill based on relevance to the request
+
+    # Combine request + live context for richer matching
+    combined = f"{user_request} {context}".lower()
+    tokens = set(combined.split())
+
     skill_scores: List[Tuple[Skill, float]] = []
-    
+
     for skill in available_skills:
         score = 0.0
-        
-        # 1. Exact name match (highest weight)
-        if skill.name.lower() in request_lower:
+
+        # Exact name match
+        if skill.name.lower() in combined:
             score += 10.0
-        
-        # 2. Keywords match (medium weight)
+
+        # Keyword matches against combined context
         if skill.keywords:
-            keyword_matches = sum(1 for kw in skill.keywords if kw.lower() in request_lower)
-            score += keyword_matches * 3.0
-        
-        # 3. Description contains request tokens (lower weight)
-        description_lower = skill.description.lower()
-        token_matches = sum(1 for token in request_tokens if token in description_lower and len(token) > 2)
-        score += token_matches * 0.5
-        
-        # 4. Priority as tiebreaker
+            score += sum(3.0 for kw in skill.keywords if kw.lower() in combined)
+
+        # Description token matches
+        desc_lower = skill.description.lower()
+        score += sum(0.5 for t in tokens if len(t) > 2 and t in desc_lower)
+
+        # Priority tiebreaker
         score += skill.priority * 0.1
-        
+
         if score > 0:
             skill_scores.append((skill, score))
-    
-    # Sort by score descending
+
     skill_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    # Return top-k skills
-    result = [skill for skill, _ in skill_scores[:top_k]]
-    
+
+    # Return all skills above threshold OR top_k minimum — whichever is more
+    threshold = 1.5
+    above = [s for s, sc in skill_scores if sc >= threshold]
+    result = above if len(above) >= top_k else [s for s, _ in skill_scores[:top_k]]
+
     if result:
         logger.info(f"Semantic search found {len(result)} relevant skills for request")
-        for i, skill in enumerate(result, 1):
-            logger.debug(f"  {i}. {skill.name} (id={skill.skill_id})")
-    
+
     return result
 
 
+def build_context_from_history(history: list, last_n: int = 6) -> str:
+    """Extract recent tool results and assistant thoughts as context for skill search."""
+    context_parts = []
+    for msg in history[-last_n:]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str) and role in ["tool", "assistant"]:
+            context_parts.append(content[:300])
+    return " ".join(context_parts)
+
+
 def format_relevant_skills_for_prompt(skills: List[Skill]) -> str:
-    """
-    Format a list of relevant skills into prompt-friendly text.
-    
-    Args:
-        skills: List of Skill objects to format
-        
-    Returns:
-        Formatted string suitable for injection into system/user prompts
-    """
     if not skills:
-        return "No relevant skills identified. Perform basic reconnaissance."
-    
-    lines = ["RELEVANT SKILLS FOR THIS REQUEST:"]
+        return "No relevant skills found — reason through the task and create a skill after."
+
+    lines = ["RELEVANT SKILLS:"]
     for i, skill in enumerate(skills, 1):
-        lines.append(f"\n{i}. {skill.name} (skill_id: {skill.skill_id})")
-        lines.append(f"   Description: {skill.description}")
-        if skill.keywords:
-            lines.append(f"   Keywords: {', '.join(skill.keywords)}")
+        lines.append(f"\n{i}. {skill.name}")
+        lines.append(f"   {skill.description}")
         if skill.agent_behavior:
             lines.append(f"   Guidance: {skill.agent_behavior}")
         if skill.mcp_tools:
             lines.append(f"   Tools: {', '.join(skill.mcp_tools)}")
-    
+
     return "\n".join(lines)
