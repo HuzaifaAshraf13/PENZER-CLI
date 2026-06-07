@@ -3,17 +3,17 @@ Minimal LLM interface - supports local servers and cloud APIs
 """
 import os
 import json
+import time
 import requests
 from pathlib import Path
 from typing import Optional, Union
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).parent.parent
+_cache: dict = {}
 
 
 class LocalServerModel:
-    """Local AI server (llama.cpp, ollama, vLLM, etc)"""
-
     def __init__(self, url: str):
         self.url = url.rstrip('/')
         self.model_name = "local-server"
@@ -31,8 +31,6 @@ class LocalServerModel:
 
 
 class APIModel:
-    """Cloud AI API (Google Gemini, OpenAI, etc)"""
-
     def __init__(self, api_key: str, url: str):
         self.api_key = api_key
         self.url = url
@@ -53,18 +51,16 @@ class APIModel:
 
 
 class LLM:
-    """Main LLM wrapper"""
-
     def __init__(self):
         self.model = self._init_model()
         self.model_name = getattr(self.model, 'model_name', 'unknown')
+        self._plain_text_failures = 0
 
     def _init_model(self) -> Union[LocalServerModel, APIModel]:
         load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
         local_url = os.getenv("LOCAL_SERVER_URL", "").strip().strip('"\'')
         api_key = os.getenv("API_KEY", "").strip().strip('"\'')
         api_url = os.getenv("URL", "").strip().strip('"\'')
-
         if local_url:
             print("[LLM] Auto-detected: Local server available")
             return LocalServerModel(local_url)
@@ -75,8 +71,8 @@ class LLM:
             raise FileNotFoundError("No LOCAL_SERVER_URL or API credentials in .env")
 
     def _extract_json(self, text: str) -> dict | None:
-        """Extract JSON from LLM output — handles code blocks and raw JSON."""
-        # Strip code blocks
+        """Robust JSON extractor — handles code blocks, partial JSON, buried objects."""
+        # Strip code fences
         for fence in ["```json", "```"]:
             if fence in text:
                 start = text.find(fence) + len(fence)
@@ -92,27 +88,48 @@ class LLM:
         except json.JSONDecodeError:
             pass
 
-        # Try finding JSON object anywhere in text
-        for start in [text.find("{"), 0]:
-            if start == -1:
-                continue
+        # Find first { and try progressively shorter substrings
+        start = text.find("{")
+        if start != -1:
             for end in range(len(text), start, -1):
                 try:
                     return json.loads(text[start:end])
                 except json.JSONDecodeError:
                     continue
 
-        return None
+        # Last resort — salvage key fields with string search
+        result = {}
+        for key in ["thought", "tool", "args"]:
+            marker = f'"{key}"'
+            idx = text.find(marker)
+            if idx != -1:
+                val_start = text.find(":", idx) + 1
+                val = text[val_start:val_start + 200].strip().strip(",")
+                try:
+                    result[key] = json.loads(val)
+                except Exception:
+                    result[key] = val.strip('"')
+        return result if result else None
+
+    def _call_with_backoff(self, messages: list) -> str:
+        """Call LLM with exponential backoff on rate limit."""
+        for attempt, wait in enumerate([0, 2, 4, 8, 16]):
+            if wait:
+                time.sleep(wait)
+            try:
+                return self.model.create_chat_completion(messages)
+            except requests.HTTPError as e:
+                if e.response.status_code == 429 and attempt < 4:
+                    continue
+                raise requests.HTTPError(f"HTTP {e.response.status_code}", response=e.response)
+        raise RuntimeError("LLM failed after retries")
 
     async def chat(self, system: str, messages: list) -> dict:
-        """
-        Chat interface for agent.
-        Expects LLM to respond with JSON:
-        {"thought": "...", "tool": "tool_name", "args": {...}}
-        or just text for final answers.
-        """
-        # Force JSON tool-call format in system prompt
-        enforced_system = system + """
+        # Switch to simpler prompt if Gemini keeps returning plain text
+        if self._plain_text_failures >= 3:
+            format_instruction = '\nRespond with JSON only: {"thought": "...", "tool": "tool_name", "args": {}}'
+        else:
+            format_instruction = """
 
 RESPONSE FORMAT — always respond with valid JSON only:
 If you need to use a tool:
@@ -122,24 +139,31 @@ If you have a final answer (no tool needed):
 {"thought": "your answer here"}
 
 Available tools: terminal, run_python, run_bash, browser, file_editor, memory
-NEVER respond with plain text. ALWAYS respond with JSON.
+Never explain yourself in plain text. Never say "I will search" or "Let me look that up."
+Just output the JSON immediately. One JSON object. Nothing else. NEVER respond with plain text.
 """
 
+        enforced_system = system + format_instruction
         prompt_messages = [{"role": "system", "content": enforced_system}] + messages
 
         try:
-            raw = self.model.create_chat_completion(prompt_messages)
+            raw = self._call_with_backoff(prompt_messages)
+        except requests.HTTPError as e:
+            if e.response.status_code == 429:
+                return {"content": "LLM rate limit reached — please wait a moment and try again.", "tool_calls": []}
+            return {"content": "LLM request failed — check your API credentials.", "tool_calls": []}
         except Exception as e:
-            return {"content": f"LLM error: {str(e)}", "tool_calls": []}
+            return {"content": "LLM did not respond — please try again.", "tool_calls": []}
 
         data = self._extract_json(raw)
 
         if not data:
-            # LLM returned plain text — treat as final answer
+            self._plain_text_failures += 1
             return {"content": raw.strip(), "tool_calls": []}
 
+        self._plain_text_failures = 0
         thought = data.get("thought", "")
-        tool_name = data.get("tool", "").strip()
+        tool_name = str(data.get("tool", "")).strip()
         tool_args = data.get("args", {})
 
         if tool_name:

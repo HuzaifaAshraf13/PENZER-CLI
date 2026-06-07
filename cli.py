@@ -5,26 +5,39 @@ PENZER-CLI: Autonomous Terminal Agent
 import threading
 import asyncio
 import sys
-from pathlib import Path
+import re
 from rich.console import Console
-from rich.prompt import Prompt
+from rich.markdown import Markdown
+from rich.panel import Panel
 
+import logging
 from logger import get_logger
 logger = get_logger("cli")
+logging.getLogger("agent.agent").setLevel(logging.WARNING)
 
 from agent.agent import PenzerAgent
 from agent.server import start_server
 from agent.core import cleanup_reme
-from config import Colors
 
 console = Console(force_terminal=True, width=100)
+
+
+def clean_response(text: str) -> str:
+    """Strip JSON artifacts and internal thought leakage."""
+    # Remove "thought:" prefix
+    text = re.sub(r'^thought\s*:\s*', '', text, flags=re.IGNORECASE).strip()
+    # Remove JSON blobs
+    text = re.sub(r'\{[^{}]{0,500}\}', '', text).strip()
+    # Remove markdown code fences
+    text = re.sub(r'```[\w]*\n?', '', text).strip()
+    return text
 
 
 def display_banner():
     console.print("""
     [red bold]╔════════════════════════════════════════╗[/red bold]
-    [red bold]║[/red bold]         [white bold]PENZER[/white bold] [red bold]terminal Agent[/red bold]              [red bold]║[/red bold]
-    [red bold]║[/red bold]         [white]Autonomous assistant[/white]           [red bold]║[/red bold]
+    [red bold]║[/red bold]         [white bold]PENZER[/white bold] [red bold]Terminal Agent[/red bold]              [red bold]║[/red bold]
+    [red bold]║[/red bold]         [white]Autonomous Assistant[/white]           [red bold]║[/red bold]
     [red bold]╚════════════════════════════════════════╝[/red bold]
     """)
 
@@ -71,18 +84,17 @@ async def main():
 
             console.print()
 
-            # Live status that updates as agent works
             with console.status("", spinner="dots") as status:
                 def on_status(msg: str):
-                    status.update(f"[red bold]{msg}[/red bold]")
+                    status.update(f"[dim]{msg}[/dim]")
 
                 agent.on_status = on_status
                 response = await agent.run(user_input)
 
+            # Clean and render response
+            response = clean_response(response or "No response")
             console.print()
-            console.print("[white bold]" + "─" * 100 + "[/white bold]")
-            console.print(f"[white]{response or 'No response'}[/white]")
-            console.print("[white bold]" + "─" * 100 + "[/white bold]")
+            console.print(Markdown(response))
             console.print()
 
     except Exception as e:
