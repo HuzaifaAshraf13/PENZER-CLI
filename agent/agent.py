@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from agent.core import mcp
 from agent.llm import LLM
-from agent.memory import load_memory, save_memory
+from session.memory import load_memory, save_memory
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills
 from agent.skills.search import semantic_search_skills, build_context_from_history

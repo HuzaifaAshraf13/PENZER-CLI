@@ -18,7 +18,7 @@ for _log in ["agent.agent", "penzer.core", "penzer.server", "agent.skills.search
 
 from agent.agent import PenzerAgent
 from agent.server import start_server
-from agent.core import cleanup_reme
+from agent.core import mcp
 
 console = Console(force_terminal=True, width=100)
 
