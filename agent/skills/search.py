@@ -34,7 +34,6 @@ def semantic_search_skills(
 
     skill_scores.sort(key=lambda x: x[1], reverse=True)
 
-    # Only return skills that genuinely match — no forced results
     threshold = 1.5
     result = [s for s, sc in skill_scores if sc >= threshold]
 
@@ -47,12 +46,23 @@ def semantic_search_skills(
 
 
 def build_context_from_history(history: list, last_n: int = 6) -> str:
+    """Extract recent messages as context — handles both str and dict content."""
     context_parts = []
     for msg in history[-last_n:]:
         role = msg.get("role", "")
         content = msg.get("content", "")
-        if isinstance(content, str) and role in ["tool", "assistant"]:
+
+        if role not in ["tool", "assistant"]:
+            continue
+
+        if isinstance(content, str):
             context_parts.append(content[:300])
+        elif isinstance(content, dict):
+            # Extract thought or content from dict responses
+            text = content.get("thought") or content.get("content", "")
+            if text:
+                context_parts.append(str(text)[:300])
+
     return " ".join(context_parts)
 
 

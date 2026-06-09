@@ -26,11 +26,6 @@ try:
 except Exception as e:
     logger.warning(f"Failed to load tools.tools: {e}")
 
-try:
-    import session.session
-    logger.info("✓ Loaded session.session")
-except Exception as e:
-    logger.warning(f"Failed to load session.session: {e}")
 
 # ---------------- HELPERS ----------------
 async def _get_tool_keys() -> list:

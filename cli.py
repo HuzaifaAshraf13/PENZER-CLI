@@ -6,30 +6,25 @@ import threading
 import asyncio
 import sys
 import re
+import logging
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.panel import Panel
 
-import logging
 from logger import get_logger
 logger = get_logger("cli")
+
 for _log in ["agent.agent", "penzer.core", "penzer.server", "agent.skills.search"]:
     logging.getLogger(_log).setLevel(logging.WARNING)
 
 from agent.agent import PenzerAgent
 from agent.server import start_server
-from agent.core import mcp
 
 console = Console(force_terminal=True, width=100)
 
 
 def clean_response(text: str) -> str:
-    """Strip JSON artifacts and internal thought leakage."""
-    # Remove "thought:" prefix
     text = re.sub(r'^thought\s*:\s*', '', text, flags=re.IGNORECASE).strip()
-    # Remove JSON blobs
     text = re.sub(r'\{[^{}]{0,500}\}', '', text).strip()
-    # Remove markdown code fences
     text = re.sub(r'```[\w]*\n?', '', text).strip()
     return text
 
@@ -89,25 +84,19 @@ async def main():
             with console.status("", spinner="dots") as status:
                 def on_status(msg: str):
                     status.update(f"[dim]{msg}[/dim]")
-
                 agent.on_status = on_status
                 response = await agent.run(user_input)
 
-            # Clean and render response
             response = clean_response(response or "No response")
             console.print()
             console.print(Markdown(response))
-            calls = agent.llm.call_count
-            tokens = agent.llm.token_estimate
-            console.print(f"[dim]  {calls} LLM calls · ~{tokens} tokens[/dim]")
+            console.print(f"[dim]  {agent.llm.call_count} LLM calls · ~{agent.llm.token_estimate} tokens[/dim]")
             console.print()
 
     except Exception as e:
         console.print(f"\n[red bold]ERROR: {str(e)}[/red bold]")
         import traceback
         traceback.print_exc()
-    finally:
-        await cleanup_reme()
 
 
 if __name__ == "__main__":

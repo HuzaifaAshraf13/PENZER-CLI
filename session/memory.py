@@ -1,88 +1,90 @@
-"""Agent memory module for persistent session memory."""
+"""
+session/memory.py — Persistent agent memory + session history in one file.
+"""
 
 import json
 import os
-from typing import Dict, Any
 import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
-
-# Memory storage file
-MEMORY_FILE = "memory_store/agent_memory.json"
+STORAGE_FILE = ".penzer.json"
 
 
-def _ensure_memory_dir():
-    """Ensure memory storage directory exists."""
-    os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
-
-
-def load_memory() -> Dict[str, Any]:
-    """Load agent memory from persistent storage.
-    
-    Returns:
-        Dictionary containing agent memory
-    """
-    _ensure_memory_dir()
-    
+def _load() -> dict:
     try:
-        if os.path.exists(MEMORY_FILE):
-            with open(MEMORY_FILE, 'r') as f:
-                return json.load(f)
+        if os.path.exists(STORAGE_FILE):
+            with open(STORAGE_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
     except Exception as e:
-        logger.warning(f"Failed to load memory: {e}")
-    
-    # Return empty memory structure if file doesn't exist or error occurred
-    return {
-        "observations": [],
-        "findings": [],
-        "targets": {},
-        "credentials": {},
-        "techniques": {},
-        "metadata": {}
-    }
+        logger.warning(f"Failed to load storage: {e}")
+    return {"memory": {}, "history": []}
 
 
-def save_memory(memory: Dict[str, Any]) -> bool:
-    """Save agent memory to persistent storage.
-    
-    Args:
-        memory: Dictionary containing agent memory
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    _ensure_memory_dir()
-    
+def _save(data: dict) -> None:
     try:
-        with open(MEMORY_FILE, 'w') as f:
-            json.dump(memory, f, indent=2)
-        return True
+        with open(STORAGE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
-        logger.error(f"Failed to save memory: {e}")
-        return False
+        logger.error(f"Failed to save storage: {e}")
 
 
-def update_memory(memory: Dict[str, Any], key: str, value: Any) -> None:
-    """Update a specific memory key.
-    
-    Args:
-        memory: Memory dictionary to update
-        key: Key to update
-        value: Value to set
-    """
-    memory[key] = value
+# ── Memory ──────────────────────────────
+
+def load_memory() -> dict:
+    return _load().get("memory", {})
 
 
-def clear_memory() -> bool:
-    """Clear all agent memory.
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        if os.path.exists(MEMORY_FILE):
-            os.remove(MEMORY_FILE)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to clear memory: {e}")
-        return False
+def save_memory(memory: dict) -> None:
+    data = _load()
+    data["memory"] = memory
+    _save(data)
+
+
+def remember(memory: dict, item: str) -> None:
+    memory.setdefault("facts", [])
+    if item not in memory["facts"]:
+        memory["facts"].append(item)
+
+
+def get_memory_context(memory: dict) -> str:
+    if not memory:
+        return ""
+    lines = ["## Memory"]
+    for key, value in memory.items():
+        if isinstance(value, list) and value:
+            lines.append(f"- {key}: {', '.join(str(v) for v in value[-10:])}")
+        elif value:
+            lines.append(f"- {key}: {value}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def clear_memory() -> None:
+    data = _load()
+    data["memory"] = {}
+    _save(data)
+
+
+# ── Session History ──────────────────────
+
+def load_history() -> list:
+    return _load().get("history", [])
+
+
+def save_history(history: list) -> None:
+    data = _load()
+    data["history"] = history
+    _save(data)
+
+
+def clear_history() -> None:
+    data = _load()
+    data["history"] = []
+    _save(data)
+
+
+def clear_all() -> None:
+    if os.path.exists(STORAGE_FILE):
+        os.remove(STORAGE_FILE)

@@ -3,37 +3,32 @@ skill_id: terminal.executor
 name: Terminal Skill
 phase: terminal
 description: Execute terminal commands safely. Explain before execution. Detect dangerous commands. Track changes. Validate results.
-keywords: [terminal, shell, execute, safe, commands]
-mcp_tools: [terminal, memory]
+keywords: [terminal, shell, execute, bash, command, run, script]
+mcp_tools: [terminal, run_bash, run_python, memory]
 agent_behavior: |
-  **BEFORE ANY COMMAND:**
-  1. Explain what it does and why.
-  2. State expected outcome.
-  3. Detect dangerous patterns:
-     - rm -rf on critical paths, chmod 000, dd, mkfs, systemctl stop, reboot, iptables -F
-     - If dangerous: flag "⚠️ DANGEROUS" and require "confirm" from user.
-  4. Execute if safe.
+  BEFORE EVERY COMMAND:
+  - State what the command does and why in your thought
+  - Dangerous patterns (rm -rf, dd, mkfs, chmod 000, reboot, iptables -F, shutdown):
+    flag in thought and use force=True only if user confirmed
   
-  **EXECUTION:**
-  1. Run command via terminal tool.
-  2. Capture stdout, stderr, exit_code.
-  3. Store in memory: command, output, exit_code, timestamp, environment.
+  EXECUTION:
+  - Use terminal for single commands
+  - Use run_bash for multi-line scripts
+  - Use run_python for Python code
+  - Always check exit_code in result — non-zero means failure
   
-  **VALIDATION:**
-  1. Check exit_code.
-  2. Compare actual output to expected.
-  3. If mismatch: analyze and retry or fallback.
-  4. If fails: trigger failure.skill to log context.
+  VALIDATION:
+  - If exit_code != 0: read stderr, diagnose, retry with fix or try different approach
+  - If output is empty when output was expected: command may have silently failed — verify
+  - Never assume success without checking exit_code
   
-  **CHANGE TRACKING:**
-  - Before state-changing commands, snapshot system.
-  - After execution, capture new state.
-  - Create change_log: timestamp, command, old_state, new_state, reverse_command.
+  ON FAILURE:
+  - Do not repeat the exact same command
+  - Change approach: different flags, different tool, different method
+  - After 2 failures on same task: reflect and recover
 priority: 1.0
-version: 1.0
+version: 1.1
 author: Penzer
 ---
-
 # Terminal Skill
-
-Explain before executing. Detect dangerous commands. Track changes. Validate results.
+Execute commands safely. Always check exit_code. Never repeat a failed command unchanged.

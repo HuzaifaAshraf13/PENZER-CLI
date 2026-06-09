@@ -53,3 +53,5 @@ final_coherence_report.py
 TEST_RESULTS.txt
 COHERENCE_TEST_REPORT.md
 COHERENCE_TEST_SUMMARY.md
+agent_memory.json
+.penzer.json

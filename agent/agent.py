@@ -1,7 +1,7 @@
 """
 Penzer Agent — LLM-driven State Machine
-LLM decides every state transition. No loop, no iteration counter.
 States: PLAN → EXECUTE → VERIFY → DONE (RECOVER on failure)
+LLM decides every transition. No loop.
 """
 
 import json
@@ -14,13 +14,15 @@ from typing import Any, Callable
 
 from agent.core import mcp
 from agent.llm import LLM
-from session.memory import load_memory, save_memory
+from session.memory import (
+    load_memory, save_memory, get_memory_context, remember,
+    load_history, save_history, clear_history
+)
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills
 from agent.skills.search import semantic_search_skills, build_context_from_history
 
 logger = logging.getLogger(__name__)
-SESSION_FILE = Path(".penzer_session.json")
 
 
 class State(Enum):
@@ -37,7 +39,7 @@ class PenzerAgent:
         self.tools: dict[str, Any] = {}
         self.memory = load_memory()
         self.skills = load_all_skills()
-        self.history = self._load_session()
+        self.history = load_history()
         self.on_status: Callable[[str], None] = lambda msg: None
         self._tool_cache: dict = {}
         self._trace: list = []
@@ -53,21 +55,18 @@ class PenzerAgent:
         except Exception as e:
             logger.warning(f"Failed to get tools from MCP: {e}")
             self.tools = {}
-        self._check_memory_health()
+        if self.memory is None:
+            self.memory = {}
         logger.info(f"Agent ready — {len(self.tools)} tools loaded")
         if self.tools:
             logger.info(f"Available tools: {', '.join(self.tools.keys())}")
         return self
 
     async def run(self, user_input: str) -> str:
-        """
-        LLM-driven state machine.
-        LLM decides what state to enter next — not a loop.
-        Recursion depth = number of state transitions.
-        """
         self.history.append({"role": "user", "content": user_input})
         self._trace = []
         self._failures = 0
+        remember(self.memory, f"User asked: {user_input[:100]}")
 
         all_skills = []
         if self.skills:
@@ -76,18 +75,7 @@ class PenzerAgent:
 
         return await self._transition(State.PLAN, user_input, all_skills)
 
-    async def _transition(self, state: State, user_input: str, all_skills: list, depth: int = 0) -> str:
-        """
-        Single state execution. LLM response determines next state.
-        No loop — each transition calls _transition recursively.
-        Max depth = 20 to prevent infinite recursion.
-        """
-        if state == State.DONE or depth >= 20:
-            self._save_session()
-            save_memory(self.memory)
-            return self.history[-1].get("content", "Done") if self.history else "Done"
-
-        # Build context-aware system prompt
+    def _build_system(self, state: State, user_input: str, all_skills: list) -> str:
         context = build_context_from_history(self.history)
         relevant_skills = semantic_search_skills(
             user_request=user_input,
@@ -96,9 +84,23 @@ class PenzerAgent:
             top_k=3,
             context=context
         )
-        system = build_system_prompt(skills=relevant_skills) + f"\n\nCurrent state: {state.value.upper()}"
+        memory_context = get_memory_context(self.memory)
+        system = build_system_prompt(skills=relevant_skills, extra=memory_context)
+        system += f"\n\nCurrent state: {state.value.upper()}"
+        return system
+
+    async def _transition(self, state: State, user_input: str, all_skills: list, depth: int = 0) -> str:
+        if state == State.DONE or depth >= 20:
+            self._save()
+            # Return last string content from history
+            for msg in reversed(self.history):
+                content = msg.get("content", "")
+                if isinstance(content, str) and content and not content.startswith("[Recovery]") and not content.startswith("[History"):
+                    return content
+            return "Done"
 
         await self._trim_history()
+        system = self._build_system(state, user_input, all_skills)
 
         try:
             if state == State.PLAN:
@@ -114,13 +116,12 @@ class PenzerAgent:
             self._trace.append({"state": state.value, "error": str(e)})
             self._failures += 1
             if self._failures >= 3:
-                self._save_session()
-                save_memory(self.memory)
+                self._save()
                 return "Task failed after multiple errors."
             return await self._transition(State.RECOVER, user_input, all_skills, depth + 1)
 
     # ─────────────────────────────────────────
-    # STATES — LLM response decides next state
+    # STATES
     # ─────────────────────────────────────────
 
     async def _plan(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
@@ -130,40 +131,41 @@ class PenzerAgent:
         response = await self.llm.chat(system=system, messages=self.history)
 
         if response.get("tool_calls"):
-            # LLM wants to act — go straight to EXECUTE
+            # LLM wants to use a tool — go to EXECUTE
             self.history.append({"role": "assistant", "content": response})
             return await self._transition(State.EXECUTE, user_input, all_skills, depth + 1)
 
-        content = response.get("content", "")
-        self.history.append({"role": "assistant", "content": content})
-
-        # LLM has a final answer already — done
-        if not response.get("tool_calls"):
+        content = response.get("content", "").strip()
+        if content:
+            self.history.append({"role": "assistant", "content": content})
             return await self._transition(State.DONE, user_input, all_skills, depth + 1)
 
+        # Empty response — push to execute
         return await self._transition(State.EXECUTE, user_input, all_skills, depth + 1)
 
     async def _execute(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
         self.on_status("Executing...")
 
-        # Find pending tool calls from last assistant message
-        last = next(
+        # Find the most recent assistant message that has tool_calls
+        pending = next(
             (m for m in reversed(self.history)
              if isinstance(m.get("content"), dict) and m["content"].get("tool_calls")),
             None
         )
 
-        if not last:
-            # No pending tool calls — ask LLM what to do
+        if not pending:
+            # No pending tool calls — ask LLM what to do next
             response = await self.llm.chat(system=system, messages=self.history)
-            if not response.get("tool_calls"):
-                answer = response.get("content", "Done")
-                self.history.append({"role": "assistant", "content": answer})
-                return await self._transition(State.DONE, user_input, all_skills, depth + 1)
-            self.history.append({"role": "assistant", "content": response})
-            last = self.history[-1]
 
-        calls = last["content"]["tool_calls"]
+            if not response.get("tool_calls"):
+                content = response.get("content", "Done")
+                self.history.append({"role": "assistant", "content": content})
+                return await self._transition(State.DONE, user_input, all_skills, depth + 1)
+
+            self.history.append({"role": "assistant", "content": response})
+            pending = self.history[-1]
+
+        calls = pending["content"]["tool_calls"]
 
         TOOL_LABELS = {
             "browser":     "Searching the web",
@@ -174,7 +176,7 @@ class PenzerAgent:
             "memory":      "Accessing memory",
         }
 
-        # Run tool calls — parallel if multiple
+        # Parallel execution if multiple tool calls
         if len(calls) > 1:
             results = await asyncio.gather(*[
                 self._call_tool(c["name"], c.get("arguments", {})) for c in calls
@@ -183,15 +185,16 @@ class PenzerAgent:
             results = [await self._call_tool(calls[0]["name"], calls[0].get("arguments", {}))]
 
         for call, result in zip(calls, results):
-            self.on_status(f"{TOOL_LABELS.get(call['name'], call['name'])}...")
+            label = TOOL_LABELS.get(call["name"], call["name"])
+            self.on_status(f"{label}...")
             self._trace.append({"state": "execute", "tool": call["name"], "result": str(result)[:200]})
+            remember(self.memory, f"Used {call['name']}: {str(result)[:80]}")
             self.history.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
                 "content": result
             })
 
-        # After execution — LLM verifies
         return await self._transition(State.VERIFY, user_input, all_skills, depth + 1)
 
     async def _verify(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
@@ -209,8 +212,9 @@ class PenzerAgent:
         if self._is_stuck():
             return await self._transition(State.RECOVER, user_input, all_skills, depth + 1)
 
-        # LLM satisfied — done
+        # Task complete
         self.history.append({"role": "assistant", "content": content})
+        remember(self.memory, f"Completed: {content[:80]}")
         return await self._transition(State.DONE, user_input, all_skills, depth + 1)
 
     async def _recover(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
@@ -222,8 +226,8 @@ class PenzerAgent:
 
         reflection = await self._reflect(user_input)
         self._trace.append({"state": "recover", "reflection": reflection})
+        remember(self.memory, f"Recovery: {reflection[:80]}")
         self.history.append({"role": "user", "content": f"[Recovery]: {reflection}"})
-
         return await self._transition(State.EXECUTE, user_input, all_skills, depth + 1)
 
     # ─────────────────────────────────────────
@@ -270,8 +274,16 @@ class PenzerAgent:
     def _is_stuck(self) -> bool:
         if len(self.history) < 6:
             return False
-        last = [m for m in self.history[-6:] if m.get("role") == "tool"]
-        return len(last) >= 3 and len(set(str(m.get("content", ""))[:50] for m in last)) == 1
+        last_tools = [m for m in self.history[-6:] if m.get("role") == "tool"]
+        if len(last_tools) < 3:
+            return False
+        # Stuck if same result repeating
+        same_result = len(set(str(m.get("content", ""))[:50] for m in last_tools)) == 1
+        # Stuck if same tool called 3+ times in a row
+        last_calls = [m for m in self.history[-6:] if isinstance(m.get("content"), dict) and m["content"].get("tool_calls")]
+        tool_names = [m["content"]["tool_calls"][0]["name"] for m in last_calls if m["content"].get("tool_calls")]
+        same_tool = len(tool_names) >= 3 and len(set(tool_names)) == 1
+        return same_result or same_tool
 
     async def _reflect(self, task: str) -> str:
         response = await self.llm.chat(
@@ -279,11 +291,6 @@ class PenzerAgent:
             messages=[{"role": "user", "content": f"Stuck on: {task}\nWhat went wrong? What to try differently?"}]
         )
         return response.get("content", "Try a different approach.")
-
-    def _check_memory_health(self) -> None:
-        if self.memory is None:
-            self.memory = {}
-            logger.warning("Memory reset to empty")
 
     async def _trim_history(self) -> None:
         if len(self.history) <= 82:
@@ -304,32 +311,18 @@ class PenzerAgent:
             )
             summary = summary_response.get("content", "Previous actions summarized.")
             self.history = first + [{"role": "assistant", "content": f"[History Summary]: {summary}"}] + recent
-            logger.info("History summarized")
         except Exception:
             self.history = first + recent
 
-    def _save_session(self) -> None:
-        try:
-            SESSION_FILE.write_text(json.dumps(self.history, default=str))
-        except Exception as e:
-            logger.debug(f"Session save failed: {e}")
-
-    def _load_session(self) -> list:
-        try:
-            if SESSION_FILE.exists():
-                data = SESSION_FILE.read_text()
-                if data.strip():
-                    return json.loads(data)
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"Session corrupted — resetting: {e}")
-            SESSION_FILE.unlink(missing_ok=True)
-        return []
+    def _save(self) -> None:
+        save_history(self.history)
+        save_memory(self.memory)
 
     def clear_session(self) -> None:
         self.history = []
         self._tool_cache = {}
         self._trace = []
-        SESSION_FILE.unlink(missing_ok=True)
+        clear_history()
         logger.info("Session cleared")
 
     def get_trace(self) -> list:
