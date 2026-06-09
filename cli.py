@@ -65,12 +65,15 @@ async def main():
             try:
                 user_input = console.input("[red bold]>>> [/red bold]").strip()
             except (EOFError, KeyboardInterrupt):
-                console.print()
-                continue
+                agent.clear_session()
+                console.print("\n[dim]Session cleared. Memory retained.[/dim]")
+                break
 
             if not user_input:
                 continue
             if user_input.lower() in ["exit", "quit"]:
+                agent.clear_session()
+                console.print("[dim]Session cleared. Memory retained.[/dim]")
                 break
             if user_input.lower() == "help":
                 display_help()
