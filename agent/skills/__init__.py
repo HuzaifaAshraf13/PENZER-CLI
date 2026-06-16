@@ -1,40 +1,28 @@
 # agent/skills/__init__.py
-"""Skill modules for pentesting phases."""
-
+"""Skill modules for Penzer."""
 from agent.skills.base import Skill, PentestPhase, SkillModule
+from agent.skills.search import load_skills_from_markdown, semantic_search_skills
 
-# Legacy prebuilt modules are intentionally not registered by default.
-# The MarkdownSkillModule loads all .skill.md definitions as Skill objects.
-from agent.skills.md_loader import MarkdownSkillModule
-
-# Register a single loader that sources skills from markdown files.
-PHASE_SKILL_MODULES = {
-    PentestPhase.UNKNOWN: MarkdownSkillModule,
-}
+# Load all skills from *.skill.md files at startup — single source of truth
+ALL_SKILLS: list[Skill] = load_skills_from_markdown()
 
 
-def load_skills_for_phase(phase: PentestPhase) -> list:
-    """Load all skills for a given phase."""
-    module = PHASE_SKILL_MODULES.get(phase)
-    if module:
-        return module.get_skills()
-    return []
+def load_skills_for_phase(phase: PentestPhase) -> list[Skill]:
+    """Return skills matching a specific phase."""
+    return [s for s in ALL_SKILLS if s.phase == phase]
 
 
-def load_all_skills() -> dict:
-    """Load all skills across all phases."""
-    # Return a dict with a single key (UNKNOWN) containing all markdown skills
-    all_skills = {}
-    for phase, module in PHASE_SKILL_MODULES.items():
-        all_skills[phase] = module.get_skills()
-    return all_skills
+def load_all_skills() -> list[Skill]:
+    """Return all loaded skills."""
+    return ALL_SKILLS
 
 
 __all__ = [
     "Skill",
     "PentestPhase",
     "SkillModule",
-    "MarkdownSkillModule",
+    "ALL_SKILLS",
     "load_skills_for_phase",
     "load_all_skills",
+    "semantic_search_skills",
 ]

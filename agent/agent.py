@@ -1,17 +1,12 @@
 """
-Penzer Agent — LLM-driven State Machine
-States: PLAN → EXECUTE → VERIFY → DONE (RECOVER on failure)
-LLM decides every transition. No loop.
+Penzer Agent — Pure agentic loop.
+LLM drives everything. One LLM call per iteration. No state machine.
 """
-
 import json
 import logging
 import inspect
 import asyncio
-from enum import Enum
-from pathlib import Path
 from typing import Any, Callable
-
 from agent.core import mcp
 from agent.llm import LLM
 from session.memory import (
@@ -24,21 +19,17 @@ from agent.skills.search import semantic_search_skills, build_context_from_histo
 
 logger = logging.getLogger(__name__)
 
-
-class State(Enum):
-    PLAN    = "plan"
-    EXECUTE = "execute"
-    VERIFY  = "verify"
-    RECOVER = "recover"
-    DONE    = "done"
+MAX_ITERATIONS = 20
+HISTORY_TRIM_THRESHOLD = 80
+HISTORY_KEEP_RECENT = 20
 
 
 class PenzerAgent:
     def __init__(self):
         self.llm = LLM()
         self.tools: dict[str, Any] = {}
-        self.memory = load_memory()
-        self.skills = load_all_skills()
+        self.memory = load_memory() or {}
+        self.skills = load_all_skills()          # list[Skill] now
         self.history = load_history()
         self.on_status: Callable[[str], None] = lambda msg: None
         self._tool_cache: dict = {}
@@ -55,8 +46,6 @@ class PenzerAgent:
         except Exception as e:
             logger.warning(f"Failed to get tools from MCP: {e}")
             self.tools = {}
-        if self.memory is None:
-            self.memory = {}
         logger.info(f"Agent ready — {len(self.tools)} tools loaded")
         if self.tools:
             logger.info(f"Available tools: {', '.join(self.tools.keys())}")
@@ -66,107 +55,28 @@ class PenzerAgent:
         self.history.append({"role": "user", "content": user_input})
         self._trace = []
         self._failures = 0
+        self._tool_cache = {}
         remember(self.memory, f"User asked: {user_input[:100]}")
 
-        all_skills = []
-        if self.skills:
-            for phase, skills in self.skills.items():
-                all_skills.extend(skills or [])
-
-        return await self._transition(State.PLAN, user_input, all_skills)
-
-    def _build_system(self, state: State, user_input: str, all_skills: list) -> str:
+        # Build system prompt ONCE per request
         context = build_context_from_history(self.history)
         relevant_skills = semantic_search_skills(
             user_request=user_input,
-            available_skills=all_skills,
+            available_skills=self.skills,
             memory=self.memory,
             top_k=3,
             context=context
         )
-        memory_context = get_memory_context(self.memory)
-        system = build_system_prompt(skills=relevant_skills, extra=memory_context)
-        system += f"\n\nCurrent state: {state.value.upper()}"
-        return system
-
-    async def _transition(self, state: State, user_input: str, all_skills: list, depth: int = 0) -> str:
-        if state == State.DONE or depth >= 20:
-            self._save()
-            # Return last string content from history
-            for msg in reversed(self.history):
-                content = msg.get("content", "")
-                if isinstance(content, str) and content and not content.startswith("[Recovery]") and not content.startswith("[History"):
-                    return content
-            return "Done"
-
-        await self._trim_history()
-        system = self._build_system(state, user_input, all_skills)
-
-        try:
-            if state == State.PLAN:
-                return await self._plan(user_input, system, all_skills, depth)
-            elif state == State.EXECUTE:
-                return await self._execute(user_input, system, all_skills, depth)
-            elif state == State.VERIFY:
-                return await self._verify(user_input, system, all_skills, depth)
-            elif state == State.RECOVER:
-                return await self._recover(user_input, system, all_skills, depth)
-        except Exception as e:
-            logger.error(f"State {state.value} error: {e}")
-            self._trace.append({"state": state.value, "error": str(e)})
-            self._failures += 1
-            if self._failures >= 3:
-                self._save()
-                return "Task failed after multiple errors."
-            return await self._transition(State.RECOVER, user_input, all_skills, depth + 1)
-
-    # ─────────────────────────────────────────
-    # STATES
-    # ─────────────────────────────────────────
-
-    async def _plan(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
-        self.on_status("Planning...")
-        self._trace.append({"state": "plan"})
-
-        response = await self.llm.chat(system=system, messages=self.history)
-
-        if response.get("tool_calls"):
-            # LLM wants to use a tool — go to EXECUTE
-            self.history.append({"role": "assistant", "content": response})
-            return await self._transition(State.EXECUTE, user_input, all_skills, depth + 1)
-
-        content = response.get("content", "").strip()
-        if content:
-            self.history.append({"role": "assistant", "content": content})
-            return await self._transition(State.DONE, user_input, all_skills, depth + 1)
-
-        # Empty response — push to execute
-        return await self._transition(State.EXECUTE, user_input, all_skills, depth + 1)
-
-    async def _execute(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
-        self.on_status("Executing...")
-
-        # Find the most recent assistant message that has tool_calls
-        pending = next(
-            (m for m in reversed(self.history)
-             if isinstance(m.get("content"), dict) and m["content"].get("tool_calls")),
-            None
+        system = build_system_prompt(
+            skills=relevant_skills,
+            extra=get_memory_context(self.memory)
         )
 
-        if not pending:
-            # No pending tool calls — ask LLM what to do next
-            response = await self.llm.chat(system=system, messages=self.history)
+        result = await self._loop(system, user_input)
+        self._save()
+        return result
 
-            if not response.get("tool_calls"):
-                content = response.get("content", "Done")
-                self.history.append({"role": "assistant", "content": content})
-                return await self._transition(State.DONE, user_input, all_skills, depth + 1)
-
-            self.history.append({"role": "assistant", "content": response})
-            pending = self.history[-1]
-
-        calls = pending["content"]["tool_calls"]
-
+    async def _loop(self, system: str, user_input: str) -> str:
         TOOL_LABELS = {
             "browser":     "Searching the web",
             "terminal":    "Running command",
@@ -176,63 +86,69 @@ class PenzerAgent:
             "memory":      "Accessing memory",
         }
 
-        # Parallel execution if multiple tool calls
-        if len(calls) > 1:
-            results = await asyncio.gather(*[
-                self._call_tool(c["name"], c.get("arguments", {})) for c in calls
-            ])
-        else:
-            results = [await self._call_tool(calls[0]["name"], calls[0].get("arguments", {}))]
+        for iteration in range(MAX_ITERATIONS):
+            await self._trim_history()
 
-        for call, result in zip(calls, results):
-            label = TOOL_LABELS.get(call["name"], call["name"])
-            self.on_status(f"{label}...")
-            self._trace.append({"state": "execute", "tool": call["name"], "result": str(result)[:200]})
-            remember(self.memory, f"Used {call['name']}: {str(result)[:80]}")
-            self.history.append({
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "content": result
-            })
+            self.on_status("Thinking..." if iteration == 0 else "Continuing...")
+            response = await self.llm.chat(system=system, messages=self.history)
 
-        return await self._transition(State.VERIFY, user_input, all_skills, depth + 1)
+            tool_calls = response.get("tool_calls")
+            content = response.get("content", "").strip()
 
-    async def _verify(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
-        self.on_status("Verifying...")
+            # No tool calls → LLM is done
+            if not tool_calls:
+                if content:
+                    self.history.append({"role": "assistant", "content": content})
+                    remember(self.memory, f"Completed: {content[:80]}")
+                    return content
+                # Empty response with no tools — shouldn't happen, bail out
+                logger.warning("Empty response with no tool calls")
+                return "Done."
 
-        response = await self.llm.chat(system=system, messages=self.history)
-        content = response.get("content", "")
-        self._trace.append({"state": "verify", "response": content[:200]})
-
-        if response.get("tool_calls"):
-            # More work needed
+            # Has tool calls — execute them
             self.history.append({"role": "assistant", "content": response})
-            return await self._transition(State.EXECUTE, user_input, all_skills, depth + 1)
 
-        if self._is_stuck():
-            return await self._transition(State.RECOVER, user_input, all_skills, depth + 1)
+            if self._is_stuck():
+                reflection = await self._reflect(user_input)
+                self._failures += 1
+                self._trace.append({"iteration": iteration, "recovery": reflection})
+                remember(self.memory, f"Recovery: {reflection[:80]}")
+                self.history.append({"role": "user", "content": f"[Recovery]: {reflection}"})
+                if self._failures >= 3:
+                    return "Task failed after multiple recovery attempts."
+                continue
 
-        # Task complete
-        self.history.append({"role": "assistant", "content": content})
-        remember(self.memory, f"Completed: {content[:80]}")
-        return await self._transition(State.DONE, user_input, all_skills, depth + 1)
+            # Parallel tool execution
+            if len(tool_calls) > 1:
+                self.on_status("Running tools in parallel...")
+                results = await asyncio.gather(*[
+                    self._call_tool(c["name"], c.get("arguments", {}))
+                    for c in tool_calls
+                ])
+            else:
+                label = TOOL_LABELS.get(tool_calls[0]["name"], tool_calls[0]["name"])
+                self.on_status(f"{label}...")
+                results = [await self._call_tool(
+                    tool_calls[0]["name"], tool_calls[0].get("arguments", {})
+                )]
 
-    async def _recover(self, user_input: str, system: str, all_skills: list, depth: int) -> str:
-        self.on_status("Recovering...")
-        self._failures += 1
+            for call, result in zip(tool_calls, results):
+                self._trace.append({
+                    "iteration": iteration,
+                    "tool": call["name"],
+                    "result": str(result)[:200]
+                })
+                remember(self.memory, f"Used {call['name']}: {str(result)[:80]}")
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", call["name"]),
+                    "content": result
+                })
 
-        if self._failures >= 3:
-            return await self._transition(State.DONE, user_input, all_skills, depth + 1)
+        logger.warning("Max iterations reached")
+        return "Task hit the iteration limit. Try breaking it into smaller steps."
 
-        reflection = await self._reflect(user_input)
-        self._trace.append({"state": "recover", "reflection": reflection})
-        remember(self.memory, f"Recovery: {reflection[:80]}")
-        self.history.append({"role": "user", "content": f"[Recovery]: {reflection}"})
-        return await self._transition(State.EXECUTE, user_input, all_skills, depth + 1)
-
-    # ─────────────────────────────────────────
-    # HELPERS
-    # ─────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     async def _call_tool(self, name: str, args: dict) -> str:
         tool = self.tools.get(name)
@@ -252,7 +168,11 @@ class PenzerAgent:
                 filtered = {k: v for k, v in args.items() if k in sig.parameters}
                 if name == "memory" and "workspace_id" not in filtered:
                     filtered["workspace_id"] = "penzer_default"
-                result = await fn(**filtered) if inspect.iscoroutinefunction(fn) else fn(**filtered)
+                result = (
+                    await fn(**filtered)
+                    if inspect.iscoroutinefunction(fn)
+                    else fn(**filtered)
+                )
                 result_str = str(result)
                 self._tool_cache[cache_key] = result_str
                 return result_str
@@ -262,8 +182,12 @@ class PenzerAgent:
                     return await self._fallback_tool(name, args, str(e))
 
     async def _fallback_tool(self, failed: str, args: dict, error: str) -> str:
-        fallbacks = {"browser": "terminal", "terminal": "run_bash",
-                     "run_python": "terminal", "file_editor": "terminal"}
+        fallbacks = {
+            "browser":     "terminal",
+            "terminal":    "run_bash",
+            "run_python":  "terminal",
+            "file_editor": "terminal"
+        }
         fallback = fallbacks.get(failed)
         if not fallback or fallback not in self.tools:
             return f"Tool '{failed}' failed: {error}"
@@ -277,27 +201,34 @@ class PenzerAgent:
         last_tools = [m for m in self.history[-6:] if m.get("role") == "tool"]
         if len(last_tools) < 3:
             return False
-        # Stuck if same result repeating
         same_result = len(set(str(m.get("content", ""))[:50] for m in last_tools)) == 1
-        # Stuck if same tool called 3+ times in a row
-        last_calls = [m for m in self.history[-6:] if isinstance(m.get("content"), dict) and m["content"].get("tool_calls")]
-        tool_names = [m["content"]["tool_calls"][0]["name"] for m in last_calls if m["content"].get("tool_calls")]
+        last_calls = [
+            m for m in self.history[-6:]
+            if isinstance(m.get("content"), dict) and m["content"].get("tool_calls")
+        ]
+        tool_names = [
+            m["content"]["tool_calls"][0]["name"]
+            for m in last_calls if m["content"].get("tool_calls")
+        ]
         same_tool = len(tool_names) >= 3 and len(set(tool_names)) == 1
         return same_result or same_tool
 
     async def _reflect(self, task: str) -> str:
         response = await self.llm.chat(
             system="You are a self-reflecting agent. Be critical and specific.",
-            messages=[{"role": "user", "content": f"Stuck on: {task}\nWhat went wrong? What to try differently?"}]
+            messages=[{
+                "role": "user",
+                "content": f"Stuck on: {task}\nWhat went wrong? What to try differently?"
+            }]
         )
         return response.get("content", "Try a different approach.")
 
     async def _trim_history(self) -> None:
-        if len(self.history) <= 82:
+        if len(self.history) <= HISTORY_TRIM_THRESHOLD:
             return
         first = self.history[:1]
-        middle = self.history[1:-20]
-        recent = self.history[-20:]
+        middle = self.history[1:-HISTORY_KEEP_RECENT]
+        recent = self.history[-HISTORY_KEEP_RECENT:]
         if not middle:
             return
         middle_text = "\n".join([
@@ -306,11 +237,13 @@ class PenzerAgent:
         ])
         try:
             summary_response = await self.llm.chat(
-                system="Summarize this conversation history in 3-5 sentences. What was done, found, and failed.",
+                system="Summarize this conversation history in 3-5 sentences.",
                 messages=[{"role": "user", "content": middle_text}]
             )
             summary = summary_response.get("content", "Previous actions summarized.")
-            self.history = first + [{"role": "assistant", "content": f"[History Summary]: {summary}"}] + recent
+            self.history = first + [
+                {"role": "assistant", "content": f"[History Summary]: {summary}"}
+            ] + recent
         except Exception:
             self.history = first + recent
 

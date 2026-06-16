@@ -6,6 +6,7 @@ import threading
 import asyncio
 import sys
 import re
+import json
 import logging
 from rich.console import Console
 from rich.markdown import Markdown
@@ -13,7 +14,7 @@ from rich.markdown import Markdown
 from logger import get_logger
 logger = get_logger("cli")
 
-for _log in ["agent.agent", "penzer.core", "penzer.server", "agent.skills.search"]:
+for _log in ["agent.agent", "penzer.core", "penzer.server", "agent.skills.search", "httpx"]:
     logging.getLogger(_log).setLevel(logging.WARNING)
 
 from agent.agent import PenzerAgent
@@ -23,10 +24,54 @@ console = Console(force_terminal=True, width=100)
 
 
 def clean_response(text: str) -> str:
+    """Strip JSON artifacts and thought prefixes from LLM output."""
+    text = text.strip()
+
+    # Try to extract thought field if entire response is JSON
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data.get("thought") or data.get("content") or text
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strip thought: prefix
     text = re.sub(r'^thought\s*:\s*', '', text, flags=re.IGNORECASE).strip()
-    text = re.sub(r'\{[^{}]{0,500}\}', '', text).strip()
+
+    # Strip markdown code fences
     text = re.sub(r'```[\w]*\n?', '', text).strip()
-    return text
+
+    # Strip any remaining JSON blocks (handles nested braces)
+    def strip_json_blocks(s: str) -> str:
+        result = []
+        depth = 0
+        in_string = False
+        escape = False
+        for ch in s:
+            if escape:
+                escape = False
+                if depth > 0:
+                    continue
+            elif ch == '\\' and in_string:
+                escape = True
+                if depth > 0:
+                    continue
+            elif ch == '"' and not escape:
+                in_string = not in_string
+                if depth > 0:
+                    continue
+            elif ch == '{' and not in_string:
+                depth += 1
+                continue
+            elif ch == '}' and not in_string:
+                depth = max(0, depth - 1)
+                continue
+            if depth == 0:
+                result.append(ch)
+        return ''.join(result).strip()
+
+    text = strip_json_blocks(text)
+    return text.strip() or "Done."
 
 
 def display_banner():
@@ -84,16 +129,20 @@ async def main():
 
             console.print()
 
+            calls_before  = agent.llm.call_count
+            tokens_before = agent.llm.token_estimate
+
             with console.status("", spinner="dots") as status:
-                def on_status(msg: str):
-                    status.update(f"[dim]{msg}[/dim]")
-                agent.on_status = on_status
+                agent.on_status = lambda msg: status.update(f"[dim]{msg}[/dim]")
                 response = await agent.run(user_input)
 
-            response = clean_response(response or "No response")
+            calls_used  = agent.llm.call_count  - calls_before
+            tokens_used = agent.llm.token_estimate - tokens_before
+
+            response = clean_response(response or "No response.")
             console.print()
             console.print(Markdown(response))
-            console.print(f"[dim]  {agent.llm.call_count} LLM calls · ~{agent.llm.token_estimate} tokens[/dim]")
+            console.print(f"[dim]  {calls_used} LLM calls · ~{tokens_used} tokens[/dim]")
             console.print()
 
     except Exception as e:
