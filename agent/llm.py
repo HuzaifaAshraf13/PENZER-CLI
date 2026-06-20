@@ -187,12 +187,7 @@ class LLM:
         raise RuntimeError(f"LLM failed after retries: {last_error}")
 
     async def chat(self, system: str, messages: list) -> dict:
-        format_hint = (
-            "\n\nRespond with a single JSON object only.\n"
-            'Tool call: {"thought": "...", "tool": "tool_name", "args": {}}\n'
-            'Final answer: {"thought": "your answer"}'
-        )
-        prompt = [{"role": "system", "content": system + format_hint}] + messages
+        prompt = [{"role": "system", "content": system}] + messages
 
         try:
             raw = await self._call_with_backoff(prompt)
@@ -202,27 +197,41 @@ class LLM:
                 for m in prompt
             )
         except httpx.HTTPStatusError as e:
+            # User-friendly error messages
             if e.response.status_code == 429:
-                return {"content": "Rate limit reached — please wait a moment and try again.", "tool_calls": []}
+                return {"content": "⏳ Rate limit reached. Please wait and try again.", "tool_calls": []}
+            if e.response.status_code == 401:
+                return {"content": "🔐 Authentication failed. Check your API key.", "tool_calls": []}
             if e.response.status_code == 403:
-                return {"content": "API key rejected — check your credentials.", "tool_calls": []}
-            return {"content": f"Request failed (HTTP {e.response.status_code}).", "tool_calls": []}
+                return {"content": "🔑 Access denied. Invalid credentials.", "tool_calls": []}
+            if e.response.status_code == 500:
+                return {"content": "⚠️ LLM server error. Try again in a moment.", "tool_calls": []}
+            if e.response.status_code == 503:
+                return {"content": "🔌 LLM service unavailable. Server is down.", "tool_calls": []}
+            if e.response.status_code == 504:
+                return {"content": "⏱️ LLM took too long. Please try again.", "tool_calls": []}
+            return {"content": f"❌ HTTP {e.response.status_code}. Try again.", "tool_calls": []}
         except httpx.TimeoutException:
-            return {"content": "Request timed out — the model took too long to respond.", "tool_calls": []}
-        except Exception:
-            return {"content": "LLM did not respond — please try again.", "tool_calls": []}
+            return {"content": "⏱️ Request timed out. LLM is slow.", "tool_calls": []}
+        except httpx.ConnectError:
+            return {"content": "🌐 Connection failed. Check your internet.", "tool_calls": []}
+        except Exception as e:
+            error_msg = str(e)[:50]
+            return {"content": f"❌ Error: {error_msg}", "tool_calls": []}
 
         data = self._extract_json(raw)
         if not data:
             return {"content": raw.strip(), "tool_calls": []}
 
-        thought   = data.get("thought", "")
+        # Support both new format (answer) and old format (thought)
+        answer    = data.get("answer") or data.get("thought", "")
         tool_name = str(data.get("tool", "")).strip()
         tool_args = data.get("args", {})
 
+        # If tool is specified, return tool call
         if tool_name:
             return {
-                "content": thought,
+                "content": answer,
                 "tool_calls": [{
                     "id": "tool_call_1",
                     "name": tool_name,
@@ -230,7 +239,8 @@ class LLM:
                 }],
             }
 
-        return {"content": thought or raw.strip(), "tool_calls": []}
+        # Otherwise, return as final answer
+        return {"content": answer or raw.strip(), "tool_calls": []}
 
 
 def get_model_choice() -> LLM:

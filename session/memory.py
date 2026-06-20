@@ -1,11 +1,11 @@
 """
 session/memory.py — Persistent agent memory + session history in one file.
 """
-
 import json
 import os
 import logging
 from typing import Any
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 STORAGE_FILE = ".penzer.json"
@@ -44,21 +44,37 @@ def save_memory(memory: dict) -> None:
 
 
 def remember(memory: dict, item: str) -> None:
+    """Add a fact to memory. Auto-saves. Dedupes exact matches."""
+    if not item or not item.strip():
+        return
+    
     memory.setdefault("facts", [])
+    
+    # Dedupe: only add if not already present
     if item not in memory["facts"]:
         memory["facts"].append(item)
+        
+        # Prune old facts if list gets too long (keep last 50)
+        if len(memory["facts"]) > 50:
+            memory["facts"] = memory["facts"][-50:]
+        
+        # Auto-save
+        save_memory(memory)
 
 
 def get_memory_context(memory: dict) -> str:
-    if not memory:
+    """Format memory as context for the LLM prompt."""
+    if not memory or not memory.get("facts"):
         return ""
-    lines = ["## Memory"]
-    for key, value in memory.items():
-        if isinstance(value, list) and value:
-            lines.append(f"- {key}: {', '.join(str(v) for v in value[-10:])}")
-        elif value:
-            lines.append(f"- {key}: {value}")
-    return "\n".join(lines) if len(lines) > 1 else ""
+    
+    facts = memory.get("facts", [])
+    if not facts:
+        return ""
+    
+    # Only include the last 5 most recent facts to stay concise
+    recent = facts[-5:]
+    context = "## Memory (recent facts)\n" + "\n".join(f"- {fact}" for fact in recent)
+    return context
 
 
 def clear_memory() -> None:

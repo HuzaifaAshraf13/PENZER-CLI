@@ -14,7 +14,11 @@ from rich.markdown import Markdown
 from logger import get_logger
 logger = get_logger("cli")
 
-for _log in ["agent.agent", "penzer.core", "penzer.server", "agent.skills.search", "httpx"]:
+for _log in [
+    "agent.agent", "penzer.core", "penzer.server",
+    "agent.skills.search", "agent.skills.loader",
+    "agent.skills.base", "httpx"
+]:
     logging.getLogger(_log).setLevel(logging.WARNING)
 
 from agent.agent import PenzerAgent
@@ -24,29 +28,30 @@ console = Console(force_terminal=True, width=100)
 
 
 def clean_response(text: str) -> str:
-    """Strip JSON artifacts and thought prefixes from LLM output."""
+    """Extract only the answer, never intermediate thoughts."""
     text = text.strip()
 
-    # Try to extract thought field if entire response is JSON
     try:
         data = json.loads(text)
         if isinstance(data, dict):
-            return data.get("thought") or data.get("content") or text
+            if data.get("tool_calls") or data.get("tool"):
+                return "Executing task..."
+            return data.get("answer") or data.get("thought") or data.get("content") or text
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Strip thought: prefix
-    text = re.sub(r'^thought\s*:\s*', '', text, flags=re.IGNORECASE).strip()
+    # Error messages with emoji — return as-is
+    if text and text[0] in "⏳🔑🔐⚠️🔌⏱️🌐❌":
+        return text
 
-    # Strip markdown code fences
+    text = re.sub(r'^(thought|answer)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
     text = re.sub(r'```[\w]*\n?', '', text).strip()
 
-    # Strip any remaining JSON blocks (handles nested braces)
     def strip_json_blocks(s: str) -> str:
-        result = []
-        depth = 0
+        result    = []
+        depth     = 0
         in_string = False
-        escape = False
+        escape    = False
         for ch in s:
             if escape:
                 escape = False
@@ -142,6 +147,17 @@ async def main():
             response = clean_response(response or "No response.")
             console.print()
             console.print(Markdown(response))
+
+            # Show matched skills
+            if agent._last_matched_skills:
+                skill_names = " · ".join(agent._last_matched_skills)
+                console.print(f"[dim]  ⭐ {skill_names}[/dim]")
+
+            # Show tools used
+            if agent._trace:
+                tools_used = " · ".join(dict.fromkeys(t["tool"] for t in agent._trace))
+                console.print(f"[dim]  🔧 {tools_used}[/dim]")
+
             console.print(f"[dim]  {calls_used} LLM calls · ~{tokens_used} tokens[/dim]")
             console.print()
 

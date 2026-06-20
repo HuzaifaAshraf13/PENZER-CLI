@@ -1,28 +1,22 @@
-# agent/skills/__init__.py
-"""Skill modules for Penzer."""
-from agent.skills.base import Skill, PentestPhase, SkillModule
-from agent.skills.search import load_skills_from_markdown, semantic_search_skills
+"""
+Penzer Skill System
 
-# Load all skills from *.skill.md files at startup — single source of truth
-ALL_SKILLS: list[Skill] = load_skills_from_markdown()
-
-
-def load_skills_for_phase(phase: PentestPhase) -> list[Skill]:
-    """Return skills matching a specific phase."""
-    return [s for s in ALL_SKILLS if s.phase == phase]
-
-
-def load_all_skills() -> list[Skill]:
-    """Return all loaded skills."""
-    return ALL_SKILLS
-
+Core skills     → agent/skills/core/        always visible to agent
+Generated skills → agent/skills/generated/  searched per request, pruned after 30 days
+"""
+from agent.skills.base   import Skill
+from agent.skills.loader import (
+    load_all_skills,
+    save_generated_skill,
+    delete_generated_skill,
+)
+from agent.skills.search import search_generated_skills, build_context_from_history
 
 __all__ = [
     "Skill",
-    "PentestPhase",
-    "SkillModule",
-    "ALL_SKILLS",
-    "load_skills_for_phase",
     "load_all_skills",
-    "semantic_search_skills",
+    "save_generated_skill",
+    "delete_generated_skill",
+    "search_generated_skills",
+    "build_context_from_history",
 ]
