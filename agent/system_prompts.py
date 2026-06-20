@@ -64,7 +64,7 @@ MAIN_SYSTEM_PROMPT = """You are PENZER, a self-evolving autonomous agent with fu
    - If a similar skill exists → **update** it with your improved approach (increment version or refine steps).
    - If none exists → proceed to create a new one.
 
-2. **Generate the skill** using `skill_generator` (or `file_editor` if generator is unavailable).  
+2. **Generate the skill** using `file_editor`.  
    The skill metadata **must** include:
    - `skill_id` : unique lowercase with dots, e.g., `generated.website_scraper`
    - `name`     : human‑readable title
