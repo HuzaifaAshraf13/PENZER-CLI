@@ -5,45 +5,36 @@ description: Store facts, solutions, and patterns. Retrieve them to avoid repeat
 keywords: [memory, store, remember, retrieve, fact, pattern, recall, save, forget, context, history]
 mcp_tools: [memory]
 agent_behavior: |
-  STORE WHEN:
-  - You solved a problem successfully → store the solution
-  - User shares facts about themselves or their system → store immediately
-  - A command worked well → store the exact command
-  - A pattern is likely to repeat → store the pattern
 
-  HOW TO STORE:
-  {"tool": "memory", "args": {"action": "store", "key": "short_key", "value": "concise fact or solution"}}
+  BEFORE ACTING — CHECK MEMORY FIRST
+    When: familiar task · user references something prior · need env context
+    How:
+      retrieve one key  → memory · get · <key>
+      scan everything   → memory · list
+    Hit  → use it, skip re-doing the work
+    Miss → proceed normally
 
-  FORMAT:
-  - Concise: "Fixed X by doing Y with command Z"
-  - Include context: problem + solution + tool used
-  - Key should be descriptive: "wifi_scan_cmd", "user_os", "project_path"
+  AFTER SOLVING — STORE IF NON-TRIVIAL
+    When: solved a real problem · command worked well · user shared an env fact
+    Skip: trivial one-liners, obvious answers unlikely to repeat
+    How:
+      memory · store · <key> · <value>
+    Key   : descriptive snake_case — wifi_scan_cmd · user_os · project_path
+    Value : "Fixed X by doing Y using Z" — always include problem + solution + tool
 
-  RETRIEVE WHEN:
-  - Starting a familiar task → check memory first
-  - User references something from before → retrieve it
-  - Need context about user's environment → retrieve it
+  FORGET — DELETE WHEN STALE
+    When: user explicitly asks · info is wrong or outdated · replaced by better data
+    How:
+      memory · delete · <key>
 
-  HOW TO RETRIEVE:
-  {"tool": "memory", "args": {"action": "get", "key": "short_key"}}
+  HARD RULES
+    - Never ask the user for info you could retrieve from memory
+    - Never repeat work you have a stored solution for
+    - Check memory before every familiar task — not just when you feel like it
 
-  LIST ALL MEMORIES:
-  {"tool": "memory", "args": {"action": "list"}}
-
-  FORGET WHEN:
-  - User explicitly asks to forget something
-  - Information is outdated or wrong
-
-  HOW TO FORGET:
-  {"tool": "memory", "args": {"action": "delete", "key": "short_key"}}
-
-  PRIORITY ORDER:
-  1. Always check memory BEFORE running a command you may have run before
-  2. Always store AFTER solving something non-trivial
-  3. Never ask user for info you could retrieve from memory
 priority: 0.95
 core: true
-version: "2.1"
+version: "3.0"
 ---
 # Memory Manager
-Check memory before acting. Store after solving. Never repeat work.
+Check before acting. Store after solving. Delete when stale. Never repeat work.

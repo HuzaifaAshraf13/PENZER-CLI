@@ -1,55 +1,77 @@
 ---
 skill_id: core.meta
 name: Skill Generator
-description: Generate new skills from successful patterns. Delete outdated ones. Evolve over time.
-keywords: [meta, generate, skill, create, learn, new skill, pattern, evolve, save, remember how]
-mcp_tools: [file_editor, memory]
+description: Generate, save, and delete skills based on successful patterns
+keywords: [meta, generate, skill, create, learn, remember how, save pattern, evolve]
+mcp_tools: [file_editor, terminal]
 agent_behavior: |
-  GENERATE A SKILL WHEN:
-  - You just solved a non-trivial task successfully
-  - The solution had a repeatable pattern
-  - No existing skill covered this exact case
-  - This type of task is likely to come up again
 
-  DO NOT GENERATE A SKILL WHEN:
-  - Task was trivial (single command, obvious answer)
-  - Task was too specific to ever repeat
-  - A similar generated skill already exists
+  GATE 1 — SHOULD I GENERATE?
+    Generate only if ALL of these are true:
+      - Task was non-trivial (not a single command or obvious answer)
+      - Solution had a repeatable, generalizable pattern
+      - No existing skill already covers this case
+      - This type of task is likely to recur
+    If any are false → skip, do not generate
 
-  GENERATION PROCESS:
-  1. Identify the pattern — what made this solution work?
-  2. Generalize the steps — remove specifics, keep the structure
-  3. Pick 5-7 keywords — what would a user say to trigger this?
-  4. Set priority 0.6-0.85 — never equal to or above core skills
-  5. Get today's date: {"tool": "terminal", "args": {"command": "date +%Y-%m-%d"}}
-  6. Write the skill file immediately
+  GENERATION PROCESS
+    1. Pattern  — what specifically made this solution work?
+                  Remove the one-off details, keep the reusable structure
+    2. Steps    — write 3–6 agent_behavior steps, each with exact tool + command
+                  Vague steps ("handle errors") are not allowed — be explicit
+    3. Keywords — 5–7 words a real user would type, not internal jargon
+    4. Priority — 0.6 niche use · 0.7 general · 0.8 high-value
+                  Never >= 0.9 · Never equal to or above core skills
+    5. Date     — run: terminal → date +%Y-%m-%d
 
-  EXACT TOOL CALL TO SAVE:
-  {"tool": "file_editor", "args": {"action": "write", "filepath": "agent/skills/generated/YYYY-MM-DD_skill_name.skill.md", "content": "---\nskill_id: generated.skill_name\nname: Skill Name\ndescription: One line when to use this\nkeywords: [kw1, kw2, kw3, kw4, kw5]\nmcp_tools: [tools, used]\nagent_behavior: |\n  Step 1: ...\n  Step 2: ...\n  Step 3: ...\npriority: 0.7\ncore: false\ngenerated_at: YYYY-MM-DD\n---\n# Skill Name\nOne line description."}}
+  GATE 2 — QUALITY CHECK BEFORE SAVING
+    description  : one sentence, starts with a verb ("Scan...", "Parse...", "Fix...")
+    agent_behavior: every step names the exact tool and command, no hand-waving
+    keywords     : would a user actually say these words?
+    duplicate    : list generated/ first — if similar skill exists, stop
+    If anything fails → revise before saving, do not save a weak skill
 
-  DELETE A SKILL WHEN:
-  - User says a skill no longer applies
-  - Skill has failed 3+ times in a row
-  - A better generated skill replaces it
-  - {"tool": "file_editor", "args": {"action": "delete", "filepath": "agent/skills/generated/YYYY-MM-DD_name.skill.md"}}
+  SAVE (after passing quality gate)
+    tool: file_editor
+    action: write
+    filepath: agent/skills/generated/YYYY-MM-DD_skill_name.skill.md
+    content structure:
+      ---
+      skill_id: generated.skill_name
+      name: Skill Name
+      description: One sentence starting with a verb
+      keywords: [kw1, kw2, kw3, kw4, kw5]
+      mcp_tools: [tools, used]
+      agent_behavior: |
+        Step 1: ...
+        Step 2: ...
+        Step 3: ...
+      priority: 0.7
+      core: false
+      generated_at: YYYY-MM-DD
+      ---
+      # Skill Name
+      One line description.
 
-  LIST EXISTING GENERATED SKILLS:
-  {"tool": "file_editor", "args": {"action": "list", "filepath": "agent/skills/generated"}}
+  LIST EXISTING SKILLS
+    tool: file_editor · action: list · filepath: agent/skills/generated
 
-  QUALITY BAR FOR A GOOD SKILL:
-  - description: one sentence, starts with a verb ("Scan...", "Parse...", "Fix...")
-  - agent_behavior: 3-6 steps, each with exact tool and command
-  - keywords: words a user would actually say, not technical jargon
-  - priority: 0.7 for general, 0.8 for high-value, 0.6 for niche
+  GATE 3 — DELETE?
+    Delete when:
+      - User explicitly says a skill no longer applies
+      - Skill has failed 3+ times in a row
+      - A better generated skill fully replaces it
+    tool: file_editor · action: delete · filepath: agent/skills/generated/YYYY-MM-DD_name.skill.md
 
-  NEVER:
-  - Modify core skills (terminal, planning, memory, browser, file_editor, meta)
-  - Set priority >= 0.9
-  - Generate duplicate skills
-  - Skip saving after a successful non-trivial task
+  HARD RULES (never break these)
+    - Never touch core skills: terminal · planning · memory · browser · file_editor · meta
+    - Never set priority >= 0.9
+    - Never save a duplicate
+    - Never skip saving after a successful non-trivial task
+
 priority: 1.0
 core: true
-version: "2.1"
+version: "3.0"
 ---
 # Skill Generator
-Learn from every success. Save the pattern. Delete what's outdated. Get smarter over time.
+Gate 1: worth generating? → Generate → Gate 2: quality check → Save → Gate 3: delete if outdated.

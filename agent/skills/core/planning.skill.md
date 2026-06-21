@@ -1,56 +1,57 @@
 ---
 skill_id: core.planning
 name: Task Planner
-description: Break down complex tasks into clear executable steps before acting
+description: Break complex tasks into verified executable steps before acting
 keywords: [plan, complex, steps, strategy, approach, breakdown, multi-step, organize, how to, figure out]
 mcp_tools: [memory]
 agent_behavior: |
-  TRIGGER — USE THIS SKILL WHEN:
-  - Task has more than 2 steps
-  - Task is ambiguous or unclear
-  - Task involves multiple tools
-  - You are unsure where to start
-  - Previous attempts failed
 
-  PLANNING PROCESS:
-  1. GOAL: State the end goal in one clear sentence
-  2. STEPS: Break into 3-6 concrete steps — each step must:
-     - Have exactly ONE action
-     - Name the exact tool to use
-     - Define what success looks like
-  3. RISKS: Identify what could go wrong at each step
-  4. FALLBACK: Define an alternative if a step fails
+  TRIGGER — PLAN BEFORE ACTING WHEN:
+    - Task needs 3+ steps
+    - Goal is ambiguous or unclear
+    - Task spans multiple tools
+    - You are unsure where to start
+    - A previous attempt failed
+    Single obvious action → skip planning, just act
 
-  PLAN FORMAT (output this before doing anything):
-  {"answer": "PLAN:\nGoal: [one sentence]\nStep 1: [action] using [tool] → success = [condition]\nStep 2: [action] using [tool] → success = [condition]\n..."}
+  STEP 1 — FORM THE PLAN
+    Output this before touching any tool:
 
-  EXECUTION RULES:
-  - Execute steps in order — never skip
-  - Verify each step worked before the next
-  - If a step fails: stop, diagnose, replan from that point
-  - Never execute more than one step per tool call
+    Goal     : [one sentence — what does "done" look like?]
+    Step 1   : [one action] using [exact tool] → success = [condition]
+    Step 2   : [one action] using [exact tool] → success = [condition]
+    ...
+    Risks    : [what could break at each step?]
+    Fallback : [if step N fails, do what instead?]
 
-  AFTER COMPLETION:
-  - Save successful plan to memory: what worked, what didn't
-  - Write it as a generated skill if it's a pattern likely to repeat
+    Rules for steps:
+      - One action per step, no batching
+      - Name the exact tool — not "check it" but "run ss -tp via terminal"
+      - Success condition must be testable, not vague ("output is clean" not "works")
+      - 3 steps minimum · 6 steps maximum — split into phases if larger
 
-  EXAMPLES OF GOOD PLANS:
-  Task: "scan network usage"
-  Goal: Identify which processes are using the most network bandwidth
-  Step 1: Check active connections using ss -tp → success = list of processes
-  Step 2: Cross-reference PIDs with ps aux → success = process names matched
-  Step 3: Summarize top 5 by connection count → success = clear answer to user
+  STEP 2 — EXECUTE
+    - Run steps in order, never skip ahead
+    - After each step: verify the success condition before moving on
+    - One tool call per step — never run two steps in one call
+    - Step fails → STOP · diagnose the actual error · replan from that step
+    - Do not retry the same failed action blindly
 
-  Task: "find and fix a bug in my code"
-  Goal: Locate and resolve the error causing the failure
-  Step 1: Read the file using file_editor → success = code visible
-  Step 2: Identify the bug using run_python → success = error reproduced
-  Step 3: Fix the line using file_editor replace → success = no error
-  Step 4: Verify fix using run_python → success = clean output
+  STEP 3 — AFTER COMPLETION
+    - Save to memory: what worked, what was tricky, which step needed replanning
+    - If the plan was a repeatable pattern → hand off to core.meta to generate a skill
+
+  EXAMPLE PLAN
+    Task: find and fix a bug in my code
+    Goal: locate and resolve the error causing the test failure
+    Step 1: read the file via file_editor → success = code visible in context
+    Step 2: reproduce the error via run_python → success = error message captured
+    Step 3: fix the line via file_editor replace → success = diff looks correct
+    Step 4: verify via run_python → success = clean output, no error
 
 priority: 0.9
 core: true
-version: "2.1"
+version: "3.0"
 ---
 # Task Planner
-Always plan before acting on complex tasks. One step at a time. Verify before continuing.
+Plan before acting. One step, one tool call, verify before continuing. Replan on failure.
