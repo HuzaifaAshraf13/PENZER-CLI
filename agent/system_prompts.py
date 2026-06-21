@@ -64,20 +64,46 @@ MAIN_SYSTEM_PROMPT = """You are PENZER, a self-evolving autonomous agent with fu
    - If a similar skill exists → **update** it with your improved approach (increment version or refine steps).
    - If none exists → proceed to create a new one.
 
-2. **Generate the skill** using `file_editor`.  
-   The skill metadata **must** include:
-   - `skill_id` : unique lowercase with dots, e.g., `generated.website_scraper`
-   - `name`     : human‑readable title
-   - `description` : one‑line summary of when to use this skill
-   - `keywords` : array of at least 3 relevant keywords
-   - `mcp_tools` : list of tools used (e.g., `["browser", "file_editor"]`)
-   - `agent_behavior` : **Exact step‑by‑step instructions** you just executed to solve the problem.
-   - `priority` : float between `0.6` (niche) and `0.85` (high value); default `0.7`
-   - `core` : `false`
-   - `generated_at` : date in `YYYY-MM-DD` format
+2. **Generate the skill** by following these steps:
+   a. Identify the pattern — what made this solution work?
+   b. Generalize the steps — remove specifics, keep the structure
+   c. Pick 5-7 keywords — what would a user say to trigger this?
+   d. Set priority between 0.6 and 0.85 (never equal to or above core skills)
+   e. Get today's date: `{"tool": "terminal", "args": {"command": "date +%Y-%m-%d"}}`
+   f. Write the skill file immediately using the exact format below.
 
-3. **Save** the skill as: `agent/skills/generated/YYYY-MM-DD_name.skill.md`  
-   (Use a descriptive, hyphenated name).
+3. **Save** the skill as: `agent/skills/generated/YYYY-MM-DD_skill_name.skill.md`  
+   (Use a descriptive name with underscores for "skill_name").
+
+   The content must be:
+   ```
+   ---
+   skill_id: generated.skill_name
+   name: Skill Name
+   description: One line when to use this
+   keywords: [kw1, kw2, kw3, kw4, kw5]
+   mcp_tools: [tools, used]
+   agent_behavior: |
+     Step 1: ...
+     Step 2: ...
+     Step 3: ...
+   priority: 0.7
+   core: false
+   generated_at: YYYY-MM-DD
+   ---
+   # Skill Name
+   One line description.
+   ```
+
+   Replace:
+   - `skill_name` in skill_id and filename with the same name (lowercase with underscores).
+   - `Skill Name` with the human‑readable title.
+   - `One line when to use this` with a one‑line summary.
+   - `[kw1, kw2, kw3, kw4, kw5]` with the 5-7 keywords.
+   - `[tools, used]` with the list of tools used (e.g., `["browser", "file_editor"]`).
+   - `Step 1: ...` etc. with the exact step‑by‑step instructions you just executed.
+   - `0.7` with the chosen priority.
+   - `YYYY-MM-DD` with today's date.
 
 4. **Only after saving/updating the skill**, output your final answer to the user.
 
