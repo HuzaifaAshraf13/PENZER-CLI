@@ -1,97 +1,58 @@
-"""
-PENZER — ReflAct Agent
-Goal locked at start. Reflected every step. One loop. No drift.
-"""
-import json
-import logging
-import inspect
-import asyncio
+"""PENZER — ReflAct Agent"""
+import json, logging, inspect, asyncio
 from typing import Any, Callable
-
 from agent.core import mcp
 from agent.llm import LLM
-from session.memory import (
-    load_memory, get_memory_context, remember,
-    load_history, save_history, clear_history,
-)
+from session.memory import load_memory, get_memory_context, remember, load_history, save_history, clear_history
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
 
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-MAX_ITER      = 15   # hard ceiling
-TRIM_AT       = 35   # compress history past this length
-KEEP_LAST     = 10   # messages kept verbatim during trim
-STUCK_WINDOW  = 6    # history window for stuck detection
-STUCK_MIN     = 2    # minimum tool results before stuck can fire
-MAX_FAILURES  = 3    # recovery attempts before giving up
+MAX_ITER, TRIM_AT, KEEP_LAST, STUCK_MIN, MAX_FAILURES = 15, 35, 10, 2, 3
 
-TOOL_LABELS: dict[str, str] = {
-    "browser":        "🌐 Searching",
-    "terminal":       "⚡ Running",
-    "run_python":     "🐍 Python",
-    "run_bash":       "📜 Script",
-    "file_editor":    "📁 File",
-    "memory":         "🧠 Memory",
-    "planning":       "📋 Planning",
-    "skill_generator":"🔧 Learning",
+TOOL_LABELS = {
+    "browser": "🌐", "terminal": "⚡", "run_python": "🐍",
+    "run_bash": "📜", "file_editor": "📁", "memory": "🧠", "planning": "📋",
 }
+FALLBACKS = {"terminal": "run_bash", "run_bash": "run_python", "run_python": "terminal", "file_editor": "terminal"}
 
-# Only fall back when the destination is a genuine equivalent.
-# browser → terminal removed: completely different capability.
-FALLBACKS: dict[str, str] = {
-    "terminal":   "run_bash",
-    "run_bash":   "run_python",
-    "run_python": "terminal",
-    "file_editor":"terminal",
-}
-
-# ── Agent ───────────────────────────────────────────────────────────────────────
 
 class PenzerAgent:
     def __init__(self) -> None:
-        self.llm              = LLM()
-        self.tools: dict      = {}
-        self.memory           = load_memory() or {}
-        self.history          = load_history()
+        self.llm      = LLM()
+        self.tools    = {}
+        self.memory   = load_memory() or {}
+        self.history  = load_history()
         self.on_status: Callable[[str], None] = lambda m: None
-
-        # Per-run state — fully reset in run()
-        self._cache: dict[str, str]   = {}   # "tool:args_json" → result (errors NOT cached)
-        self._trace: list[dict]       = []   # lightweight step log
-        self._failures: int           = 0
-        self._goal: str               = ""
-        self._skills_dirty: bool      = False
-        self._last_matched_skills: list[str] = []
-
+        self._fn_cache: dict = {}   # fn → (signature, is_async)
+        self._reset()
         data = load_all_skills()
-        self.core_skills = data["core"]
-        self.gen_skills  = data["generated"]
+        self.core_skills, self.gen_skills = data["core"], data["generated"]
+
+    def _reset(self):
+        self._cache: dict               = {}
+        self._trace: list               = []
+        self._failures: int             = 0
+        self._goal: str                 = ""
+        self._skills_dirty: bool        = False
+        self._last_matched_skills: list = []   # fixed: was missing, caused AttributeError
 
     async def async_init(self) -> "PenzerAgent":
-        try:
-            import tools.tools
-        except Exception as e:
-            logger.warning("Tools import: %s", e)
-        try:
-            self.tools = await mcp.get_tools() or {}
-        except Exception as e:
-            logger.warning("MCP init: %s", e)
+        try: import tools.tools
+        except Exception as e: logger.warning("Tools: %s", e)
+        try: self.tools = await mcp.get_tools() or {}
+        except Exception as e: logger.warning("MCP: %s", e)
         return self
 
-    # ── Public ─────────────────────────────────────────────────────────────────
+    # ── Public ──────────────────────────────────────────────────────────────────
 
     async def run(self, user_input: str) -> str:
-        self._goal         = user_input
-        self._trace        = []
-        self._failures     = 0
-        self._cache        = {}
-        self._skills_dirty = False
-        self._last_matched_skills = []
-
+        self._reset()
+        self._goal = user_input
         self.history.append({"role": "user", "content": user_input})
 
+        # Compute matched skills FIRST — needed before building system prompt
         matched_gen = search_generated_skills(
             user_input, self.gen_skills,
             context=build_context_from_history(self.history),
@@ -102,162 +63,112 @@ class PenzerAgent:
             + [s.name for s in matched_gen]
         )
 
+        # Skills hint goes into extra= so agent knows which skills apply on step 0
+        skills_hint = (
+            f"SKILLS MATCHED FOR THIS TASK: {', '.join(self._last_matched_skills)}\n"
+            "You MUST follow the matched skill's agent_behavior steps before using any tool.\n"
+            "Before generating a new skill, check agent/skills/generated — it may already exist.\n"
+        ) if self._last_matched_skills else (
+            "No specific skills matched. Proceed carefully and generate a skill after solving.\n"
+        )
+
         system = build_system_prompt(
             core_skills=self.core_skills,
             generated_skills=matched_gen,
-            extra=get_memory_context(self.memory),
+            extra=get_memory_context(self.memory) + "\n\n" + skills_hint,
         )
 
         result = await self._loop(system)
 
         if self._skills_dirty:
             data = load_all_skills()
-            self.core_skills = data["core"]
-            self.gen_skills  = data["generated"]
+            self.core_skills, self.gen_skills = data["core"], data["generated"]
 
         remember(self.memory, f"Completed: {result[:120]}")
         save_history(self.history)
         return result
 
-    # ── Core loop ───────────────────────────────────────────────────────────────
+    # ── Loop ────────────────────────────────────────────────────────────────────
 
     async def _loop(self, system: str) -> str:
-        empty_streak = 0
-
+        empty = 0
         for i in range(MAX_ITER):
-            await self._trim()
-            self.on_status("Thinking…" if i == 0 else f"Step {i + 1}…")
+            asyncio.ensure_future(self._trim())
+            self.on_status("Thinking…" if i == 0 else f"Step {i+1}…")
 
-            msgs = self._build_messages(i)
-            r    = await self.llm.chat(system=system, messages=msgs)
+            r = await self.llm.chat(system=system, messages=self._msgs(i))
+            calls, text = r.get("tool_calls") or [], r.get("content", "").strip()
 
-            tool_calls = r.get("tool_calls") or []
-            content    = r.get("content", "").strip()
-
-            # ── No tool calls: answer or nudge ───────────────────────────────
-            if not tool_calls:
-                if content:
-                    self.history.append({"role": "assistant", "content": content})
-                    return content
-                empty_streak += 1
-                if empty_streak >= 2:
-                    return "No response received. Try rephrasing your request."
+            if not calls:
+                if text:
+                    self.history.append({"role": "assistant", "content": text})
+                    return text
+                empty += 1
+                if empty >= 2:
+                    return "No response. Try rephrasing."
                 if self._last_role() == "tool":
-                    self.history.append({
-                        "role": "user",
-                        "content": (
-                            f"Goal: {self._goal}\n"
-                            "You have a tool result above. "
-                            "Does it fully answer the goal? "
-                            "Give your final answer or call the next tool."
-                        ),
-                    })
+                    self.history.append({"role": "user", "content":
+                        f"Goal: {self._goal}\nAnalyze the result and give your final answer or call the next tool."})
                 continue
 
-            empty_streak = 0
-            self.history.append({
-                "role": "assistant",
-                "content": json.dumps({"reflection": content, "tool_calls": tool_calls}),
-            })
+            empty = 0
+            self.history.append({"role": "assistant",
+                                  "content": json.dumps({"reflection": text, "tool_calls": calls})})
 
-            # ── Stuck detection ──────────────────────────────────────────────
-            if self._is_stuck():
+            if len(self._trace) >= STUCK_MIN and self._stuck():
                 self._failures += 1
                 if self._failures >= MAX_FAILURES:
-                    return (
-                        f"Stuck after {MAX_FAILURES} recovery attempts. "
-                        "Try breaking the task into smaller steps."
-                    )
-                recovery = await self._reflect()
-                self.history.append({"role": "user", "content": f"[Recovery] {recovery}"})
+                    return f"Stuck after {MAX_FAILURES} attempts. Break the task into smaller steps."
+                self.history.append({"role": "user", "content": f"[Recovery] {await self._reflect()}"})
                 continue
 
-            # ── Execute — sequential for correct ReflAct ────────────────────
-            valid   = [c for c in tool_calls if c["name"] in self.tools]
-            invalid = [c for c in tool_calls if c["name"] not in self.tools]
+            for c in calls:
+                name = c["name"]
+                if name not in self.tools:
+                    self.history.append({"role": "tool", "tool_call_id": c.get("id", name),
+                                         "content": f"Unknown tool '{name}'. Available: {', '.join(sorted(self.tools))}."})
+                    continue
 
-            for c in invalid:
-                self.history.append({
-                    "role": "tool",
-                    "tool_call_id": c.get("id", c["name"]),
-                    "content": (
-                        f"Unknown tool '{c['name']}'. "
-                        f"Available: {', '.join(sorted(self.tools))}."
-                    ),
-                })
+                self.on_status(TOOL_LABELS.get(name, name) + "…")
+                raw = await self._run(name, c.get("arguments", {}))
+                ok  = not self._is_error(raw)
 
-            if not valid:
-                continue
+                self._trace.append({"step": i, "tool": name, "args": c.get("arguments", {}),
+                                     "result": str(raw)[:300], "success": ok})
+                self.history.append({"role": "tool", "tool_call_id": c.get("id", name),
+                                     "content": f"[{name}]\n{self._fmt(raw)}"})
 
-            # Sequential: each result feeds the next reflection (core ReflAct property)
-            for c in valid:
-                self.on_status(TOOL_LABELS.get(c["name"], c["name"]) + "…")
-                raw    = await self._run(c["name"], c.get("arguments", {}))
-                output = self._fmt(c["name"], raw)
-                ok     = not self._is_error(raw)
-
-                self._trace.append({
-                    "step":    i,
-                    "tool":    c["name"],
-                    "args":    c.get("arguments", {}),
-                    "result":  str(raw)[:300],
-                    "success": ok,
-                })
-
-                self.history.append({
-                    "role":        "tool",
-                    "tool_call_id": c.get("id", c["name"]),
-                    "content":     f"[{c['name']}]\n{output}",
-                })
-
-                # Skills reload trigger — file_editor OR skill_generator
-                if c["name"] in ("file_editor", "skill_generator"):
+                if name == "file_editor":
                     fp = str(c.get("arguments", {}).get("filepath", ""))
-                    if "skills/generated" in fp:
+                    if "skills/generated" in fp and fp.endswith(".skill.md"):
                         self._skills_dirty = True
 
         return "Reached iteration limit. Break the task into smaller steps."
 
-    # ── ReflAct message builder ─────────────────────────────────────────────────
+    # ── ReflAct injection ───────────────────────────────────────────────────────
 
-    def _build_messages(self, step: int) -> list[dict]:
-        """
-        Inject a goal-state reflection prompt at every step after the first.
-        Based on the ReflAct paper: the agent must reflect on its current state
-        *in relation to* the task goal before selecting the next action.
-        Not a question for the agent to answer — a directive to structure its thought.
-        """
+    def _msgs(self, step: int) -> list[dict]:
         if step == 0 or not self._trace:
             return self.history
-
-        last    = self._trace[-1]
-        status  = "succeeded" if last["success"] else "FAILED"
-        prior   = [
-            f"  step {s['step']}: {s['tool']} → {'ok' if s['success'] else 'FAILED'}"
-            for s in self._trace
-        ]
-
-        # Paper instruction: reflect on state in relation to goal, then act.
-        # We surface the raw facts; the agent generates the reflection itself.
-        injection = (
-            f"[ReflAct — step {step}]\n"
-            f"GOAL       : {self._goal}\n"
-            f"LAST ACTION: {last['tool']}({json.dumps(last['args'])[:80]}) → {status}\n"
-            f"LAST OUTPUT: {last['result'][:250]}\n"
-            f"PRIOR STEPS:\n" + "\n".join(prior) + "\n\n"
-            "Before your next action, reflect in one sentence on your current state "
-            "in relation to the task goal. Then either output your final answer or "
-            "call the next tool. Do not repeat a failed action."
+        t      = self._trace[-1]
+        steps  = " → ".join(f"{s['tool']}({'ok' if s['success'] else 'x'})" for s in self._trace)
+        skills = f"SKILLS FOR THIS TASK: {', '.join(self._last_matched_skills)}\n" \
+                 if self._last_matched_skills else ""
+        inj = (
+            f"[ReflAct {step}] GOAL: {self._goal}\n"
+            f"{skills}"
+            f"LAST: {t['tool']} → {'ok' if t['success'] else 'FAILED'} | {t['result'][:200]}\n"
+            f"STEPS: {steps}\n\n"
+            "Check your matched skills above before acting. "
+            "Reflect in one sentence on your current state in relation to the goal, "
+            "then answer or call next tool."
         )
-
-        return self.history + [{"role": "user", "content": injection}]
+        return self.history + [{"role": "user", "content": inj}]
 
     # ── Tool execution ──────────────────────────────────────────────────────────
 
     async def _run(self, name: str, args: dict) -> str:
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
-
-        # Only return cached result for successes — never serve a cached failure
         if key in self._cache:
             return self._cache[key]
 
@@ -267,63 +178,43 @@ class PenzerAgent:
 
         for attempt in range(2):
             try:
-                fn  = getattr(tool, "fn", tool)
-                sig = inspect.signature(fn)
-                kw  = {k: v for k, v in args.items() if k in sig.parameters}
+                fn = getattr(tool, "fn", tool)
+                if fn not in self._fn_cache:
+                    self._fn_cache[fn] = (inspect.signature(fn), inspect.iscoroutinefunction(fn))
+                sig, is_async = self._fn_cache[fn]
+                kw = {k: v for k, v in args.items() if k in sig.parameters}
                 if name == "memory":
                     kw.setdefault("workspace_id", "penzer_default")
-
-                out = await fn(**kw) if inspect.iscoroutinefunction(fn) else fn(**kw)
-                s   = str(out)
-                self._cache[key] = s  # cache only on success
+                out = await fn(**kw) if is_async else fn(**kw)
+                self._cache[key] = s = str(out)
                 return s
-
             except Exception as e:
                 logger.error("%s attempt %d: %s", name, attempt + 1, e)
                 if attempt == 1:
                     fb = FALLBACKS.get(name)
                     if fb and fb in self.tools:
                         self.on_status(f"Retrying with {fb}…")
-                        return await self._run(fb, self._adapt_args(name, fb, args))
+                        cmd = args.get("command") or args.get("query") or args.get("code") or args.get("script", "")
+                        return await self._run(fb, {"command": cmd})
                     return f"{name} error: {e}"
-
-        return f"{name}: unexpected failure"
-
-    def _adapt_args(self, from_tool: str, to_tool: str, args: dict) -> dict:
-        """Translate args as losslessly as possible when falling back."""
-        if to_tool in ("terminal", "run_bash", "run_python"):
-            cmd = (
-                args.get("command")
-                or args.get("query")
-                or args.get("code")
-                or args.get("script", "")
-            )
-            return {"command": cmd}
-        return args
+        return ""
 
     # ── Helpers ─────────────────────────────────────────────────────────────────
 
-    def _fmt(self, name: str, raw: Any) -> str:
-        s = str(raw).strip()
-        if not s:
-            return "(empty output)"
+    def _fmt(self, raw: Any) -> str:
+        s = str(raw).strip() or "(empty)"
         try:
             d = json.loads(s)
             if isinstance(d, dict):
                 if d.get("status") == "error":
                     return f"ERROR: {d.get('message', s)}"
-                for key in ("output", "content", "data", "result", "text"):
-                    if key in d:
-                        return str(d[key])
+                return str(next((d[k] for k in ("output","content","data","result","text") if k in d), s))
         except (json.JSONDecodeError, ValueError):
             pass
-        if len(s) > 2000:
-            return s[:1500] + f"\n…[{len(s) - 1500} chars truncated]"
-        return s
+        return s[:1500] + f"\n…[{len(s)-1500} truncated]" if len(s) > 2000 else s
 
-    def _is_error(self, result: Any) -> bool:
-        s = str(result).lower()
-        return any(tok in s for tok in (
+    def _is_error(self, r: Any) -> bool:
+        return any(t in str(r).lower() for t in (
             "error:", "failed:", "exception", "traceback",
             "not found", "permission denied", "no such file",
         ))
@@ -334,92 +225,50 @@ class PenzerAgent:
                 return m["role"]
         return ""
 
-    def _is_stuck(self) -> bool:
-        window    = self.history[-STUCK_WINDOW:]
-        tool_msgs = [m for m in window if m.get("role") == "tool"]
-
-        # Need at least STUCK_MIN results before stuck can fire — prevents false positive
-        # on first tool call (old bug: set of 1 element == 1, always triggered)
-        if len(tool_msgs) < STUCK_MIN:
-            return False
-
-        # Identical outputs
-        outputs = [str(m.get("content", ""))[:100] for m in tool_msgs]
-        if len(set(outputs)) == 1:
-            return True
-
-        # Same tool called 3+ times in a row with no progress
-        tool_names: list[str] = []
-        for m in window:
+    def _stuck(self) -> bool:
+        w    = self.history[-6:]
+        msgs = [m for m in w if m.get("role") == "tool"]
+        if len(msgs) < STUCK_MIN: return False
+        if len({str(m.get("content",""))[:100] for m in msgs}) == 1: return True
+        names = []
+        for m in w:
             if m.get("role") == "assistant":
-                try:
-                    for tc in json.loads(m["content"]).get("tool_calls", []):
-                        tool_names.append(tc["name"])
-                except (json.JSONDecodeError, KeyError, TypeError):
-                    pass
-        if len(tool_names) >= 3 and len(set(tool_names)) == 1:
-            return True
-
-        # All recent steps failed
+                try: names.extend(tc["name"] for tc in json.loads(m["content"]).get("tool_calls", []))
+                except (json.JSONDecodeError, KeyError, TypeError): pass
+        if len(names) >= 3 and len(set(names)) == 1: return True
         recent = self._trace[-STUCK_MIN:]
-        if len(recent) >= STUCK_MIN and all(not s["success"] for s in recent):
-            return True
-
-        return False
+        return len(recent) >= STUCK_MIN and all(not s["success"] for s in recent)
 
     async def _reflect(self) -> str:
-        failed = [
-            f"step {s['step']}: {s['tool']}({json.dumps(s['args'])[:60]}) → {s['result'][:100]}"
+        failed = "\n".join(
+            f"step {s['step']}: {s['tool']} → {s['result'][:100]}"
             for s in self._trace[-4:] if not s["success"]
-        ]
-        prompt = (
-            f"GOAL: {self._goal}\n"
-            f"FAILED STEPS:\n" + "\n".join(failed or ["(none recorded)"]) + "\n\n"
-            "Respond in this exact format:\n"
-            "DIAGNOSIS : [what is going wrong]\n"
-            "HYPOTHESIS: [why it is failing]\n"
-            "NEXT      : [one specific alternative to try]"
-        )
+        ) or "(none)"
         r = await self.llm.chat(
-            system="You are a precise agent debugger. Be specific, not generic.",
-            messages=[{"role": "user", "content": prompt}],
+            system="Precise agent debugger. Be specific.",
+            messages=[{"role": "user", "content": f"GOAL: {self._goal}\nFAILED:\n{failed}\n\nDIAGNOSIS:\nHYPOTHESIS:\nNEXT:"}],
         )
-        return r.get("content", "Try a completely different approach.")
+        return r.get("content", "Try a different approach.")
 
     async def _trim(self) -> None:
-        if len(self.history) <= TRIM_AT:
-            return
-        first, middle, recent = (
-            self.history[:1],
-            self.history[1:-KEEP_LAST],
-            self.history[-KEEP_LAST:],
-        )
-        if not middle:
-            return
-        snippet = "\n".join(
-            f"{m['role']}: {str(m.get('content', ''))[:150]}" for m in middle
-        )
+        if len(self.history) <= TRIM_AT: return
+        first, mid, tail = self.history[:1], self.history[1:-KEEP_LAST], self.history[-KEEP_LAST:]
+        if not mid: return
         try:
             r = await self.llm.chat(
-                system="Summarize what was attempted and what was learned. Two sentences max.",
-                messages=[{"role": "user", "content": snippet}],
+                system="Two sentences: what was done, what worked.",
+                messages=[{"role": "user", "content": "\n".join(
+                    f"{m['role']}: {str(m.get('content',''))[:150]}" for m in mid)}],
             )
-            self.history = (
-                first
-                + [{"role": "assistant", "content": f"[Context snoummary] {r.get('content', '')}"}]
-                + recent
-            )
+            self.history = first + [{"role": "assistant", "content": f"[Summary] {r.get('content','')}"}] + tail
         except Exception:
-            self.history = first + recent
-        logger.debug("History trimmed to %d messages.", len(self.history))
+            self.history = first + tail
 
     # ── Session ─────────────────────────────────────────────────────────────────
 
     def clear_session(self) -> None:
         self.history.clear()
-        self._cache.clear()
-        self._trace.clear()
-        self._goal = ""
+        self._reset()
         clear_history()
 
     def get_trace(self) -> list[dict]:
