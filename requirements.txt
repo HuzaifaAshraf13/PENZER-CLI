@@ -110,7 +110,6 @@ pathvalidate==3.3.1
 pgvector==0.4.2
 pillow==12.2.0
 platformdirs==4.5.0
-playwright==1.60.0
 portalocker==3.2.0
 posthog==5.4.0
 propcache==0.4.1
