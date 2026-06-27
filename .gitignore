@@ -55,3 +55,4 @@ COHERENCE_TEST_REPORT.md
 COHERENCE_TEST_SUMMARY.md
 agent_memory.json
 .penzer.json
+.penzer/

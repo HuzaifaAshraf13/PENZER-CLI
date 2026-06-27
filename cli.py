@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-PENZER-CLI: Autonomous Terminal Agent
-"""
+"""PENZER-CLI: Autonomous Terminal Agent"""
 import threading
 import asyncio
 import sys
@@ -10,14 +8,14 @@ import json
 import logging
 from rich.console import Console
 from rich.markdown import Markdown
-
 from logger import get_logger
+
 logger = get_logger("cli")
 
 for _log in [
     "agent.agent", "penzer.core", "penzer.server",
     "agent.skills.search", "agent.skills.loader",
-    "agent.skills.base", "httpx"
+    "agent.skills.base", "session.memory", "httpx",
 ]:
     logging.getLogger(_log).setLevel(logging.WARNING)
 
@@ -28,9 +26,7 @@ console = Console(force_terminal=True, width=100)
 
 
 def clean_response(text: str) -> str:
-    """Extract only the answer, never intermediate thoughts."""
     text = text.strip()
-
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -40,7 +36,6 @@ def clean_response(text: str) -> str:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Error messages with emoji — return as-is
     if text and text[0] in "⏳🔑🔐⚠️🔌⏱️🌐❌":
         return text
 
@@ -48,23 +43,17 @@ def clean_response(text: str) -> str:
     text = re.sub(r'```[\w]*\n?', '', text).strip()
 
     def strip_json_blocks(s: str) -> str:
-        result    = []
-        depth     = 0
-        in_string = False
-        escape    = False
+        result, depth, in_string, escape = [], 0, False, False
         for ch in s:
             if escape:
                 escape = False
-                if depth > 0:
-                    continue
+                if depth > 0: continue
             elif ch == '\\' and in_string:
                 escape = True
-                if depth > 0:
-                    continue
+                if depth > 0: continue
             elif ch == '"' and not escape:
                 in_string = not in_string
-                if depth > 0:
-                    continue
+                if depth > 0: continue
             elif ch == '{' and not in_string:
                 depth += 1
                 continue
@@ -121,44 +110,49 @@ async def main():
 
             if not user_input:
                 continue
-            if user_input.lower() in ["exit", "quit"]:
+
+            if user_input.lower() in ("exit", "quit"):
                 agent.clear_session()
                 console.print("[dim]Session cleared. Memory retained.[/dim]")
                 break
+
             if user_input.lower() == "help":
                 display_help()
                 continue
+
             if user_input.lower() == "clear":
                 console.clear()
                 continue
 
             console.print()
 
-            calls_before  = agent.llm.call_count
-            tokens_before = agent.llm.token_estimate
+            calls_before  = getattr(agent.llm, "call_count", 0)
+            tokens_before = getattr(agent.llm, "token_estimate", 0)
 
             with console.status("", spinner="dots") as status:
                 agent.on_status = lambda msg: status.update(f"[dim]{msg}[/dim]")
                 response = await agent.run(user_input)
 
-            calls_used  = agent.llm.call_count  - calls_before
-            tokens_used = agent.llm.token_estimate - tokens_before
+            calls_used  = getattr(agent.llm, "call_count", 0) - calls_before
+            tokens_used = getattr(agent.llm, "token_estimate", 0) - tokens_before
 
             response = clean_response(response or "No response.")
+
             console.print()
             console.print(Markdown(response))
 
-            # Show matched skills
-            if agent._last_matched_skills:
-                skill_names = " · ".join(agent._last_matched_skills)
-                console.print(f"[dim]  ⭐ {skill_names}[/dim]")
+            matched = getattr(agent, "_matched_skills", [])
+            if matched:
+                console.print(f"[dim]  ⭐ {' · '.join(matched)}[/dim]")
 
-            # Show tools used
-            if agent._trace:
-                tools_used = " · ".join(dict.fromkeys(t["tool"] for t in agent._trace))
+            trace = getattr(agent, "_trace", [])
+            if trace:
+                tools_used = " · ".join(dict.fromkeys(t["tool"] for t in trace))
                 console.print(f"[dim]  🔧 {tools_used}[/dim]")
 
-            console.print(f"[dim]  {calls_used} LLM calls · ~{tokens_used} tokens[/dim]")
+            if calls_used or tokens_used:
+                console.print(f"[dim]  {calls_used} LLM calls · ~{tokens_used} tokens[/dim]")
+
             console.print()
 
     except Exception as e:
