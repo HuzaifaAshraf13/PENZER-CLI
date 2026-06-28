@@ -123,9 +123,75 @@ class PenzerAgent:
             "last_action":    "",
             "last_outcome":   "",
         }
+        # Multi-skill orchestration
+        self._skill_plan:  list = []  # merged ordered steps from all active skills
+        self._skill_steps: dict = {}  # {skill_name: current_step_index}
+        self._skill_done:  set  = set()  # skills that completed all steps
 
     def _handle_shutdown(self, signum, frame):
         self._shutdown = True
+
+    def _orchestrate_skills(self) -> None:
+        """
+        Merge all active skills into a unified execution plan.
+        Each step is: {skill, step_num, instruction, tools_needed}
+        Dependencies respected: skills with shared tools run sequentially not parallel.
+        """
+        self._skill_plan  = []
+        self._skill_steps = {s.name: 0 for s in self._active_skills}
+        self._skill_done  = set()
+
+        for skill in self._active_skills:
+            behavior = (skill.agent_behavior or "").strip()
+            lines    = [l.strip() for l in behavior.splitlines()
+                        if l.strip() and not l.strip().startswith("#")]
+            tools    = set(skill.mcp_tools or [])
+            for idx, line in enumerate(lines):
+                self._skill_plan.append({
+                    "skill":       skill.name,
+                    "step":        idx,
+                    "instruction": line,
+                    "tools":       tools,
+                    "done":        False,
+                })
+
+        # Sort: steps that share tools come together to avoid conflicts
+        tool_order = ["memory", "planning", "browser", "terminal", "file_editor"]
+        def sort_key(step):
+            for i, t in enumerate(tool_order):
+                if t in step["tools"]:
+                    return i
+            return len(tool_order)
+        self._skill_plan.sort(key=sort_key)
+
+    def _skill_plan_summary(self) -> str:
+        """Return current skill plan progress for ReflAct injection."""
+        if not self._skill_plan:
+            return ""
+        total = len(self._skill_plan)
+        done  = sum(1 for s in self._skill_plan if s["done"])
+        pending = [s for s in self._skill_plan if not s["done"]]
+        next_steps = pending[:3]  # show next 3 pending steps
+
+        lines = [f"SKILL PLAN [{done}/{total} steps done]"]
+        for s in next_steps:
+            lines.append(f"  [{s['skill']}] step {s['step']+1}: {s['instruction'][:80]}")
+        if len(pending) > 3:
+            lines.append(f"  … {len(pending)-3} more steps")
+        return "\n".join(lines)
+
+    def _mark_skill_step_done(self, tool_name: str) -> None:
+        """After a tool runs, mark matching skill steps as done."""
+        for step in self._skill_plan:
+            if not step["done"] and tool_name in step["tools"]:
+                step["done"] = True
+                skill_name   = step["skill"]
+                self._skill_steps[skill_name] = step["step"] + 1
+                # Check if this skill is fully done
+                skill_steps = [s for s in self._skill_plan if s["skill"] == skill_name]
+                if all(s["done"] for s in skill_steps):
+                    self._skill_done.add(skill_name)
+                break  # one tool call marks one step
 
     async def async_init(self) -> "PenzerAgent":
         try:
@@ -162,6 +228,10 @@ class PenzerAgent:
         self._matched_skills      = [s.name for s in self._active_skills]
         self._last_matched_skills = self._matched_skills
         self._novel_task          = not bool(self._matched_skills)
+
+        # Build merged execution plan from all matched skills
+        if self._active_skills:
+            self._orchestrate_skills()
 
         skills_hint = (
             f"SKILLS MATCHED: {', '.join(self._matched_skills)}\n"
@@ -456,6 +526,8 @@ class PenzerAgent:
                     update_skill_metric(skill.name, ok)
 
                 self._update_belief(name, c.get("arguments", {}), str(raw), ok)
+                if ok and self._skill_plan:
+                    self._mark_skill_step_done(name)
 
                 self.history.append({
                     "role": "tool",
@@ -529,15 +601,17 @@ class PenzerAgent:
                 f"CURRENT: {self._current_subtask}\n"
             )
 
-        status = "✓ ok" if t["success"] else f"✗ {t['error_type']}"
+        status     = "✓ ok" if t["success"] else f"✗ {t['error_type']}"
+        skill_plan = self._skill_plan_summary()
         inj = (
             f"[ReflAct {step}] GOAL: {self._goal}\n"
             f"{subtask_line}"
             f"{skills_line}"
+            f"{skill_plan}\n" if skill_plan else ""
             f"{self._belief_summary()}\n"
             f"LAST: {t['tool']} → {status} ({t['elapsed_sec']}s) | {t['result'][:120]}\n"
             f"RECENT: {recent}\n\n"
-            "Given belief state and goal — what is the next action?"
+            "Follow the SKILL PLAN above. Next pending step — execute it."
         )
         return self.history + [{"role": "user", "content": inj}]
 

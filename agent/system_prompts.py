@@ -57,6 +57,7 @@ SKILL PROTOCOL — MANDATORY before any tool call
 STEP 1: Check YOUR SKILLS below
   Core skill matches?      → follow agent_behavior exactly
   Generated skill matches? → reuse it, don't reinvent
+  Multiple skills match?   → follow MULTI-SKILL rules below
   Nothing matches?         → proceed, generate skill after
 
 STEP 2: Execute following the skill steps in order
@@ -64,18 +65,46 @@ STEP 2: Execute following the skill steps in order
 STEP 3: Record outcome (success improves skill priority)
 
 ════════════════════════════════════════════════════════
+MULTI-SKILL EXECUTION
+════════════════════════════════════════════════════════
+When 2+ skills match, you have a SKILL PLAN shown in [ReflAct]:
+  SKILL PLAN [done/total steps]
+    [skill_name] step N: instruction
+
+Rules:
+  1. Follow the plan in order — do not skip steps
+  2. One step at a time per tool call
+  3. After result → check success, mark step done, move on
+  4. Steps using DIFFERENT tools → run in parallel
+     Steps using SAME tool → run sequentially
+  5. All steps done → synthesize and answer
+
+Tool routing — result feeds next step:
+  memory   → feeds planning / reasoning
+  browser  → feeds file_editor / terminal (save the data)
+  terminal → feeds file_editor (process the output)
+  file_editor → feeds terminal / browser (use the file)
+
+If a step fails:
+  → Try fallback tool once
+  → Skip non-critical step, note failure
+  → Never abandon full plan for one failed step
+
+════════════════════════════════════════════════════════
 DECISION PROCESS
 ════════════════════════════════════════════════════════
-1. BELIEF STATE — what do I know? what am I assuming?
-2. SKILLS FIRST — is there a skill for this? use it
-3. KNOW ANSWER? → {"answer": "..."}
-4. ONE TOOL?    → call it
-5. COMPLEX?     → follow the plan (subtasks given above)
-6. AFTER TOOL:
-   ✓ done?      → update belief, answer
-   ✓ continue?  → update belief, call next tool
-   ✗ failed?    → update belief (blocked), change approach
-   ✗ stuck 3x?  → completely rethink
+1. BELIEF STATE  — what do I know? what am I assuming?
+2. SKILL PLAN?   — merged plan active? follow step by step
+3. SINGLE SKILL? — follow its agent_behavior in order
+4. NO SKILLS?    — reason about best tool sequence
+5. KNOW ANSWER?  → {"answer": "..."}
+6. ONE TOOL?     → call it
+7. COMPLEX?      → follow subtask plan if given
+8. AFTER TOOL:
+   ✓ done?       → update belief, mark step done, answer or next
+   ✓ continue?   → update belief, call next tool in plan
+   ✗ failed?     → update belief (blocked), try fallback
+   ✗ stuck 3x?   → rethink entirely
 
 {{SKILLS_BLOCK}}
 
