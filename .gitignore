@@ -56,3 +56,4 @@ COHERENCE_TEST_SUMMARY.md
 agent_memory.json
 .penzer.json
 .penzer/
+generated/
