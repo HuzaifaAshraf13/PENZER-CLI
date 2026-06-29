@@ -1,16 +1,26 @@
 """
 PENZER — Research-Grade Agent
 
+Research sources:
+  ReflAct    (Kim 2025)       — belief-state injection, 27.7% improvement
+  ExpeL      (Zhao AAAI 2024) — insight extraction, trajectory recall
+  Reflexion  (Shinn 2023)     — verbal post-mortem, no gradient updates
+  HyMem      (Zhao 2026)      — dual-tier retrieval, 92.6% cost reduction
+  MemoryBank (Zhong 2024)     — Ebbinghaus decay, memory reinforcement
+  Active CC  (Arxiv 2601)     — proactive context compression
+
 Implements:
-  1. Belief State        — updated after every tool call (ReflAct paper)
-  2. Episodic + Semantic — structured memory with scored retrieval
-  3. Reflexion           — post-task verbal post-mortem (Shinn 2023)
-  4. Planner/Executor    — Planner decomposes, Executor drives subtasks
-  5. Trajectory Skills   — built from full winning tool trace
-  6. Multi-skill         — ALL matched skills active, metrics tracked for each
-  7. Parallel tools      — multiple tool calls run concurrently
+  1. Belief state           — updated every tool call (ReflAct)
+  2. Dual-tier memory       — fast for simple, deep for complex (HyMem)
+  3. Reflexion + ExpeL      — post-task post-mortem + insight extraction
+  4. Planner/Executor       — decompose then drive subtasks
+  5. Multi-skill plan       — merged ordered plan across ALL matched skills
+  6. Skill-aware metrics    — only update skill if its tools were used
+  7. Parallel tool exec     — asyncio.gather across concurrent calls
+  8. Rate-limit retry       — exponential backoff + jitter
+  9. Proactive compression  — trim before hitting context limit
 """
-import json, logging, inspect, asyncio, signal, time, psutil
+import json, logging, inspect, asyncio, signal, time, psutil, random
 from typing import Any, Callable
 from datetime import datetime
 from collections import defaultdict
@@ -21,7 +31,8 @@ from session.memory import (
     load_history, save_history, clear_history,
     remember_episodic, remember_semantic,
     store_post_mortem, get_post_mortems,
-    get_relevant_memories,
+    get_relevant_memories, get_insights, store_insight,
+    get_similar_trajectories, score_complexity,
     update_skill_metric, add_checkpoint,
     get_storage_summary,
 )
@@ -31,14 +42,18 @@ from agent.skills import load_all_skills, search_generated_skills, build_context
 logger = logging.getLogger(__name__)
 
 MAX_ITER          = 15
-TRIM_AT           = 35
-KEEP_LAST         = 10
+TRIM_AT           = 30
+KEEP_LAST         = 8
 STUCK_MIN         = 2
 MAX_FAILURES      = 3
 TOOL_TIMEOUT      = 30
 CHECKPOINT_EVERY  = 10
 MEMORY_CRITICAL   = 85
 COMPLEX_THRESHOLD = 3
+
+RATE_LIMIT_BASE   = 5.0
+RATE_LIMIT_MAX    = 60.0
+RATE_LIMIT_JITTER = 2.0
 
 TOOL_LABELS = {
     "browser": "🌐", "terminal": "⚡", "run_python": "🐍",
@@ -47,10 +62,6 @@ TOOL_LABELS = {
 FALLBACKS = {
     "terminal": "run_bash", "run_bash": "run_python",
     "run_python": "terminal", "file_editor": "terminal",
-}
-SKILL_GATED_TOOLS = {
-    "planning", "memory", "file_editor", "browser",
-    "terminal", "run_bash", "run_python",
 }
 
 
@@ -92,9 +103,10 @@ class PenzerAgent:
         data = load_all_skills()
         self.core_skills, self.gen_skills = data["core"], data["generated"]
 
-        self._monitor  = ResourceMonitor()
-        self._shutdown = False
-        self._backoff  = 1.0
+        self._monitor       = ResourceMonitor()
+        self._shutdown      = False
+        self._backoff       = 1.0
+        self._rate_attempts = 0
 
         signal.signal(signal.SIGINT, self._handle_shutdown)
 
@@ -104,17 +116,32 @@ class PenzerAgent:
         self._failures:            int   = 0
         self._goal:                str   = ""
         self._skills_dirty:        bool  = False
-        self._matched_skills:      list  = []   # ALL matched skill names
-        self._last_matched_skills: list  = []   # alias for cli.py
-        self._active_skills:       list  = []   # ALL active skill objects
+        self._matched_skills:      list  = []
+        self._last_matched_skills: list  = []
+        self._active_skills:       list  = []
         self._system_prompt:       str   = ""
         self._consec_errors:       dict  = defaultdict(int)
         self._iteration:           int   = 0
         self._novel_task:          bool  = False
-        self._skill_gate_shown:    bool  = False
+        self._is_complex_task:     bool  = False
+        self._task_insights:       list  = []
+
+        # Skill flags — kept separate so they don't block each other
+        self._skill_gate_shown:    bool  = False  # "no skills" gate shown
+        self._meta_skill_triggered:bool  = False  # meta-skill reminder injected
+
+        # Skill plan (multi-skill orchestration)
+        self._skill_plan:          list  = []
+        self._skill_steps:         dict  = {}
+        self._skill_done:          set   = set()
+
+        # Subtask tracking
         self._subtasks:            list  = []
         self._subtask_idx:         int   = 0
+        self._total_subtasks:      int   = 0   # stored at plan time, never changes
         self._current_subtask:     str   = ""
+
+        # Belief state (ReflAct)
         self._belief: dict = {
             "goal_progress":  "not_started",
             "verified_facts": [],
@@ -123,75 +150,9 @@ class PenzerAgent:
             "last_action":    "",
             "last_outcome":   "",
         }
-        # Multi-skill orchestration
-        self._skill_plan:  list = []  # merged ordered steps from all active skills
-        self._skill_steps: dict = {}  # {skill_name: current_step_index}
-        self._skill_done:  set  = set()  # skills that completed all steps
 
     def _handle_shutdown(self, signum, frame):
         self._shutdown = True
-
-    def _orchestrate_skills(self) -> None:
-        """
-        Merge all active skills into a unified execution plan.
-        Each step is: {skill, step_num, instruction, tools_needed}
-        Dependencies respected: skills with shared tools run sequentially not parallel.
-        """
-        self._skill_plan  = []
-        self._skill_steps = {s.name: 0 for s in self._active_skills}
-        self._skill_done  = set()
-
-        for skill in self._active_skills:
-            behavior = (skill.agent_behavior or "").strip()
-            lines    = [l.strip() for l in behavior.splitlines()
-                        if l.strip() and not l.strip().startswith("#")]
-            tools    = set(skill.mcp_tools or [])
-            for idx, line in enumerate(lines):
-                self._skill_plan.append({
-                    "skill":       skill.name,
-                    "step":        idx,
-                    "instruction": line,
-                    "tools":       tools,
-                    "done":        False,
-                })
-
-        # Sort: steps that share tools come together to avoid conflicts
-        tool_order = ["memory", "planning", "browser", "terminal", "file_editor"]
-        def sort_key(step):
-            for i, t in enumerate(tool_order):
-                if t in step["tools"]:
-                    return i
-            return len(tool_order)
-        self._skill_plan.sort(key=sort_key)
-
-    def _skill_plan_summary(self) -> str:
-        """Return current skill plan progress for ReflAct injection."""
-        if not self._skill_plan:
-            return ""
-        total = len(self._skill_plan)
-        done  = sum(1 for s in self._skill_plan if s["done"])
-        pending = [s for s in self._skill_plan if not s["done"]]
-        next_steps = pending[:3]  # show next 3 pending steps
-
-        lines = [f"SKILL PLAN [{done}/{total} steps done]"]
-        for s in next_steps:
-            lines.append(f"  [{s['skill']}] step {s['step']+1}: {s['instruction'][:80]}")
-        if len(pending) > 3:
-            lines.append(f"  … {len(pending)-3} more steps")
-        return "\n".join(lines)
-
-    def _mark_skill_step_done(self, tool_name: str) -> None:
-        """After a tool runs, mark matching skill steps as done."""
-        for step in self._skill_plan:
-            if not step["done"] and tool_name in step["tools"]:
-                step["done"] = True
-                skill_name   = step["skill"]
-                self._skill_steps[skill_name] = step["step"] + 1
-                # Check if this skill is fully done
-                skill_steps = [s for s in self._skill_plan if s["skill"] == skill_name]
-                if all(s["done"] for s in skill_steps):
-                    self._skill_done.add(skill_name)
-                break  # one tool call marks one step
 
     async def async_init(self) -> "PenzerAgent":
         try:
@@ -211,58 +172,73 @@ class PenzerAgent:
         self._goal = user_input
         self.history.append({"role": "user", "content": user_input})
 
-        past_memory  = get_relevant_memories(user_input, n=5)
+        # Dual-tier memory (HyMem) — fast for simple, deep for complex
+        self._is_complex_task = await self._is_complex(user_input)
+        past_memory  = get_relevant_memories(user_input, n=5, deep=self._is_complex_task)
         past_mortems = get_post_mortems(user_input, n=2)
+
+        # ExpeL: recall cross-task insights AND similar past trajectories
+        self._task_insights     = get_insights(user_input, n=3)
+        self._past_trajectories = get_similar_trajectories(user_input, n=2)
 
         matched_gen = search_generated_skills(
             user_input, self.gen_skills,
             context=build_context_from_history(self.history),
         )
-
-        # Collect ALL matched skills — not just first one
-        matched_core_skills = [
+        matched_core = [
             s for s in self.core_skills
             if any(k.lower() in user_input.lower() for k in s.keywords)
         ]
-        self._active_skills       = matched_core_skills + list(matched_gen)
+        self._active_skills       = matched_core + list(matched_gen)
         self._matched_skills      = [s.name for s in self._active_skills]
         self._last_matched_skills = self._matched_skills
         self._novel_task          = not bool(self._matched_skills)
 
-        # Build merged execution plan from all matched skills
+        # Build merged skill plan across ALL matched skills
         if self._active_skills:
             self._orchestrate_skills()
 
         skills_hint = (
             f"SKILLS MATCHED: {', '.join(self._matched_skills)}\n"
-            "All matched skills are active. Follow their combined agent_behavior steps.\n"
+            "All matched skills active — follow their merged SKILL PLAN.\n"
         ) if self._matched_skills else (
             "NO SKILLS MATCHED — proceed carefully. "
-            "Generate a skill after if task needed 3+ tool calls.\n"
+            "Generate skill after if 3+ tool calls used.\n"
         )
+
+        insight_hint = ""
+        if self._task_insights:
+            insight_hint = "\n## Recalled Insights\n" + "".join(
+                f"- {i['insight']}\n" for i in self._task_insights
+            )
+        if self._past_trajectories:
+            insight_hint += "\n## Similar Past Runs\n" + "".join(
+                f"- {t['event']} → {t['outcome']}\n"
+                for t in self._past_trajectories
+            )
 
         mortem_hint = ""
         if past_mortems:
-            mortem_hint = "\n## Past Experience on Similar Tasks\n"
-            for pm in past_mortems:
-                mortem_hint += (
-                    f"  [{pm['task_type']}]\n"
-                    f"  Worked: {pm['what_worked']}\n"
-                    f"  Failed: {pm['what_failed']}\n"
-                    f"  Next time: {pm['next_time']}\n"
-                )
+            mortem_hint = "\n## Past Experience\n" + "".join(
+                f"  [{pm['task_type']}] "
+                f"Worked: {pm['what_worked']} | "
+                f"Failed: {pm['what_failed']} | "
+                f"Next: {pm['next_time']}\n"
+                for pm in past_mortems
+            )
 
         self._system_prompt = build_system_prompt(
             core_skills=self.core_skills,
             generated_skills=matched_gen,
             memory_context=past_memory,
-            extra=skills_hint + mortem_hint,
+            extra=skills_hint + insight_hint + mortem_hint,
             goal=user_input,
         )
 
-        # Planner — decompose complex tasks into subtasks
-        if await self._is_complex(user_input):
-            self._subtasks = await self._plan_task(user_input)
+        # Planner for complex tasks
+        if self._is_complex_task:
+            self._subtasks       = await self._plan_task(user_input)
+            self._total_subtasks = len(self._subtasks)
 
         result = await self._loop()
 
@@ -270,7 +246,7 @@ class PenzerAgent:
             data = load_all_skills()
             self.core_skills, self.gen_skills = data["core"], data["generated"]
 
-        # Episodic memory — always store if tools were used
+        # Episodic memory — store if tools were used
         if self._trace:
             tool_seq = " → ".join(t["tool"] for t in self._trace)
             outcome  = "success" if any(t["success"] for t in self._trace) else "failure"
@@ -281,22 +257,92 @@ class PenzerAgent:
                 task_type=user_input[:40],
             )
 
-        # Reflexion — post-mortem for complex tasks
+        # Reflexion: evaluate completion, then write post-mortem + insights
         if len(self._trace) >= COMPLEX_THRESHOLD:
-            await self._write_post_mortem(user_input, result)
+            completed, eval_reason = await self._evaluate_completion(user_input, result)
+            if not completed:
+                logger.info("Evaluator: task incomplete — %s", eval_reason)
+                # Store as failure so future runs know to try harder
+                result = f"{result} [Note: evaluator flagged as incomplete: {eval_reason}]"
+            await self._write_post_mortem_and_insights(user_input, result)
 
         save_history(self.history)
         return result
 
-    # ── Planner ──────────────────────────────────────────────────────────────────
+    # ── Skill Orchestration ──────────────────────────────────────────────────────
+
+    def _orchestrate_skills(self) -> None:
+        """Merge all matched skills into one ordered execution plan."""
+        self._skill_plan  = []
+        self._skill_steps = {s.name: 0 for s in self._active_skills}
+        self._skill_done  = set()
+
+        for skill in self._active_skills:
+            behavior = (skill.agent_behavior or "").strip()
+            lines    = [
+                l.strip() for l in behavior.splitlines()
+                if l.strip() and not l.strip().startswith("#")
+            ]
+            tools = set(skill.mcp_tools or [])
+            for idx, line in enumerate(lines):
+                self._skill_plan.append({
+                    "skill":       skill.name,
+                    "step":        idx,
+                    "instruction": line,
+                    "tools":       tools,   # empty set = matches any tool
+                    "done":        False,
+                })
+
+        # Sort: memory/planning first, browser second, terminal third, file_editor last
+        tool_order = ["memory", "planning", "browser", "terminal", "file_editor"]
+        self._skill_plan.sort(key=lambda s: next(
+            (i for i, t in enumerate(tool_order) if t in s["tools"]),
+            len(tool_order)  # no tools = end of list
+        ))
+
+    def _skill_plan_summary(self) -> str:
+        if not self._skill_plan:
+            return ""
+        total   = len(self._skill_plan)
+        done    = sum(1 for s in self._skill_plan if s["done"])
+        pending = [s for s in self._skill_plan if not s["done"]][:3]
+        lines   = [f"SKILL PLAN [{done}/{total} steps]"]
+        for s in pending:
+            lines.append(f"  [{s['skill']}] step {s['step']+1}: {s['instruction'][:80]}")
+        return "\n".join(lines)
+
+    def _mark_skill_step_done(self, tool_name: str) -> None:
+        """
+        Mark the first pending step whose tools include tool_name as done.
+        If a step has no tools defined, match it to any tool call.
+        """
+        for step in self._skill_plan:
+            if step["done"]:
+                continue
+            # Match if tool in step's tools, OR step has no tools defined
+            if not step["tools"] or tool_name in step["tools"]:
+                step["done"]  = True
+                skill_name    = step["skill"]
+                self._skill_steps[skill_name] = step["step"] + 1
+                skill_steps   = [s for s in self._skill_plan if s["skill"] == skill_name]
+                if all(s["done"] for s in skill_steps):
+                    self._skill_done.add(skill_name)
+                break
+
+    def _skills_for_tool(self, tool_name: str) -> list:
+        """Return active skills whose mcp_tools include this tool (or have no tools)."""
+        matched = []
+        for skill in self._active_skills:
+            tools = set(skill.mcp_tools or [])
+            if not tools or tool_name in tools:
+                matched.append(skill)
+        return matched
+
+    # ── Planner/Executor ─────────────────────────────────────────────────────────
 
     async def _is_complex(self, goal: str) -> bool:
-        signals = [
-            "build", "create", "setup", "install", "configure", "deploy",
-            "write", "analyze", "research", "find and", "compare", "generate",
-            "step", "multiple", "then", "after", "first", "finally",
-        ]
-        return any(s in goal.lower() for s in signals)
+        """Use numerical complexity score (HyMem) instead of keyword heuristic."""
+        return score_complexity(goal) >= 0.4
 
     async def _plan_task(self, goal: str) -> list[str]:
         self.on_status("Planning…")
@@ -304,45 +350,30 @@ class PenzerAgent:
             r = await asyncio.wait_for(
                 self.llm.chat(
                     system=(
-                        "You are a task planner. Break the goal into 3-6 concrete subtasks. "
-                        "Return ONLY a JSON array of strings. No markdown. No explanation.\n"
-                        'Example: ["Check system info", "Find open ports", "Save report"]'
+                        "Task planner. Break goal into 3-6 concrete subtasks. "
+                        "Return ONLY a JSON array of strings. No markdown.\n"
+                        'Example: ["Check network info", "Scan ports", "Save results"]'
                     ),
                     messages=[{"role": "user", "content": f"Goal: {goal}"}],
                 ),
                 timeout=15,
             )
-            text     = r.get("content", "[]").strip()
-            subtasks = json.loads(text)
+            subtasks = json.loads(r.get("content", "[]").strip())
             if isinstance(subtasks, list) and subtasks:
-                logger.debug("Plan created: %s", subtasks)
                 return subtasks
         except Exception as e:
-            logger.debug("Planner failed: %s", e)
+            logger.debug("Planner: %s", e)
         return []
-
-    # ── Executor — drives subtasks one by one ────────────────────────────────────
-
-    async def _executor_next_subtask(self) -> str:
-        if self._subtask_idx >= len(self._subtasks):
-            return ""
-        subtask = self._subtasks[self._subtask_idx]
-        self._current_subtask = subtask
-        self._subtask_idx    += 1
-        return subtask
-
-    def _all_subtasks_done(self) -> bool:
-        return bool(self._subtasks) and self._subtask_idx >= len(self._subtasks)
 
     # ── Belief State ─────────────────────────────────────────────────────────────
 
     def _update_belief(self, tool: str, args: dict, result: str, ok: bool) -> None:
         self._belief["last_action"]  = f"{tool}({self._fmt_action(tool, args)})"
-        self._belief["last_outcome"] = "ok" if ok else f"failed: {result[:80]}"
+        self._belief["last_outcome"] = "ok" if ok else f"failed: {result[:60]}"
         if self._belief["goal_progress"] == "not_started":
             self._belief["goal_progress"] = "in_progress"
         if ok:
-            fact = f"{tool}: {result[:100]}"
+            fact = f"{tool}: {result[:80]}"
             if fact not in self._belief["verified_facts"]:
                 self._belief["verified_facts"].append(fact)
                 self._belief["verified_facts"] = self._belief["verified_facts"][-5:]
@@ -350,7 +381,7 @@ class PenzerAgent:
             self._belief["goal_progress"] = "blocked"
 
     def _belief_summary(self) -> str:
-        b = self._belief
+        b     = self._belief
         lines = [f"BELIEF: {b['goal_progress'].upper()}"]
         if b["verified_facts"]:
             lines.append(f"  Know: {' | '.join(b['verified_facts'][-2:])}")
@@ -358,9 +389,36 @@ class PenzerAgent:
             lines.append(f"  Last: {b['last_action']} → {b['last_outcome']}")
         return "\n".join(lines)
 
-    # ── Reflexion ────────────────────────────────────────────────────────────────
+    # ── Task Completion Evaluator (Reflexion) ───────────────────────────────────
 
-    async def _write_post_mortem(self, goal: str, result: str) -> None:
+    async def _evaluate_completion(self, goal: str, result: str) -> tuple[bool, str]:
+        """
+        Reflexion's evaluator: did we actually solve the goal?
+        Returns (completed: bool, reason: str)
+        """
+        try:
+            r = await asyncio.wait_for(
+                self.llm.chat(
+                    system=(
+                        "Evaluate if the goal was achieved. "
+                        "Return JSON: {\"completed\": true/false, \"reason\": \"one sentence\"}. "
+                        "Be strict — partial results count as not completed."
+                    ),
+                    messages=[{"role": "user", "content":
+                        f"GOAL: {goal}\nRESULT: {result[:200]}\n"
+                        f"TOOLS USED: {' → '.join(t['tool'] for t in self._trace)}"
+                    }],
+                ),
+                timeout=10,
+            )
+            ev = json.loads(r.get("content", "{}").strip())
+            return bool(ev.get("completed", True)), ev.get("reason", "")
+        except Exception:
+            return True, ""  # default: assume completed if evaluator fails
+
+    # ── Reflexion + ExpeL ────────────────────────────────────────────────────────
+
+    async def _write_post_mortem_and_insights(self, goal: str, result: str) -> None:
         worked = " → ".join(
             f"{t['tool']}({self._fmt_action(t['tool'], t['args'])})"
             for t in self._trace if t["success"]
@@ -374,8 +432,9 @@ class PenzerAgent:
             r = await asyncio.wait_for(
                 self.llm.chat(
                     system=(
-                        "Write a brief post-mortem. Return JSON with keys: "
-                        "what_worked, what_failed, next_time. "
+                        "Write a post-mortem AND extract a reusable insight. "
+                        "Return JSON with keys: what_worked, what_failed, next_time, insight. "
+                        "insight = one general rule for future similar tasks. "
                         "One sentence each. No markdown."
                     ),
                     messages=[{"role": "user", "content":
@@ -392,13 +451,19 @@ class PenzerAgent:
                 what_failed=pm.get("what_failed", failed),
                 next_time=pm.get("next_time", ""),
             )
+            if pm.get("insight"):
+                store_insight(
+                    insight=pm["insight"],
+                    source_tasks=[goal[:40]],
+                    confidence=0.7 if any(t["success"] for t in self._trace) else 0.4,
+                )
             if any(t["success"] for t in self._trace):
                 remember_semantic(
-                    pattern=f"For '{goal[:40]}': use {worked}",
+                    pattern=f"For '{goal[:40]}': {worked}",
                     confidence=0.7,
                 )
         except Exception as e:
-            logger.debug("Post-mortem failed: %s", e)
+            logger.debug("Post-mortem: %s", e)
 
     # ── Main Loop ────────────────────────────────────────────────────────────────
 
@@ -418,19 +483,19 @@ class PenzerAgent:
                 return f"Resource limit: {msg}"
 
             asyncio.ensure_future(self._trim())
+            self.on_status("Thinking…" if i == 0 else f"Step {i+1}…")
 
-            # Executor: inject next subtask into context when previous done
-            if self._subtasks and not self._all_subtasks_done():
-                next_sub = await self._executor_next_subtask()
-                if next_sub:
-                    self.on_status(f"Subtask {self._subtask_idx}/{len(self._subtasks)}…")
-                    self.history.append({"role": "user",
-                        "content": f"[Executor] Next subtask: {next_sub}"})
-            elif self._all_subtasks_done() and i > 0:
+            # Executor: inject next subtask
+            if self._subtasks and self._subtask_idx < len(self._subtasks):
+                subtask = self._subtasks[self._subtask_idx]
+                self._current_subtask = subtask
+                self._subtask_idx    += 1
+                self.history.append({"role": "user", "content":
+                    f"[Executor] Subtask {self._subtask_idx}/{self._total_subtasks}: {subtask}"})
+            elif self._subtasks and self._subtask_idx >= len(self._subtasks):
                 self.history.append({"role": "user",
                     "content": "[Executor] All subtasks complete. Give final answer."})
-
-            self.on_status("Thinking…" if i == 0 else f"Step {i+1}…")
+                self._subtasks = []
 
             if (i + 1) % 5 == 0:
                 matched_gen = search_generated_skills(
@@ -440,27 +505,18 @@ class PenzerAgent:
                 self._system_prompt = build_system_prompt(
                     core_skills=self.core_skills,
                     generated_skills=matched_gen,
-                    memory_context=get_relevant_memories(self._goal, n=3),
+                    memory_context=get_relevant_memories(
+                        self._goal, n=3, deep=self._is_complex_task
+                    ),
                     goal=self._goal,
                 )
 
             if (i + 1) % CHECKPOINT_EVERY == 0:
                 await self._checkpoint(i)
 
-            try:
-                r = await asyncio.wait_for(
-                    self.llm.chat(system=self._system_prompt, messages=self._msgs(i)),
-                    timeout=30 * self._backoff,
-                )
-                self._backoff = max(1.0, self._backoff * 0.9)
-            except asyncio.TimeoutError:
-                self._backoff = min(3.0, self._backoff * 1.5)
-                self.history.append({"role": "user",
-                    "content": "Timeout. Continue or give final answer."})
-                continue
-            except Exception as e:
-                logger.error("LLM error: %s", e)
-                return f"LLM error: {e}"
+            r = await self._llm_with_retry(i)
+            if r is None:
+                return "Rate limit exceeded. Try again in a moment."
 
             calls = r.get("tool_calls") or []
             text  = r.get("content", "").strip()
@@ -487,24 +543,20 @@ class PenzerAgent:
             if len(self._trace) >= STUCK_MIN and self._stuck():
                 self._failures += 1
                 if self._failures >= MAX_FAILURES:
-                    return f"Stuck after {MAX_FAILURES} attempts"
+                    return "Stuck after max attempts"
                 self.history.append({"role": "user",
                     "content": f"[Recovery] {await self._reflect()}"})
                 continue
 
-            # Skill gate — shown once, lists ALL matched skills
-            unknown = [c["name"] for c in calls
-                       if c["name"] in SKILL_GATED_TOOLS and c["name"] in self.tools]
-            if unknown and not self._matched_skills and not self._skill_gate_shown:
+            # Skill gate — shown once when no skills matched
+            if not self._matched_skills and not self._skill_gate_shown:
                 self._skill_gate_shown = True
-                self.history.append({"role": "user", "content":
-                    f"[Skill gate] No skills matched. Proceeding with: {', '.join(unknown)}. "
-                    "Check YOUR SKILLS first."})
+                self.history.append({"role": "user",
+                    "content": "[Skill gate] No skills matched. Check YOUR SKILLS first."})
 
             # Parallel tool execution
             results = await self._run_parallel(calls)
 
-            # Process results
             for c, (raw, elapsed) in zip(calls, results):
                 name  = c["name"]
                 ok    = not self._is_error(raw)
@@ -521,20 +573,19 @@ class PenzerAgent:
                 if ok: self._consec_errors[name] = 0
                 else:  self._consec_errors[name] += 1
 
-                # Track metrics for ALL matched skills
-                for skill in self._active_skills:
+                # Only update metrics for skills whose tools match this tool call
+                for skill in self._skills_for_tool(name):
                     update_skill_metric(skill.name, ok)
 
                 self._update_belief(name, c.get("arguments", {}), str(raw), ok)
+
                 if ok and self._skill_plan:
                     self._mark_skill_step_done(name)
 
                 self.history.append({
                     "role": "tool",
                     "tool_call_id": c.get("id", name),
-                    "content": self._fmt_tool_output(
-                        name, c.get("arguments", {}), raw, ok, elapsed
-                    ),
+                    "content": self._fmt_tool_output(name, c.get("arguments", {}), raw, ok, elapsed),
                 })
 
                 if name == "file_editor":
@@ -542,17 +593,48 @@ class PenzerAgent:
                     if "skills/generated" in fp and fp.endswith(".skill.md"):
                         self._skills_dirty = True
 
-            # Trigger skill generation for novel complex tasks
+            # Meta-skill: novel + complex + not yet triggered (separate from gate flag)
             if (
                 self._novel_task
                 and len(self._trace) >= COMPLEX_THRESHOLD
                 and any(t["success"] for t in self._trace)
-                and not self._skill_gate_shown
+                and not self._meta_skill_triggered
             ):
-                self._skill_gate_shown = True
+                self._meta_skill_triggered = True
                 self._inject_meta_skill_reminder()
 
         return "Iteration limit reached"
+
+    # ── Rate-limit retry ─────────────────────────────────────────────────────────
+
+    async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
+        delay = RATE_LIMIT_BASE
+        for attempt in range(max_attempts):
+            try:
+                r = await asyncio.wait_for(
+                    self.llm.chat(system=self._system_prompt, messages=self._msgs(step)),
+                    timeout=45,
+                )
+                self._backoff       = max(1.0, self._backoff * 0.9)
+                self._rate_attempts = 0
+                return r
+            except asyncio.TimeoutError:
+                self._backoff = min(3.0, self._backoff * 1.5)
+                self.history.append({"role": "user",
+                    "content": "Timeout. Continue or give final answer."})
+                return None
+            except Exception as e:
+                err = str(e).lower()
+                if any(x in err for x in ("rate", "429", "quota", "limit")):
+                    self._rate_attempts += 1
+                    jitter = random.uniform(0, RATE_LIMIT_JITTER)
+                    wait   = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + jitter)
+                    self.on_status(f"Rate limit — waiting {wait:.0f}s…")
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error("LLM error: %s", e)
+                return None
+        return None
 
     # ── Parallel Tool Execution ──────────────────────────────────────────────────
 
@@ -565,9 +647,7 @@ class PenzerAgent:
                 return f"Unknown tool '{name}'.", 0.0
             self.on_status(f"{TOOL_LABELS.get(name, name)} {self._fmt_action(name, args)}")
             try:
-                raw = await asyncio.wait_for(
-                    self._run(name, args), timeout=TOOL_TIMEOUT
-                )
+                raw = await asyncio.wait_for(self._run(name, args), timeout=TOOL_TIMEOUT)
             except asyncio.TimeoutError:
                 raw = f"Timeout after {TOOL_TIMEOUT}s"
             return raw, round(time.time() - start, 2)
@@ -580,57 +660,46 @@ class PenzerAgent:
         if step == 0 or not self._trace:
             return self.history
 
-        t      = self._trace[-1]
-        recent = " → ".join(
+        t       = self._trace[-1]
+        recent  = " → ".join(
             f"{s['tool']}({'✓' if s['success'] else '✗'})"
             for s in self._trace[-5:]
         )
+        skills_line  = f"ACTIVE SKILLS: {', '.join(self._matched_skills)}\n" if self._matched_skills else ""
+        plan_line    = self._skill_plan_summary()
+        subtask_line = (
+            f"SUBTASK [{self._subtask_idx}/{self._total_subtasks}]: {self._current_subtask}\n"
+        ) if self._current_subtask and self._total_subtasks else ""
+        status = "✓ ok" if t["success"] else f"✗ {t['error_type']}"
 
-        # All active skills shown
-        skills_line = ""
-        if self._matched_skills:
-            skills_line = f"ACTIVE SKILLS: {', '.join(self._matched_skills)}\n"
-
-        # Subtask progress
-        subtask_line = ""
-        if self._subtasks:
-            done = self._subtask_idx
-            total = len(self._subtasks)
-            subtask_line = (
-                f"PLAN [{done}/{total}]: {self._subtasks}\n"
-                f"CURRENT: {self._current_subtask}\n"
-            )
-
-        status     = "✓ ok" if t["success"] else f"✗ {t['error_type']}"
-        skill_plan = self._skill_plan_summary()
         inj = (
             f"[ReflAct {step}] GOAL: {self._goal}\n"
             f"{subtask_line}"
             f"{skills_line}"
-            f"{skill_plan}\n" if skill_plan else ""
+            f"{plan_line + chr(10) if plan_line else ''}"
             f"{self._belief_summary()}\n"
             f"LAST: {t['tool']} → {status} ({t['elapsed_sec']}s) | {t['result'][:120]}\n"
             f"RECENT: {recent}\n\n"
-            "Follow the SKILL PLAN above. Next pending step — execute it."
+            "Given belief state and skill plan — execute the next pending step."
         )
         return self.history + [{"role": "user", "content": inj}]
 
     # ── Meta-skill injection ─────────────────────────────────────────────────────
 
     def _inject_meta_skill_reminder(self):
-        winning_seq = " → ".join(
+        winning = " → ".join(
             f"{t['tool']}({self._fmt_action(t['tool'], t['args'])})"
             for t in self._trace if t["success"]
         )
         self.history.append({"role": "user", "content": (
             "[Skill evolution] Complex novel task solved. "
-            f"Winning sequence: {winning_seq}\n"
+            f"Winning sequence: {winning}\n"
             "Before final answer:\n"
             "1. List agent/skills/generated/ — similar skill exists?\n"
-            "2. If not: write .skill.md with this exact sequence + failure_modes.\n"
-            "3. Include: name, description, keywords, agent_behavior (exact steps), "
+            "2. If not: write .skill.md with exact sequence + failure_modes.\n"
+            "3. Include: name, description, keywords, agent_behavior, "
             "failure_modes, mcp_tools.\n"
-            "Then answer."
+            "Then give your final answer."
         )})
 
     # ── Tool execution ───────────────────────────────────────────────────────────
@@ -662,8 +731,7 @@ class PenzerAgent:
                     fb = FALLBACKS.get(name)
                     if fb and fb in self.tools:
                         self.on_status(f"Fallback → {fb}…")
-                        cmd = (args.get("command") or args.get("query")
-                               or args.get("code") or "")
+                        cmd = args.get("command") or args.get("query") or args.get("code") or ""
                         return await self._run(fb, {"command": cmd})
                     return f"Error: {e}"
         return ""
@@ -745,11 +813,9 @@ class PenzerAgent:
             if m.get("role") == "assistant":
                 try:
                     names.extend(
-                        tc["name"] for tc in
-                        json.loads(m["content"]).get("tool_calls", [])
+                        tc["name"] for tc in json.loads(m["content"]).get("tool_calls", [])
                     )
-                except Exception:
-                    pass
+                except Exception: pass
         if len(names) >= 3 and len(set(names)) == 1: return True
         recent = self._trace[-STUCK_MIN:]
         return len(recent) >= STUCK_MIN and all(not s["success"] for s in recent)
@@ -760,20 +826,29 @@ class PenzerAgent:
             for s in self._trace[-3:] if not s["success"]
         ) or "  (none)"
         r = await self.llm.chat(
-            system="Debug agent failures. Output: DIAGNOSIS, NEXT STEP.",
+            system="Debug agent failures. DIAGNOSIS then NEXT STEP.",
             messages=[{"role": "user", "content":
-                f"GOAL: {self._goal}\n{self._belief_summary()}\n"
-                f"FAILED:\n{failed}\n\nDIAGNOSIS:\nNEXT:"}],
+                f"GOAL: {self._goal}\n{self._belief_summary()}\nFAILED:\n{failed}\n\nDIAGNOSIS:\nNEXT:"}],
         )
         return r.get("content", "Try completely different approach")
 
     async def _trim(self) -> None:
+        """
+        Goal-aware compression (Active CC).
+        Summarizes with explicit focus on what is still relevant to the current goal.
+        """
         if len(self.history) <= TRIM_AT: return
         first, mid, tail = self.history[:1], self.history[1:-KEEP_LAST], self.history[-KEEP_LAST:]
         if not mid: return
         try:
             r = await self.llm.chat(
-                system="Summarize in 2 sentences: what was done, what worked.",
+                system=(
+                    "Compress this conversation history. "
+                    f"GOAL: {self._goal}\n"
+                    "Rules: keep facts relevant to the goal, discard irrelevant exchanges. "
+                    "Output 2-3 sentences max. Focus on: what was tried, what worked, "
+                    "what is still needed to complete the goal."
+                ),
                 messages=[{"role": "user", "content": "\n".join(
                     f"{m['role']}: {str(m.get('content',''))[:100]}" for m in mid
                 )}],
@@ -791,12 +866,12 @@ class PenzerAgent:
                 "iteration":   iteration,
                 "goal":        self._goal,
                 "belief":      self._belief["goal_progress"],
-                "subtask":     f"{self._subtask_idx}/{len(self._subtasks)}",
+                "subtask":     f"{self._subtask_idx}/{self._total_subtasks}",
                 "trace_len":   len(self._trace),
                 "resources":   self._monitor.stats(),
             })
         except Exception as e:
-            logger.debug("Checkpoint failed: %s", e)
+            logger.debug("Checkpoint: %s", e)
 
     def clear_session(self) -> None:
         self.history.clear()
@@ -810,6 +885,6 @@ class PenzerAgent:
             "tools_called":  len(self._trace),
             "success_count": sum(1 for t in self._trace if t["success"]),
             "active_skills": self._matched_skills,
-            "subtasks":      f"{self._subtask_idx}/{len(self._subtasks)}",
+            "insights_used": len(self._task_insights),
             "storage":       get_storage_summary(),
         }
