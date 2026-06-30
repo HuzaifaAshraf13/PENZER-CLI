@@ -12,7 +12,7 @@ Research-backed memory architecture:
 import json
 import math
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,7 @@ def _fresh() -> dict:
         "semantic":     [],   # [{pattern, confidence, times_validated, timestamp}]
         "insights":     [],   # [{insight, source_tasks, confidence, timestamp}] — ExpeL
         "post_mortem":  [],   # [{task_type, what_worked, what_failed, next_time, timestamp}]
+        "kv":           {},   # simple key-value store for the "memory" tool
         "history":      [],
         "skill_metrics": {},
         "checkpoints":  [],
@@ -337,6 +338,41 @@ def score_complexity(query: str) -> float:
     return min(1.0, max(0.0, score))
 
 
+# ── Key-Value Store (backs the "memory" tool used by core.memory skill) ──
+
+def kv_store(key: str, value: str) -> str:
+    data = _load()
+    data.setdefault("kv", {})
+    data["kv"][key] = {"value": value, "timestamp": datetime.now().isoformat()}
+    _save(data)
+    return f"Stored: {key}"
+
+
+def kv_get(key: str) -> str:
+    data = _load()
+    entry = data.get("kv", {}).get(key)
+    if not entry:
+        return f"No value found for '{key}'"
+    return entry["value"]
+
+
+def kv_list() -> str:
+    data = _load()
+    kv = data.get("kv", {})
+    if not kv:
+        return "No stored keys"
+    return ", ".join(kv.keys())
+
+
+def kv_delete(key: str) -> str:
+    data = _load()
+    if key in data.get("kv", {}):
+        del data["kv"][key]
+        _save(data)
+        return f"Deleted: {key}"
+    return f"Key '{key}' not found"
+
+
 # ── Legacy shims (agent.py compatibility) ────────────────────
 
 def load_memory() -> dict:
@@ -357,10 +393,11 @@ def get_memory_context(memory: dict) -> str:
 
 def clear_memory() -> None:
     data = _load()
-    data["episodic"]  = []
-    data["semantic"]  = []
-    data["insights"]  = []
+    data["episodic"]    = []
+    data["semantic"]    = []
+    data["insights"]    = []
     data["post_mortem"] = []
+    data["kv"]          = {}
     _save(data)
 
 
@@ -428,6 +465,7 @@ def get_storage_summary() -> dict:
         "semantic":    len(data["semantic"]),
         "insights":    len(data["insights"]),
         "post_mortem": len(data["post_mortem"]),
+        "kv_keys":     len(data.get("kv", {})),
         "history":     len(data["history"]),
         "skills":      len(data["skill_metrics"]),
         "file":        str(STORAGE_FILE),

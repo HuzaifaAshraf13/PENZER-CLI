@@ -35,6 +35,7 @@ from session.memory import (
     get_similar_trajectories, score_complexity,
     update_skill_metric, add_checkpoint,
     get_storage_summary,
+    kv_store, kv_get, kv_list, kv_delete,
 )
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
@@ -125,6 +126,7 @@ class PenzerAgent:
         self._novel_task:          bool  = False
         self._is_complex_task:     bool  = False
         self._task_insights:       list  = []
+        self._past_trajectories:   list  = []   # ExpeL trajectory recall — was missing, caused crash
 
         # Skill flags — kept separate so they don't block each other
         self._skill_gate_shown:    bool  = False  # "no skills" gate shown
@@ -163,6 +165,9 @@ class PenzerAgent:
             self.tools = await mcp.get_tools() or {}
         except Exception as e:
             logger.debug("MCP: %s", e)
+        # Register built-in "memory" tool so it passes `name in self.tools` checks
+        # even though it has no MCP backend — handled directly in _run().
+        self.tools.setdefault("memory", "builtin")
         return self
 
     # ── Public ──────────────────────────────────────────────────────────────────
@@ -643,6 +648,13 @@ class PenzerAgent:
             name  = c["name"]
             args  = c.get("arguments", {})
             start = time.time()
+
+            # Memory tool is built-in — never goes to MCP
+            if name == "memory":
+                self.on_status(f"🧠 {self._fmt_action(name, args)}")
+                raw = self._run_memory_tool(args)
+                return raw, round(time.time() - start, 2)
+
             if name not in self.tools:
                 return f"Unknown tool '{name}'.", 0.0
             self.on_status(f"{TOOL_LABELS.get(name, name)} {self._fmt_action(name, args)}")
@@ -705,6 +717,8 @@ class PenzerAgent:
     # ── Tool execution ───────────────────────────────────────────────────────────
 
     async def _run(self, name: str, args: dict) -> str:
+        # Note: "memory" tool is intercepted earlier in _run_parallel().
+        # This path only handles real MCP tools.
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
         if key in self._cache:
             return self._cache[key]
@@ -720,8 +734,6 @@ class PenzerAgent:
                     self._fn_cache[fn] = (inspect.signature(fn), inspect.iscoroutinefunction(fn))
                 sig, is_async = self._fn_cache[fn]
                 kw = {k: v for k, v in args.items() if k in sig.parameters}
-                if name == "memory":
-                    kw.setdefault("workspace_id", "penzer_default")
                 out = await fn(**kw) if is_async else fn(**kw)
                 self._cache[key] = s = str(out)
                 return s
@@ -735,6 +747,25 @@ class PenzerAgent:
                         return await self._run(fb, {"command": cmd})
                     return f"Error: {e}"
         return ""
+
+    def _run_memory_tool(self, args: dict) -> str:
+        """
+        Backing implementation for the 'memory' tool referenced by core.memory skill.
+        Actions: get, store, list, delete
+        """
+        action = args.get("action", "")
+        key    = args.get("key", "")
+        value  = args.get("value", "")
+
+        if action == "get":
+            return kv_get(key)
+        if action == "store":
+            return kv_store(key, value)
+        if action == "list":
+            return kv_list()
+        if action == "delete":
+            return kv_delete(key)
+        return f"Unknown memory action '{action}'. Use: get, store, list, delete"
 
     # ── Output ───────────────────────────────────────────────────────────────────
 

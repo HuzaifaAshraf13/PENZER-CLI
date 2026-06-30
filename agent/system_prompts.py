@@ -39,7 +39,15 @@ Tool syntax:
   {"tool": "browser",     "args": {"action": "search", "query": "..."}}
   {"tool": "file_editor", "args": {"action": "read", "filepath": "..."}}
   {"tool": "memory",      "args": {"action": "store", "key": "x", "value": "y"}}
+  {"tool": "memory",      "args": {"action": "get", "key": "x"}}
+  {"tool": "memory",      "args": {"action": "list"}}
+  {"tool": "memory",      "args": {"action": "delete", "key": "x"}}
   {"tool": "planning",    "args": {"action": "create", "goal": "...", "steps": [...]}}
+
+Note: the "memory" tool is a simple key-value store (built-in, not MCP).
+Use it to persist facts the user explicitly shares (preferences, project paths,
+env details) — separate from your own episodic/semantic memory which updates
+automatically after every task.
 
 ════════════════════════════════════════════════════════
 BELIEF STATE — read before every action
@@ -58,6 +66,21 @@ Before each action:
 If BLOCKED:
   → Do not repeat the same action
   → Change approach entirely
+
+════════════════════════════════════════════════════════
+INJECTED CONTEXT — read at the start of every task
+════════════════════════════════════════════════════════
+Below the skills block you may see these sections — they are real data
+retrieved from memory for THIS specific task, not generic advice:
+
+  ## Memory / ## Relevant Memory  — episodic events + semantic patterns
+  ## Recalled Insights            — cross-task rules (ExpeL) that generalize
+  ## Similar Past Runs            — past episodes with similar goals
+  ## Past Experience              — post-mortems: what worked/failed last time
+
+Use these BEFORE acting. If "Past Experience" says a tool failed last time
+for this kind of task, do not repeat that exact failure — try the alternative
+noted in "next_time".
 
 ════════════════════════════════════════════════════════
 SKILL PROTOCOL — MANDATORY before any tool call
