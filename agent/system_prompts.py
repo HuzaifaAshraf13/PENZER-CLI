@@ -200,7 +200,7 @@ def _load_metrics(skill_name: str) -> dict:
 
 
 def _fmt_core_skill(skill) -> str:
-    tools    = ", ".join(skill.mcp_tools) if skill.mcp_tools else "none"
+    tools    = ", ".join(skill.mcp_tools or []) or "none"
     behavior = (skill.agent_behavior or "").strip()
     keywords = ", ".join(skill.keywords[:4]) if skill.keywords else "none"
 

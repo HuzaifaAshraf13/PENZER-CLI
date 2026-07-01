@@ -126,7 +126,8 @@ class PenzerAgent:
         self._novel_task:          bool  = False
         self._is_complex_task:     bool  = False
         self._task_insights:       list  = []
-        self._past_trajectories:   list  = []   # ExpeL trajectory recall — was missing, caused crash
+        self._past_trajectories:   list  = []
+        self._trimming:            bool  = False  # lock: prevent concurrent history mutation
 
         # Skill flags — kept separate so they don't block each other
         self._skill_gate_shown:    bool  = False  # "no skills" gate shown
@@ -363,7 +364,9 @@ class PenzerAgent:
                 ),
                 timeout=15,
             )
-            subtasks = json.loads(r.get("content", "[]").strip())
+            raw_content = r.get("content", "[]").strip()
+            raw_content = raw_content.strip("```").lstrip("json").strip()
+            subtasks = json.loads(raw_content)
             if isinstance(subtasks, list) and subtasks:
                 return subtasks
         except Exception as e:
@@ -416,7 +419,8 @@ class PenzerAgent:
                 ),
                 timeout=10,
             )
-            ev = json.loads(r.get("content", "{}").strip())
+            raw_ev = r.get("content", "{}").strip().strip("```").lstrip("json").strip()
+            ev = json.loads(raw_ev)
             return bool(ev.get("completed", True)), ev.get("reason", "")
         except Exception:
             return True, ""  # default: assume completed if evaluator fails
@@ -449,7 +453,8 @@ class PenzerAgent:
                 ),
                 timeout=15,
             )
-            pm = json.loads(r.get("content", "{}").strip())
+            raw_pm = r.get("content", "{}").strip().strip("```").lstrip("json").strip()
+            pm = json.loads(raw_pm)
             store_post_mortem(
                 task_type=goal[:40],
                 what_worked=pm.get("what_worked", worked),
@@ -717,8 +722,11 @@ class PenzerAgent:
     # ── Tool execution ───────────────────────────────────────────────────────────
 
     async def _run(self, name: str, args: dict) -> str:
-        # Note: "memory" tool is intercepted earlier in _run_parallel().
-        # This path only handles real MCP tools.
+        # "memory" is intercepted in _run_parallel() — should never reach here.
+        # Guard against the "builtin" sentinel value we registered.
+        if name == "memory" or self.tools.get(name) == "builtin":
+            return self._run_memory_tool(args)
+
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
         if key in self._cache:
             return self._cache[key]
@@ -866,9 +874,11 @@ class PenzerAgent:
     async def _trim(self) -> None:
         """
         Goal-aware compression (Active CC).
-        Summarizes with explicit focus on what is still relevant to the current goal.
+        Lock prevents concurrent trims corrupting self.history.
         """
-        if len(self.history) <= TRIM_AT: return
+        if self._trimming or len(self.history) <= TRIM_AT:
+            return
+        self._trimming = True
         first, mid, tail = self.history[:1], self.history[1:-KEEP_LAST], self.history[-KEEP_LAST:]
         if not mid: return
         try:
@@ -889,6 +899,8 @@ class PenzerAgent:
             ] + tail
         except Exception:
             self.history = first + tail
+        finally:
+            self._trimming = False
 
     async def _checkpoint(self, iteration: int):
         try:

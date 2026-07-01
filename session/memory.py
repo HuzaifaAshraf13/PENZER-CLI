@@ -243,8 +243,7 @@ def get_post_mortems(query: str, n: int = 2) -> list[dict]:
 # Deep path: full scoring for complex queries
 
 def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
-    data    = _load()
-    query_l = query.lower()
+    data = _load()
 
     # Fast path: simple queries get summary-level context only
     if not deep:
@@ -361,7 +360,8 @@ def kv_list() -> str:
     kv = data.get("kv", {})
     if not kv:
         return "No stored keys"
-    return ", ".join(kv.keys())
+    lines = [f"{k}: {v['value'][:80]}" for k, v in kv.items()]
+    return "\n".join(lines)
 
 
 def kv_delete(key: str) -> str:
