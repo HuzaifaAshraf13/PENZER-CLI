@@ -2,12 +2,16 @@
 session/memory.py
 
 Research-backed memory architecture:
-  - Episodic: raw events with Ebbinghaus decay (MemoryBank 2024)
-  - Semantic: distilled cross-task insights (ExpeL AAAI 2024)
-  - Post-mortems: verbal Reflexion per task (Shinn 2023)
-  - Dual-tier retrieval: fast summaries for simple, deep for complex (HyMem 2026)
-  - Forgetting curve: old unused memories decay and get pruned automatically
-  - Insight extraction: cross-task patterns distilled into reusable rules
+  - Episodic        : raw events with Ebbinghaus decay (MemoryBank 2024)
+  - Semantic        : distilled cross-task insights (ExpeL AAAI 2024)
+  - Post-mortems    : verbal Reflexion per task (Shinn 2023)
+  - Dual-tier       : fast summaries vs deep scoring (HyMem 2026)
+  - KV Store        : explicit user-facing key-value facts
+  - Conflict detect : contradicting semantics flagged + resolved
+  - Assoc retrieval : chained related episode pull
+  - Category decay  : each memory type decays at its own rate
+  - Consolidation   : episodic → semantic distillation on schedule
+  - Episodic replay : compressed narrative of past similar runs
 """
 import json
 import math
@@ -21,26 +25,37 @@ STORAGE_DIR  = Path(".penzer")
 STORAGE_FILE = STORAGE_DIR / "session.json"
 STORAGE_DIR.mkdir(exist_ok=True)
 
-MAX_EPISODIC    = 300
-MAX_SEMANTIC    = 150
-MAX_INSIGHTS    = 100   # ExpeL: cross-task extracted insights
-MAX_POST_MORTEM = 50
-MAX_HISTORY     = 500
-MAX_CHECKPOINTS = 5
+MAX_EPISODIC     = 300
+MAX_SEMANTIC     = 150
+MAX_INSIGHTS     = 100
+MAX_POST_MORTEM  = 50
+MAX_HISTORY      = 500
+MAX_CHECKPOINTS  = 5
+CONSOLIDATE_EVERY = 20   # consolidate after every N new episodic entries
 
-DECAY_HALF_LIFE_HOURS = 72   # Ebbinghaus: memory strength halves every 72h
+# Category-specific half-lives (hours)
+DECAY_RATES = {
+    "episodic": 72,    # raw events — fade in 3 days
+    "semantic": 336,   # learned patterns — fade in 2 weeks
+    "insights": 504,   # cross-task rules — fade in 3 weeks
+    "kv":       720,   # user facts — fade in 1 month
+}
+
+# Spaced repetition intervals (hours)
+SR_INTERVALS = [1, 24, 72, 168, 336]
 
 
 def _fresh() -> dict:
     return {
-        "episodic":     [],   # [{event, outcome, importance, timestamp, task_type, strength}]
-        "semantic":     [],   # [{pattern, confidence, times_validated, timestamp}]
-        "insights":     [],   # [{insight, source_tasks, confidence, timestamp}] — ExpeL
-        "post_mortem":  [],   # [{task_type, what_worked, what_failed, next_time, timestamp}]
-        "kv":           {},   # simple key-value store for the "memory" tool
-        "history":      [],
+        "episodic":      [],
+        "semantic":      [],
+        "insights":      [],
+        "post_mortem":   [],
+        "kv":            {},
+        "history":       [],
         "skill_metrics": {},
-        "checkpoints":  [],
+        "checkpoints":   [],
+        "consolidation": {"count": 0, "last_run": ""},
     }
 
 
@@ -54,7 +69,7 @@ def _load() -> dict:
                     data.setdefault(k, v)
                 return data
     except Exception as e:
-        logger.debug("Storage load failed: %s", e)
+        logger.debug("Storage load: %s", e)
     return _fresh()
 
 
@@ -66,81 +81,146 @@ def _save(data: dict) -> None:
         logger.error("Storage save: %s", e)
 
 
-# ── Ebbinghaus decay score ────────────────────────────────────
-# Memory strength decays exponentially with time unless reinforced
+# ── Decay ────────────────────────────────────────────────────
+# Each category has its own half-life (category-specific forgetting curve)
 
-def _decay(timestamp: str, base_strength: float = 1.0) -> float:
+def _decay(timestamp: str, strength: float = 1.0, category: str = "episodic") -> float:
     try:
-        then  = datetime.fromisoformat(timestamp)
-        hours = (datetime.now() - then).total_seconds() / 3600
-        return base_strength * math.exp(-0.693 * hours / DECAY_HALF_LIFE_HOURS)
+        half_life = DECAY_RATES.get(category, 72)
+        hours     = (datetime.now() - datetime.fromisoformat(timestamp)).total_seconds() / 3600
+        return strength * math.exp(-0.693 * hours / half_life)
     except Exception:
         return 0.5
 
 
 def _recency(timestamp: str) -> float:
     try:
-        then  = datetime.fromisoformat(timestamp)
-        hours = (datetime.now() - then).total_seconds() / 3600
+        hours = (datetime.now() - datetime.fromisoformat(timestamp)).total_seconds() / 3600
         return math.exp(-0.01 * hours)
     except Exception:
         return 0.5
 
 
 def _relevance(text: str, query: str) -> float:
-    q_words = set(query.lower().split())
-    t_words = set(text.lower().split())
-    return len(q_words & t_words) / len(q_words) if q_words else 0.0
+    q = set(query.lower().split())
+    t = set(text.lower().split())
+    return len(q & t) / len(q) if q else 0.0
 
 
 # ── Episodic Memory ──────────────────────────────────────────
 
-def remember_episodic(event: str, outcome: str, importance: float = 0.5, task_type: str = "") -> None:
+def remember_episodic(
+    event: str, outcome: str,
+    importance: float = 0.5, task_type: str = ""
+) -> None:
     data = _load()
     data["episodic"].append({
-        "event":     event,
-        "outcome":   outcome,
-        "importance": min(1.0, max(0.0, importance)),
-        "task_type": task_type,
-        "timestamp": datetime.now().isoformat(),
-        "strength":  1.0,  # starts at full strength, decays over time
+        "event":       event,
+        "outcome":     outcome,
+        "importance":  min(1.0, max(0.0, importance)),
+        "task_type":   task_type,
+        "timestamp":   datetime.now().isoformat(),
+        "strength":    1.0,
         "access_count": 0,
     })
-    # Prune: remove entries with decayed strength < 0.1 first, then by importance
+    # Prune decayed entries
     data["episodic"] = [
         e for e in data["episodic"]
-        if _decay(e["timestamp"], e.get("strength", 1.0)) > 0.1
+        if _decay(e["timestamp"], e.get("strength", 1.0), "episodic") > 0.05
     ]
     if len(data["episodic"]) > MAX_EPISODIC:
         data["episodic"] = sorted(
             data["episodic"],
-            key=lambda x: _decay(x["timestamp"], x.get("strength", 1.0)) * x["importance"],
+            key=lambda x: _decay(x["timestamp"], x.get("strength", 1.0), "episodic") * x["importance"]
         )[-MAX_EPISODIC:]
+
+    # Track consolidation schedule
+    data["consolidation"]["count"] = data["consolidation"].get("count", 0) + 1
     _save(data)
 
 
 def reinforce_episodic(event_text: str) -> None:
-    """
-    Reinforce a memory using spaced repetition intervals (MemoryBank).
-    Each access extends the decay half-life: 1h → 24h → 72h → 168h → 336h
-    """
-    SR_INTERVALS = [1, 24, 72, 168, 336]  # hours — spaced repetition schedule
+    """Spaced repetition — each access extends the half-life."""
     data = _load()
     for ep in data["episodic"]:
         if event_text[:50] in ep["event"]:
-            count    = ep.get("access_count", 0) + 1
-            interval = SR_INTERVALS[min(count, len(SR_INTERVALS) - 1)]
-            # Strength reflects current SR interval as fraction of max
-            ep["strength"]      = min(3.0, interval / SR_INTERVALS[-1] * 3.0)
-            ep["timestamp"]     = datetime.now().isoformat()
-            ep["access_count"]  = count
+            count           = ep.get("access_count", 0) + 1
+            interval        = SR_INTERVALS[min(count, len(SR_INTERVALS) - 1)]
+            ep["strength"]  = min(3.0, interval / SR_INTERVALS[-1] * 3.0)
+            ep["timestamp"] = datetime.now().isoformat()
+            ep["access_count"] = count
     _save(data)
+
+
+# ── Associative Retrieval ────────────────────────────────────
+# When one episode is retrieved, chain-pull related ones
+
+def get_associated(event: dict, n: int = 2) -> list[dict]:
+    """Pull episodes related to the given one by task_type or keyword overlap."""
+    data    = _load()
+    base_tt = event.get("task_type", "")
+    base_ev = event.get("event", "")
+    scored  = []
+    for ep in data["episodic"]:
+        if ep is event or ep.get("event") == base_ev:
+            continue
+        type_match    = 1.0 if ep.get("task_type") == base_tt and base_tt else 0.0
+        keyword_match = _relevance(ep["event"], base_ev)
+        score         = type_match * 0.6 + keyword_match * 0.4
+        if score > 0.1:
+            scored.append((score, ep))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [ep for _, ep in scored[:n]]
+
+
+# ── Episodic Replay ──────────────────────────────────────────
+# Compressed narrative of past relevant runs for task context
+
+def get_episode_replay(query: str, n: int = 3) -> str:
+    """
+    Returns a compressed narrative of the N most relevant past episodes.
+    Format: "Last time [task]: tried [tools], [outcome]. What worked: [X]."
+    """
+    data   = _load()
+    scored = []
+    for ep in data["episodic"]:
+        rel = _relevance(ep["event"] + " " + ep["task_type"], query)
+        dec = _decay(ep["timestamp"], ep.get("strength", 1.0), "episodic")
+        if rel > 0.1:
+            scored.append((rel * 0.6 + dec * 0.4, ep))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:n]
+    if not top:
+        return ""
+
+    lines = ["## Episode Replay (past similar runs)"]
+    for _, ep in top:
+        lines.append(
+            f"- [{ep.get('task_type', 'task')}] {ep['event'][:80]} → {ep['outcome']}"
+        )
+        # Pull associated episodes for richer context
+        associated = get_associated(ep, n=1)
+        for assoc in associated:
+            lines.append(f"    related: {assoc['event'][:60]} → {assoc['outcome']}")
+
+    return "\n".join(lines)
 
 
 # ── Semantic Memory ──────────────────────────────────────────
 
 def remember_semantic(pattern: str, confidence: float = 0.6) -> None:
+    """Store + run conflict detection before saving."""
     data = _load()
+    # Conflict detection before storing
+    conflict = detect_conflict(pattern, data["semantic"])
+    if conflict:
+        if conflict["confidence"] >= confidence:
+            logger.debug("Conflict: keeping existing '%s'", conflict["pattern"][:60])
+            return
+        else:
+            data["semantic"].remove(conflict)
+            logger.debug("Conflict: replacing lower-confidence pattern")
+
     existing = [s for s in data["semantic"] if s["pattern"] == pattern]
     if existing:
         existing[0]["confidence"]      = min(1.0, existing[0]["confidence"] + 0.05)
@@ -160,8 +240,34 @@ def remember_semantic(pattern: str, confidence: float = 0.6) -> None:
     _save(data)
 
 
-# ── Insight Extraction (ExpeL pattern) ──────────────────────
-# Cross-task distilled rules — more generalizable than episodic
+# ── Conflict Detection ───────────────────────────────────────
+# Detect contradicting semantic memories — same topic, opposite advice
+
+NEGATION_PAIRS = [
+    ("always", "never"), ("use", "avoid"), ("works", "fails"),
+    ("do", "don't"), ("can", "cannot"), ("enable", "disable"),
+]
+
+def detect_conflict(new_pattern: str, existing: list[dict]) -> dict | None:
+    """
+    Check if new_pattern contradicts an existing semantic memory.
+    Returns the conflicting entry if found, else None.
+    """
+    new_words = set(new_pattern.lower().split())
+    for sem in existing:
+        old_words = set(sem["pattern"].lower().split())
+        topic_overlap = len(new_words & old_words) / max(len(new_words), 1)
+        if topic_overlap < 0.4:
+            continue
+        # Check for negation pairs indicating contradiction
+        for pos, neg in NEGATION_PAIRS:
+            if (pos in new_words and neg in old_words) or \
+               (neg in new_words and pos in old_words):
+                return sem
+    return None
+
+
+# ── Insight Extraction (ExpeL) ───────────────────────────────
 
 def store_insight(insight: str, source_tasks: list[str], confidence: float = 0.7) -> None:
     data = _load()
@@ -185,7 +291,7 @@ def store_insight(insight: str, source_tasks: list[str], confidence: float = 0.7
 
 
 def get_insights(query: str, n: int = 3) -> list[dict]:
-    data = _load()
+    data   = _load()
     scored = [
         (_relevance(i["insight"], query) * 0.6 + i["confidence"] * 0.4, i)
         for i in data["insights"]
@@ -195,18 +301,16 @@ def get_insights(query: str, n: int = 3) -> list[dict]:
     return [i for _, i in scored[:n]]
 
 
-# ── Trajectory Retrieval (ExpeL — missing piece) ────────────
-# Retrieve similar past tool sequences, not just insights
+# ── Trajectory Retrieval (ExpeL) ─────────────────────────────
 
 def get_similar_trajectories(query: str, n: int = 3) -> list[dict]:
-    """Retrieve episodic memories whose tool sequences match this query."""
     data   = _load()
-    scored = []
-    for ep in data["episodic"]:
-        rel = _relevance(ep["event"] + " " + ep["outcome"], query)
-        dec = _decay(ep["timestamp"], ep.get("strength", 1.0))
-        if rel > 0.1:
-            scored.append((rel * 0.7 + dec * 0.3, ep))
+    scored = [
+        (_relevance(ep["event"] + " " + ep["outcome"], query) * 0.7
+         + _decay(ep["timestamp"], ep.get("strength", 1.0), "episodic") * 0.3, ep)
+        for ep in data["episodic"]
+        if _relevance(ep["event"] + " " + ep["outcome"], query) > 0.1
+    ]
     scored.sort(key=lambda x: x[0], reverse=True)
     return [ep for _, ep in scored[:n]]
 
@@ -228,7 +332,7 @@ def store_post_mortem(task_type: str, what_worked: str, what_failed: str, next_t
 
 
 def get_post_mortems(query: str, n: int = 2) -> list[dict]:
-    data = _load()
+    data   = _load()
     scored = [
         (_relevance(pm["task_type"] + " " + pm["what_worked"], query), pm)
         for pm in data["post_mortem"]
@@ -239,48 +343,44 @@ def get_post_mortems(query: str, n: int = 2) -> list[dict]:
 
 
 # ── Dual-Tier Retrieval (HyMem 2026) ────────────────────────
-# Fast path: summary-level for simple queries
-# Deep path: full scoring for complex queries
 
 def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
     data = _load()
 
-    # Fast path: simple queries get summary-level context only
     if not deep:
         lines = ["## Memory"]
-        # Top semantic patterns (fastest, most distilled)
         for sem in sorted(data["semantic"], key=lambda x: x["confidence"], reverse=True)[:2]:
             if _relevance(sem["pattern"], query) > 0.2:
                 lines.append(f"- [learned] {sem['pattern']}")
-        # Top insights
         for ins in get_insights(query, n=2):
             lines.append(f"- [insight] {ins['insight']}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
-    # Deep path: full scoring across all memory types
     scored = []
     for ep in data["episodic"]:
         text  = f"{ep['event']} {ep['outcome']}"
         score = (
-            _recency(ep["timestamp"])              * 0.25
-            + _relevance(text, query)              * 0.45
-            + ep["importance"]                     * 0.15
-            + _decay(ep["timestamp"], ep.get("strength", 1.0)) * 0.15
+            _recency(ep["timestamp"])                                       * 0.20
+            + _relevance(text, query)                                        * 0.40
+            + ep["importance"]                                               * 0.15
+            + _decay(ep["timestamp"], ep.get("strength", 1.0), "episodic")  * 0.25
         )
         scored.append((score, "episodic", ep))
 
     for sem in data["semantic"]:
         score = (
-            _recency(sem["timestamp"])             * 0.2
-            + _relevance(sem["pattern"], query)    * 0.5
-            + sem["confidence"]                    * 0.3
+            _recency(sem["timestamp"])                                       * 0.15
+            + _relevance(sem["pattern"], query)                              * 0.50
+            + sem["confidence"]                                              * 0.25
+            + _decay(sem["timestamp"], 1.0, "semantic")                      * 0.10
         )
         scored.append((score, "semantic", sem))
 
     for ins in data["insights"]:
         score = (
-            _relevance(ins["insight"], query)      * 0.6
-            + ins["confidence"]                    * 0.4
+            _relevance(ins["insight"], query)                                * 0.65
+            + ins["confidence"]                                              * 0.25
+            + _decay(ins["timestamp"], 1.0, "insights")                      * 0.10
         )
         scored.append((score, "insight", ins))
 
@@ -293,21 +393,97 @@ def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
     lines = ["## Relevant Memory"]
     for _, kind, item in top:
         if kind == "episodic":
+            # Also pull associated episodes
             lines.append(f"- [event] {item['event']} → {item['outcome']}")
+            for assoc in get_associated(item, n=1):
+                lines.append(f"    ↳ related: {assoc['event'][:60]} → {assoc['outcome']}")
+            reinforce_episodic(item["event"])
         elif kind == "semantic":
-            lines.append(f"- [learned] {item['pattern']} ({item['confidence']:.0%} confidence)")
+            lines.append(f"- [learned] {item['pattern']} ({item['confidence']:.0%})")
         else:
             lines.append(f"- [insight] {item['insight']}")
-
-    # Reinforce accessed episodic memories
-    for _, kind, item in top:
-        if kind == "episodic":
-            reinforce_episodic(item["event"])
 
     return "\n".join(lines)
 
 
-# ── Complexity Scoring (HyMem — replaces keyword heuristic) ──
+# ── Memory Consolidation ─────────────────────────────────────
+# Cluster episodic → distil into semantic → prune raw episodes
+
+def should_consolidate() -> bool:
+    data  = _load()
+    count = data.get("consolidation", {}).get("count", 0)
+    return count >= CONSOLIDATE_EVERY
+
+
+async def consolidate_memory(llm) -> None:
+    """
+    Background consolidation:
+    1. Cluster episodic memories by task_type
+    2. Distil each cluster into a semantic pattern via LLM
+    3. Delete consolidated episodes (keep high-importance ones)
+    """
+    import asyncio
+    data = _load()
+    if not data["episodic"]:
+        return
+
+    # Group by task_type
+    clusters: dict[str, list] = {}
+    for ep in data["episodic"]:
+        tt = ep.get("task_type", "general")
+        clusters.setdefault(tt, []).append(ep)
+
+    new_patterns = []
+    for task_type, episodes in clusters.items():
+        if len(episodes) < 3:
+            continue
+        try:
+            summaries = "\n".join(
+                f"- {ep['event'][:60]} → {ep['outcome']}"
+                for ep in episodes[:8]
+            )
+            r = await asyncio.wait_for(
+                llm.chat(
+                    system=(
+                        "Distil these experiences into ONE reusable pattern. "
+                        "Return a single sentence starting with an action verb. "
+                        "No JSON, just the sentence."
+                    ),
+                    messages=[{"role": "user", "content":
+                        f"Task type: {task_type}\nExperiences:\n{summaries}"}],
+                ),
+                timeout=10,
+            )
+            pattern = r.get("content", "").strip()
+            if pattern:
+                new_patterns.append((pattern, task_type, episodes))
+        except Exception as e:
+            logger.debug("Consolidation LLM: %s", e)
+
+    for pattern, task_type, episodes in new_patterns:
+        # Store distilled pattern as semantic memory
+        avg_conf = sum(ep["importance"] for ep in episodes) / len(episodes)
+        existing = [s for s in data["semantic"] if s["pattern"] == pattern]
+        if not existing:
+            data["semantic"].append({
+                "pattern":         pattern,
+                "confidence":      min(1.0, avg_conf),
+                "times_validated": len(episodes),
+                "timestamp":       datetime.now().isoformat(),
+            })
+        # Prune consolidated episodes (keep importance > 0.8)
+        data["episodic"] = [
+            ep for ep in data["episodic"]
+            if ep not in episodes or ep["importance"] > 0.8
+        ]
+
+    data["consolidation"]["count"]    = 0
+    data["consolidation"]["last_run"] = datetime.now().isoformat()
+    _save(data)
+    logger.info("Memory consolidation done — %d new patterns", len(new_patterns))
+
+
+# ── Complexity Scoring (HyMem) ───────────────────────────────
 
 COMPLEXITY_SIGNALS = {
     "high":   ["build", "create", "deploy", "configure", "analyze", "research",
@@ -317,27 +493,23 @@ COMPLEXITY_SIGNALS = {
     "low":    ["hi", "hello", "what", "who", "when", "where", "why"],
 }
 
+
 def score_complexity(query: str) -> float:
-    """
-    Score query complexity 0.0-1.0 numerically.
-    HyMem uses this to decide fast vs deep retrieval.
-    """
-    q = query.lower()
+    q           = query.lower()
     high_hits   = sum(1 for s in COMPLEXITY_SIGNALS["high"]   if s in q)
     medium_hits = sum(1 for s in COMPLEXITY_SIGNALS["medium"] if s in q)
     low_hits    = sum(1 for s in COMPLEXITY_SIGNALS["low"]    if s in q)
     word_count  = len(q.split())
-
     score = (
         high_hits   * 0.4
         + medium_hits * 0.2
-        + (word_count / 20) * 0.3   # longer = more complex
+        + (word_count / 20) * 0.3
         - low_hits  * 0.1
     )
     return min(1.0, max(0.0, score))
 
 
-# ── Key-Value Store (backs the "memory" tool used by core.memory skill) ──
+# ── KV Store ─────────────────────────────────────────────────
 
 def kv_store(key: str, value: str) -> str:
     data = _load()
@@ -348,7 +520,7 @@ def kv_store(key: str, value: str) -> str:
 
 
 def kv_get(key: str) -> str:
-    data = _load()
+    data  = _load()
     entry = data.get("kv", {}).get(key)
     if not entry:
         return f"No value found for '{key}'"
@@ -357,7 +529,7 @@ def kv_get(key: str) -> str:
 
 def kv_list() -> str:
     data = _load()
-    kv = data.get("kv", {})
+    kv   = data.get("kv", {})
     if not kv:
         return "No stored keys"
     lines = [f"{k}: {v['value'][:80]}" for k, v in kv.items()]
@@ -373,35 +545,7 @@ def kv_delete(key: str) -> str:
     return f"Key '{key}' not found"
 
 
-# ── Legacy shims (agent.py compatibility) ────────────────────
-
-def load_memory() -> dict:
-    return {}
-
-
-def save_memory(memory: dict) -> None:
-    pass
-
-
-def remember(memory: dict, item: str) -> None:
-    pass
-
-
-def get_memory_context(memory: dict) -> str:
-    return ""
-
-
-def clear_memory() -> None:
-    data = _load()
-    data["episodic"]    = []
-    data["semantic"]    = []
-    data["insights"]    = []
-    data["post_mortem"] = []
-    data["kv"]          = {}
-    _save(data)
-
-
-# ── Skill Metrics ────────────────────────────────────────────
+# ── Skill Metrics ─────────────────────────────────────────────
 
 def update_skill_metric(skill_name: str, success: bool) -> None:
     data = _load()
@@ -424,7 +568,7 @@ def get_skill_metric(skill_name: str) -> dict:
     )
 
 
-# ── History ──────────────────────────────────────────────────
+# ── History ───────────────────────────────────────────────────
 
 def load_history() -> list:
     h = _load().get("history", [])
@@ -443,7 +587,7 @@ def clear_history() -> None:
     _save(data)
 
 
-# ── Checkpoints ──────────────────────────────────────────────
+# ── Checkpoints ───────────────────────────────────────────────
 
 def add_checkpoint(checkpoint: dict) -> None:
     data = _load()
@@ -456,7 +600,31 @@ def load_checkpoints() -> list:
     return _load().get("checkpoints", [])
 
 
-# ── Utils ────────────────────────────────────────────────────
+# ── Legacy shims ──────────────────────────────────────────────
+
+def load_memory() -> dict:
+    return {}
+
+def save_memory(memory: dict) -> None:
+    pass
+
+def remember(memory: dict, item: str) -> None:
+    pass
+
+def get_memory_context(memory: dict) -> str:
+    return ""
+
+def clear_memory() -> None:
+    data = _load()
+    data["episodic"]    = []
+    data["semantic"]    = []
+    data["insights"]    = []
+    data["post_mortem"] = []
+    data["kv"]          = {}
+    _save(data)
+
+
+# ── Utils ─────────────────────────────────────────────────────
 
 def get_storage_summary() -> dict:
     data = _load()
