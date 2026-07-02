@@ -163,6 +163,12 @@ class PenzerAgent:
         self._total_subtasks:      int   = 0
         self._current_subtask:     str   = ""
 
+        # Execution state machine
+        self._execution_queue:     list  = []
+        self._execution_index:     int   = 0
+        self._active_execution_item: dict | None = None
+        self._execution_complete:  bool  = False
+
         # Working memory (Miller's Law — max 7 items)
         self._working_mem: deque = deque(maxlen=WORKING_MEMORY_SIZE)
 
@@ -277,6 +283,12 @@ class PenzerAgent:
             if self._milestones:
                 self._subtasks       = self._milestones[0].get("steps", [])
                 self._total_subtasks = sum(len(m.get("steps", [])) for m in self._milestones)
+            self._build_execution_queue()
+        else:
+            self._execution_queue = []
+            self._execution_index = 0
+            self._active_execution_item = None
+            self._execution_complete = True
 
         result = await self._loop()
 
@@ -542,6 +554,61 @@ class PenzerAgent:
         except Exception as e:
             logger.debug("Post-mortem: %s", e)
 
+    def _build_execution_queue(self) -> None:
+        self._execution_queue = []
+        self._execution_index = 0
+        self._active_execution_item = None
+        self._execution_complete = False
+
+        if not self._milestones:
+            self._execution_complete = True
+            return
+
+        for milestone_idx, milestone in enumerate(self._milestones):
+            milestone_name = milestone.get("milestone", "").strip()
+            if milestone_name:
+                self._execution_queue.append({
+                    "kind": "milestone",
+                    "title": milestone_name,
+                    "milestone_idx": milestone_idx,
+                    "step_index": None,
+                })
+            for step_idx, step in enumerate(milestone.get("steps", []) or []):
+                if step:
+                    self._execution_queue.append({
+                        "kind": "step",
+                        "title": step,
+                        "milestone_idx": milestone_idx,
+                        "step_index": step_idx,
+                    })
+
+    def _claim_next_execution_item(self) -> dict | None:
+        if self._execution_complete:
+            return None
+        if self._execution_index >= len(self._execution_queue):
+            self._execution_complete = True
+            self._active_execution_item = None
+            return None
+
+        item = self._execution_queue[self._execution_index]
+        self._execution_index += 1
+        self._active_execution_item = item
+        self._current_subtask = item.get("title", "")
+        self._milestone_idx = item.get("milestone_idx", getattr(self, "_milestone_idx", 0))
+        if self._milestones and self._milestone_idx < len(self._milestones):
+            self._subtasks = self._milestones[self._milestone_idx].get("steps", [])
+        else:
+            self._subtasks = getattr(self, "_subtasks", [])
+        return item
+
+    def _complete_current_execution_item(self, success: bool = True) -> None:
+        if self._active_execution_item is None:
+            return
+        self._active_execution_item = None
+        self._execution_complete = self._execution_index >= len(self._execution_queue)
+        if not success:
+            self._execution_complete = False
+
     # ── Main Loop ────────────────────────────────────────────────────────────────
 
     async def _loop(self) -> str:
@@ -562,26 +629,16 @@ class PenzerAgent:
             asyncio.ensure_future(self._trim())
             self.on_status("Thinking…" if i == 0 else f"Step {i+1}…")
 
-            # Executor: drive subtasks from hierarchical plan
-            if self._milestones and self._milestone_idx < len(self._milestones):
-                milestone = self._milestones[self._milestone_idx]
-                if self._subtask_idx < len(self._subtasks):
-                    subtask = self._subtasks[self._subtask_idx]
-                    self._current_subtask = subtask
-                    self._subtask_idx    += 1
+            # Executor: drive the next pending execution item from the state machine
+            if self._active_execution_item is None:
+                item = self._claim_next_execution_item()
+                if item is not None:
                     self.history.append({"role": "user", "content":
-                        f"[Executor] Milestone {self._milestone_idx+1} "
-                        f"'{milestone.get('milestone','')}' "
-                        f"— Step {self._subtask_idx}/{len(self._subtasks)}: {subtask}"})
-                elif self._subtask_idx >= len(self._subtasks):
-                    self._milestone_idx += 1
-                    if self._milestone_idx < len(self._milestones):
-                        self._subtasks    = self._milestones[self._milestone_idx].get("steps", [])
-                        self._subtask_idx = 0
-                    else:
-                        self.history.append({"role": "user",
-                            "content": "[Executor] All milestones complete. Give final answer."})
-                        self._milestones = []
+                        f"[Executor] {item['kind'].title()} — {item['title']}"})
+                elif self._execution_complete:
+                    self.history.append({"role": "user",
+                        "content": "[Executor] All planned work complete. Give final answer."})
+                    self._milestones = []
 
             if (i + 1) % 5 == 0:
                 matched_gen = search_generated_skills(
@@ -611,6 +668,8 @@ class PenzerAgent:
                 if text:
                     self.history.append({"role": "assistant", "content": text})
                     self._belief["goal_progress"] = "complete"
+                    if self._active_execution_item is not None:
+                        self._complete_current_execution_item(success=True)
                     return text
                 empty += 1
                 if empty >= 2:
@@ -706,6 +765,10 @@ class PenzerAgent:
                     fp = str(c.get("arguments", {}).get("filepath", ""))
                     if "skills/generated" in fp and fp.endswith(".skill.md"):
                         self._skills_dirty = True
+
+            if self._active_execution_item is not None:
+                any_success = any(t["success"] for t in self._trace[-len(filtered_calls):]) if filtered_calls else False
+                self._complete_current_execution_item(success=any_success)
 
             if (
                 self._novel_task
@@ -843,10 +906,8 @@ class PenzerAgent:
         skills_line   = f"ACTIVE SKILLS: {', '.join(self._matched_skills)}\n" if self._matched_skills else ""
         plan_line     = self._skill_plan_summary()
         subtask_line  = (
-            f"MILESTONE [{self._milestone_idx+1}/{len(self._milestones)}]: "
-            f"'{self._milestones[self._milestone_idx].get('milestone','') if self._milestone_idx < len(self._milestones) else ''}' "
-            f"— Step: {self._current_subtask}\n"
-        ) if self._current_subtask and self._milestones else ""
+            f"ACTIVE ITEM: {self._active_execution_item.get('title', self._current_subtask)}\n"
+        ) if self._active_execution_item else ""
         wm_line = self._working_mem_summary()
         status  = "✓ ok" if t["success"] else f"✗ {t['error_type']}"
         inj = (
