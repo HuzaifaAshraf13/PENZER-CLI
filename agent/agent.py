@@ -16,7 +16,7 @@ Implements:
   4.  Episodic replay         — compressed narrative of past similar runs
   5.  Reflexion + ExpeL       — post-mortem + insight extraction
   6.  Task completion eval    — did we actually solve it?
-  7.  Adaptive MAX_ITER       — complexity → 5/10/20 iterations
+  7.  Execution queue         — state machine for milestones → steps
   8.  Hierarchical planning   — milestones → steps, replan per branch
   9.  Tool confidence scoring — score before calling, skip if < 0.5
   10. Multi-skill orchestration — merged ordered plan across ALL skills
