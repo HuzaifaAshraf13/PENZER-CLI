@@ -16,6 +16,7 @@ Research-backed memory architecture:
 import json
 import math
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -59,6 +60,16 @@ DECAY_RATES = {
 
 # Spaced repetition intervals (hours)
 SR_INTERVALS = [1, 24, 72, 168, 336]
+
+_USER_FACT_PATTERNS = [
+    (r"\bmy name is\s+([A-Za-z][A-Za-z.-]+)\b", "user.name"),
+    (r"\bcall me\s+([A-Za-z][A-Za-z.-]+)\b", "user.name"),
+    (r"\bmy email(?: is|:)?\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", "user.email"),
+    (r"\bmy phone(?: is|:)?\s*([+()0-9 .-]{4,})", "user.phone"),
+    (r"\bmy (?:public )?ip(?: is|:)?\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", "user.ip"),
+    (r"\bmy preference(?: is|:)?\s*([^.!?]+)", "user.preference"),
+    (r"\bi prefer\s+([^.!?]+)", "user.preference"),
+]
 
 
 def _fresh() -> dict:
@@ -126,6 +137,23 @@ def _save(data: dict) -> None:
             json.dump(data, f, indent=2)
     except Exception as e:
         logger.error("Storage save: %s", e)
+
+
+def remember_user_facts(text: str) -> list[dict]:
+    """Extract simple user facts from natural language and store them in KV memory."""
+    if not text:
+        return []
+    stored = []
+    for pattern, key in _USER_FACT_PATTERNS:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            value = match.group(1).strip().rstrip(".?!")
+            if not value:
+                continue
+            if key == "user.preference":
+                value = value.strip()
+            kv_store(key, value)
+            stored.append({"key": key, "value": value})
+    return stored
 
 
 def save_last_run(snapshot: dict) -> None:
@@ -614,22 +642,23 @@ def get_relevant_kv_facts(query: str, n: int = 3) -> list[dict]:
     data = _load()
     items = []
     q = (query or "").lower()
-    query_tokens = set(q.split())
+    query_tokens = set(re.split(r"[^a-z0-9]+", q)) - {""}
     ip_keywords = {"ip", "address", "public", "external", "my", "what"}
 
     for key, entry in data.get("kv", {}).items():
         value = str(entry.get("value", ""))
         key_text = f"{key} {value}".lower()
+        key_tokens = set(re.split(r"[^a-z0-9]+", key_text)) - {""}
         score = 0.0
         if key.lower() in q:
             score += 0.8
         if q and value.lower() in q:
             score += 0.7
-        if any(token in key_text for token in ["ip", "address", "public"]):
+        if any(token in key_tokens for token in ["ip", "address", "public"]):
             score += 0.2
-        if query_tokens and any(token in key_text for token in query_tokens):
+        if query_tokens and (query_tokens & key_tokens):
             score += 0.3
-        if any(token in q for token in ip_keywords) and any(token in key_text for token in ip_keywords):
+        if any(token in q for token in ip_keywords) and any(token in key_tokens for token in ip_keywords):
             score += 0.4
         score += _relevance(key_text, q) * 0.6
         if score > 0.1:

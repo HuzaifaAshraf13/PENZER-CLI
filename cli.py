@@ -15,6 +15,7 @@ from rich.panel import Panel
 from logger import get_logger
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state
+from config import DEFAULT_PROFILE, PROFILE_OPTIONS, get_profile_settings
 
 logger = get_logger("cli")
 
@@ -122,8 +123,11 @@ def build_help_text() -> str:
         "• [cyan]apikey[/cyan]    Manage API credentials",
         "• [cyan]update[/cyan]    Check for updates",
         "• [cyan]state[/cyan]     Show current execution state",
+        "• [cyan]memory[/cyan]    Show saved facts and memory state",
         "• [cyan]checkpoints[/cyan] Show saved checkpoints",
         "• [cyan]resume[/cyan]    Resume last interrupted task",
+        "• [cyan]profile[/cyan]   Show or switch the current CLI profile",
+        "• [cyan]benchmark[/cyan]  Show a lightweight quality summary",
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
 
@@ -277,13 +281,20 @@ async def main():
                 continue
 
             if user_input.lower() == "plugins":
+                from tools.plugins import list_plugin_metadata
                 plugin_names = agent.list_plugin_tools()
+                metadata = list_plugin_metadata()
                 if plugin_names:
                     console.print("[white]Available plugin tools:[/white]")
                     for name in plugin_names:
                         console.print(f"  - {name}")
                 else:
                     console.print("[dim]No plugin tools available yet.[/dim]")
+                if metadata:
+                    console.print()
+                    console.print("[cyan]Plugin modules:[/cyan]")
+                    for entry in metadata:
+                        console.print(f"  - {entry['name']}: {', '.join(entry['functions']) or 'no functions'}")
                 continue
 
             if user_input.lower().startswith("apikey"):
@@ -300,6 +311,20 @@ async def main():
 
             if user_input.lower() == "state":
                 console.print(Panel(format_execution_state(), title="Execution State", border_style="yellow"))
+                continue
+
+            if user_input.lower() == "memory":
+                from session.memory import kv_list, load_history
+                console.print(Panel(
+                    "\n".join([
+                        "[bold]Stored facts[/bold]",
+                        kv_list(),
+                        "",
+                        f"[dim]Recent history entries: {len(load_history())}[/dim]",
+                    ]),
+                    title="Memory",
+                    border_style="magenta",
+                ))
                 continue
 
             if user_input.lower() == "checkpoints":
@@ -331,6 +356,42 @@ async def main():
                 response = await agent.resume_last_task()
                 console.print()
                 console.print(Markdown(clean_response(response or "No response.")))
+                continue
+
+            if user_input.lower().startswith("profile"):
+                parts = user_input.split()
+                if len(parts) > 1:
+                    profile = parts[1].lower()
+                    if profile in PROFILE_OPTIONS:
+                        os.environ["PENZER_PROFILE"] = profile
+                        console.print(f"[green]Profile set to {profile}[/green]")
+                    else:
+                        console.print(f"[yellow]Unknown profile. Choose from: {', '.join(PROFILE_OPTIONS)}[/yellow]")
+                else:
+                    current_profile = get_profile_settings()["name"]
+                    console.print(f"[cyan]Current profile:[/cyan] {current_profile}")
+                    for name, description in PROFILE_OPTIONS.items():
+                        console.print(f"  - {name}: {description}")
+                continue
+
+            if user_input.lower() == "benchmark":
+                from session.memory import load_history
+                history = load_history()
+                settings = get_profile_settings()
+                summary = {
+                    "history_entries": len(history),
+                    "profile": settings["name"],
+                    "memory_entries": len(history),
+                    "approval_required": settings["approval_required"],
+                }
+                console.print(Panel(
+                    f"History entries: {summary['history_entries']}\n"
+                    f"Profile: {summary['profile']}\n"
+                    f"Approval required: {summary['approval_required']}\n"
+                    f"Memory-backed context: enabled",
+                    title="Benchmark Summary",
+                    border_style="cyan",
+                ))
                 continue
 
             console.print()

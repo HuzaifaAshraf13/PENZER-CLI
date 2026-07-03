@@ -8,6 +8,7 @@ import subprocess
 from agent.core import mcp
 from tools.executor import execute, get_change_log
 from tools.standards import success, error, warning
+from config import get_profile_settings
 
 _cwd = os.getcwd()
 _SESSION_CWDS: dict[str, str] = {}
@@ -111,7 +112,7 @@ def _terminal_impl(
         timeout=timeout,
         workdir=effective_workdir,
         force=force,
-        approval_required=True,
+        approval_required=get_profile_settings().get("approval_required", True),
         confirmation_reason="This action may be destructive or sensitive.",
     )
 

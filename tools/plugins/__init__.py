@@ -34,6 +34,25 @@ def load_plugin_tools():
     return tools
 
 
+def list_plugin_metadata():
+    """Return lightweight metadata for discovered plugins for CLI inspection."""
+    metadata = []
+    for path in sorted(_PLUGIN_DIR.glob("*.py")):
+        if path.name.startswith("_") or path.name == "__init__.py":
+            continue
+        try:
+            module = importlib.import_module(f"tools.plugins.{path.stem}")
+            metadata.append({
+                "name": path.stem,
+                "module": module.__name__,
+                "functions": [name for name, obj in inspect.getmembers(module, inspect.isfunction)
+                              if getattr(obj, "__module__", "").startswith("tools.plugins")],
+            })
+        except Exception:
+            continue
+    return metadata
+
+
 def create_plugin_tool(name: str, description: str, code: str, *, module_name: str | None = None):
     """Create a plugin module file, register it, and expose it as a callable tool."""
     safe_name = (name or "plugin_tool").strip().replace("-", "_")

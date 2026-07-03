@@ -11,6 +11,8 @@ import resource
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 
+from config import get_profile_settings
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
@@ -70,7 +72,7 @@ def is_dangerous(command: str) -> tuple[bool, str]:
 
 def confirm_action(command: str, reason: str = "") -> bool:
     """Prompt the user for explicit approval before running a risky command."""
-    prompt = "This action may be destructive or sensitive. Approve execution? [y/N]: "
+    prompt = "Approve this command? [y/N]: "
     if reason:
         prompt = f"{reason}\n{prompt}"
     try:
@@ -107,7 +109,7 @@ def execute(
     workdir: Optional[str] = None,
     force: bool = False,
     venv_path: Optional[str] = None,
-    approval_required: bool = False,
+    approval_required: Optional[bool] = None,
     confirmation_reason: str = "",
     state: Optional[dict] = None,
 ) -> dict:
@@ -126,6 +128,9 @@ def execute(
         dict with stdout, stderr, exit_code, cwd, mode
     """
     global _cwd, _change_log, _exec_count
+
+    if approval_required is None:
+        approval_required = get_profile_settings().get("approval_required", True)
 
     if not command or not command.strip():
         return _error("No command provided")

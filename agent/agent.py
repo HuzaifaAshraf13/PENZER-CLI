@@ -36,7 +36,7 @@ from agent.llm import LLM
 from session.memory import (
     load_history, save_history, clear_history,
     remember_episodic, remember_semantic,
-    store_post_mortem, get_post_mortems,
+    remember_user_facts, store_post_mortem, get_post_mortems,
     get_relevant_memories, get_insights, store_insight,
     get_similar_trajectories, get_episode_replay,
     score_complexity, should_consolidate, consolidate_memory,
@@ -218,6 +218,13 @@ class PenzerAgent:
         self._matched_skills = snapshot.get("matched_skills", self._matched_skills)
         self._last_matched_skills = snapshot.get("last_matched_skills", self._last_matched_skills)
         self._system_prompt = snapshot.get("system_prompt", self._system_prompt)
+        self._subtasks = snapshot.get("subtasks", self._subtasks)
+        self._subtask_idx = snapshot.get("subtask_idx", self._subtask_idx)
+        self._milestone_idx = snapshot.get("milestone_idx", self._milestone_idx)
+        self._total_subtasks = snapshot.get("total_subtasks", self._total_subtasks)
+        self._current_subtask = snapshot.get("current_subtask", self._current_subtask)
+        self._execution_complete = snapshot.get("execution_complete", self._execution_complete)
+
         if self._resume_state:
             set_execution_state({"state": self._resume_state})
 
@@ -286,6 +293,7 @@ class PenzerAgent:
             self._max_iter = ITER_BY_COMPLEXITY["complex"]
 
         self.history.append({"role": "user", "content": user_input})
+        remember_user_facts(user_input)
 
         # Dual-tier memory retrieval
         past_memory        = get_relevant_memories(user_input, n=5, deep=self._is_complex_task)
@@ -819,7 +827,7 @@ class PenzerAgent:
             filtered_calls = []
             for c in calls:
                 conf = self._tool_confidence(c["name"], c.get("arguments", {}))
-                if conf < 0.4:
+                if conf < 0.5:
                     self.history.append({"role": "tool",
                         "tool_call_id": c.get("id", c["name"]),
                         "content": f"[Skipped] {c['name']} confidence {conf:.0%} too low. Try different approach."})

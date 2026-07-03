@@ -160,3 +160,39 @@ ENABLE_AUTO_SAVE = True
 ENABLE_SKILL_FILTERING = False  # Full LLM autonomy by default
 ENABLE_EXPERIMENTAL_FEATURES = False
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+# User-facing profiles for CLI ergonomics
+DEFAULT_PROFILE = os.getenv("PENZER_PROFILE", "balanced")
+PROFILE_OPTIONS = {
+    "balanced": "Balanced defaults for everyday use",
+    "safe": "Safer approvals and fewer risky actions",
+    "fast": "Faster execution with fewer confirmation prompts",
+}
+
+
+def get_profile_settings(profile_name: str | None = None) -> dict:
+    selected = (profile_name or os.getenv("PENZER_PROFILE", DEFAULT_PROFILE) or DEFAULT_PROFILE).lower()
+    if selected not in PROFILE_OPTIONS:
+        selected = DEFAULT_PROFILE
+    if selected == "safe":
+        return {
+            "name": selected,
+            "approval_required": True,
+            "confirm_destructive": True,
+            "confirm_sensitive": True,
+            "max_parallelism": 2,
+        }
+    if selected == "fast":
+        return {
+            "name": selected,
+            "approval_required": False,
+            "confirm_destructive": False,
+            "confirm_sensitive": False,
+            "max_parallelism": 4,
+        }
+    return {
+        "name": selected,
+        "approval_required": True,
+        "confirm_destructive": True,
+        "confirm_sensitive": True,
+        "max_parallelism": 3,
+    }
