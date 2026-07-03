@@ -131,16 +131,23 @@ def build_help_text() -> str:
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
 
+PENZER_LOGO = r"""
+ ____   _____   _   _   _____   _____   ____  
+|  _ \ | ____| | \ | | |__  / | ____| |  _ \ 
+| |_) ||  _|   |  \| |   / /  |  _|   | |_) |
+|  __/ | |___  | |\  |  / /_  | |___  |  _ < 
+|_|    |_____| |_| \_| /____| |_____| |_| \_\
+""".strip("\n")
 
 def display_banner():
+    console.print(f"[bold red]{PENZER_LOGO}")
     console.print(Panel(
-        "[bold white]PENZER[/bold white] [dim]autonomous terminal agent[/dim]\n"
-        "[cyan]Describe a task and the agent will work through it step by step.[/cyan]",
+        "[bold white]Autonomous Terminal Agent[/bold white]\n"
+        "[cyan]You're talking to something that plans[/cyan]\n"
+        f"[dim]v{get_version()} · type 'help' to get started[/dim]",
         border_style="red",
         padding=(0, 1),
     ))
-
-
 def display_help():
     console.print(Panel(build_help_text(), title="Help", border_style="cyan", padding=(0, 1)))
 
