@@ -39,6 +39,7 @@ MEMORY_FILES = {
     "checkpoints": MEMORY_DIR / "checkpoints.json",
     "consolidation": MEMORY_DIR / "consolidation.json",
 }
+LAST_RUN_PATH = STORAGE_DIR / "last_run.json"
 
 MAX_EPISODIC     = 300
 MAX_SEMANTIC     = 150
@@ -125,6 +126,34 @@ def _save(data: dict) -> None:
             json.dump(data, f, indent=2)
     except Exception as e:
         logger.error("Storage save: %s", e)
+
+
+def save_last_run(snapshot: dict) -> None:
+    try:
+        LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LAST_RUN_PATH, "w") as f:
+            json.dump(snapshot, f, indent=2)
+    except Exception as e:
+        logger.error("Save last run: %s", e)
+
+
+def load_last_run() -> dict | None:
+    if not LAST_RUN_PATH.exists():
+        return None
+    try:
+        with open(LAST_RUN_PATH) as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error("Load last run: %s", e)
+    return None
+
+
+def clear_last_run() -> None:
+    try:
+        if LAST_RUN_PATH.exists():
+            LAST_RUN_PATH.unlink()
+    except Exception as e:
+        logger.error("Clear last run: %s", e)
 
 
 # ── Decay ────────────────────────────────────────────────────

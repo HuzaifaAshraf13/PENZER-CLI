@@ -28,6 +28,14 @@ DANGEROUS_PATTERNS = [
     "iptables -F", "ufw disable",
 ]
 
+SENSITIVE_PATTERNS = [
+    "pip install", "pip3 install", "python -m pip install",
+    "apt install", "apt-get install", "yum install", "dnf install",
+    "brew install", "npm install", "curl -fsSL", "curl | bash",
+    "wget -qO-", "wget ", "git clone", "ssh ", "scp ", "rsync ",
+    "http://", "https://",
+]
+
 _cwd = os.getcwd()
 _change_log: list = []
 _exec_count: int = 0
@@ -70,6 +78,13 @@ def confirm_action(command: str, reason: str = "") -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
     return response in {"y", "yes"}
+
+
+def is_sensitive(command: str) -> bool:
+    for p in SENSITIVE_PATTERNS:
+        if p.lower() in command.lower():
+            return True
+    return False
 
 
 def _set_limits():
@@ -135,6 +150,18 @@ def execute(
                     return _warn(f"{reason} Execution cancelled by user.")
             else:
                 return _warn(f"{reason} Set force=True to run.")
+
+        sensitive = is_sensitive(command)
+        if sensitive and approval_required:
+            reason = "Sensitive or install-related command detected."
+            update_execution_state(
+                needs_confirmation=True,
+                confirmation_reason=reason,
+            )
+            if confirm_action(command, reason):
+                force = True
+            else:
+                return _warn(f"{reason} Execution cancelled by user.")
 
     # Resolve working directory
     cwd = workdir or _cwd

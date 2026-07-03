@@ -121,6 +121,9 @@ def build_help_text() -> str:
         "• [cyan]plugins[/cyan]   List available plugin tools",
         "• [cyan]apikey[/cyan]    Manage API credentials",
         "• [cyan]update[/cyan]    Check for updates",
+        "• [cyan]state[/cyan]     Show current execution state",
+        "• [cyan]checkpoints[/cyan] Show saved checkpoints",
+        "• [cyan]resume[/cyan]    Resume last interrupted task",
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
 
@@ -293,6 +296,41 @@ async def main():
                     console.print("[green]" + result.get("message", "Update complete") + "[/green]")
                 except Exception as exc:
                     console.print(f"[red]Update failed: {exc}[/red]")
+                continue
+
+            if user_input.lower() == "state":
+                console.print(Panel(format_execution_state(), title="Execution State", border_style="yellow"))
+                continue
+
+            if user_input.lower() == "checkpoints":
+                from session.memory import load_checkpoints
+                checkpoints = load_checkpoints()
+                if checkpoints:
+                    for idx, cp in enumerate(checkpoints, 1):
+                        console.print(f"[cyan]{idx}.[/cyan] {cp.get('goal','')} — {cp.get('belief','')} @ {cp.get('timestamp','')}")
+                else:
+                    console.print("[dim]No checkpoints saved yet.[/dim]")
+                continue
+
+            if user_input.lower() == "resume":
+                from session.memory import load_last_run
+                snapshot = load_last_run()
+                if not snapshot:
+                    console.print("[dim]No interrupted task to resume.[/dim]")
+                    continue
+                console.print(Panel(
+                    f"Last interrupted goal: [bold]{snapshot.get('goal','')}[/bold]\n"
+                    f"Current step: [bold]{snapshot.get('resume_state', {}).get('current_step','')}[/bold]\n"
+                    f"Blocked: [bold]{', '.join(snapshot.get('resume_state', {}).get('blocked_steps', [])) or 'none'}[/bold]",
+                    title="Resume Preview",
+                    border_style="green",
+                ))
+                if console.input("Resume this task? [y/N]: ").strip().lower() not in {"y", "yes"}:
+                    console.print("[dim]Resume cancelled.[/dim]")
+                    continue
+                response = await agent.resume_last_task()
+                console.print()
+                console.print(Markdown(clean_response(response or "No response.")))
                 continue
 
             console.print()

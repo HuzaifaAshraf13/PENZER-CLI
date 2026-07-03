@@ -43,6 +43,7 @@ from session.memory import (
     update_skill_metric, add_checkpoint,
     get_storage_summary, get_relevant_kv_facts,
     kv_store, kv_get, kv_list, kv_delete,
+    save_last_run, load_last_run, clear_last_run,
 )
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
@@ -201,6 +202,44 @@ class PenzerAgent:
         self.tools.setdefault("memory", "builtin")
         return self
 
+    def _restore_snapshot(self, snapshot: dict) -> None:
+        self._goal = snapshot.get("goal", self._goal)
+        self.history = snapshot.get("history", self.history)
+        self._trace = snapshot.get("trace", self._trace)
+        self._resume_state = snapshot.get("resume_state", self._resume_state)
+        self._milestones = snapshot.get("milestones", self._milestones)
+        self._execution_queue = snapshot.get("execution_queue", self._execution_queue)
+        self._execution_index = snapshot.get("execution_index", self._execution_index)
+        self._active_execution_item = snapshot.get("active_execution_item", self._active_execution_item)
+        self._belief = snapshot.get("belief", self._belief)
+        self._complexity_score = snapshot.get("complexity_score", self._complexity_score)
+        self._is_complex_task = snapshot.get("is_complex_task", self._is_complex_task)
+        self._max_iter = snapshot.get("max_iter", self._max_iter)
+        self._matched_skills = snapshot.get("matched_skills", self._matched_skills)
+        self._last_matched_skills = snapshot.get("last_matched_skills", self._last_matched_skills)
+        self._system_prompt = snapshot.get("system_prompt", self._system_prompt)
+        if self._resume_state:
+            set_execution_state({"state": self._resume_state})
+
+    async def resume_last_task(self) -> str:
+        snapshot = load_last_run()
+        if not snapshot:
+            return "No interrupted task to resume."
+        if snapshot.get("execution_queue") is None and snapshot.get("trace"):
+            return "No resumable execution state found."
+        self._restore_snapshot(snapshot)
+        self._goal = snapshot.get("goal", self._goal)
+        self._complexity_score = snapshot.get("complexity_score", self._complexity_score)
+        self._is_complex_task = snapshot.get("is_complex_task", self._is_complex_task)
+        self._max_iter = snapshot.get("max_iter", self._max_iter)
+        if self._complexity_score < 0.3:
+            self._max_iter = ITER_BY_COMPLEXITY["simple"]
+        elif self._complexity_score < 0.6:
+            self._max_iter = ITER_BY_COMPLEXITY["medium"]
+        else:
+            self._max_iter = ITER_BY_COMPLEXITY["complex"]
+        return await self._loop()
+
     def list_plugin_tools(self) -> list[str]:
         """Return sorted available plugin tool names."""
         return sorted((getattr(self, "_plugin_tools", {}) or {}).keys())
@@ -316,6 +355,7 @@ class PenzerAgent:
             "confirmation_reason": "",
         }
         set_execution_state({"state": self._resume_state})
+        self._persist_resume_snapshot()
 
         # Hierarchical planner for complex tasks
         if self._is_complex_task:
@@ -345,6 +385,8 @@ class PenzerAgent:
                 importance=min(1.0, len(self._trace) * 0.15),
                 task_type=user_input[:40],
             )
+
+        clear_last_run()
 
         if len(self._trace) >= COMPLEX_THRESHOLD:
             completed, eval_reason = await self._evaluate_completion(user_input, result)
@@ -412,6 +454,28 @@ class PenzerAgent:
         if ok and result and result != "(empty)":
             fact = f"{tool}: {result[:80]}"
             self._working_mem.append(fact)
+
+    def _persist_resume_snapshot(self) -> None:
+        try:
+            save_last_run({
+                "goal": self._goal,
+                "history": self.history,
+                "trace": self._trace,
+                "resume_state": self._resume_state,
+                "milestones": self._milestones,
+                "execution_queue": self._execution_queue,
+                "execution_index": self._execution_index,
+                "active_execution_item": self._active_execution_item,
+                "belief": self._belief,
+                "complexity_score": self._complexity_score,
+                "is_complex_task": self._is_complex_task,
+                "max_iter": self._max_iter,
+                "matched_skills": self._matched_skills,
+                "last_matched_skills": self._last_matched_skills,
+                "system_prompt": self._system_prompt,
+            })
+        except Exception:
+            pass
 
     def _working_mem_summary(self) -> str:
         if not self._working_mem: return ""
@@ -797,6 +861,7 @@ class PenzerAgent:
                 if not ok:
                     self._resume_state["blocked_steps"] = self._resume_state.get("blocked_steps", []) + [self._fmt_action(name, c.get("arguments", {}))]
                 set_execution_state({"state": self._resume_state})
+                self._persist_resume_snapshot()
 
                 if ok: self._consec_errors[name] = 0
                 else:  self._consec_errors[name] += 1
@@ -1267,6 +1332,7 @@ class PenzerAgent:
         self.history.clear()
         self._reset()
         clear_history()
+        clear_last_run()
 
     def get_metrics(self) -> dict:
         return {
