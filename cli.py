@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.panel import Panel
 from logger import get_logger
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state
@@ -112,21 +113,29 @@ def clean_response(text: str) -> str:
     return text.strip() or "Done."
 
 
+def build_help_text() -> str:
+    return "\n".join([
+        "[bold]Commands[/bold]",
+        "• [cyan]help[/cyan]      Show this help",
+        "• [cyan]clear[/cyan]     Clear the terminal",
+        "• [cyan]plugins[/cyan]   List available plugin tools",
+        "• [cyan]apikey[/cyan]    Manage API credentials",
+        "• [cyan]update[/cyan]    Check for updates",
+        "• [cyan]exit[/cyan]      Leave Penzer",
+    ])
+
+
 def display_banner():
-    console.print("[bold white on red]  PENZER  [/bold white on red] [dim]autonomous terminal agent[/dim]")
-    console.print("[cyan]Type your goal and let the agent work. Use [bold]help[/bold] for commands.[/cyan]")
+    console.print(Panel(
+        "[bold white]PENZER[/bold white] [dim]autonomous terminal agent[/dim]\n"
+        "[cyan]Describe a task and the agent will work through it step by step.[/cyan]",
+        border_style="red",
+        padding=(0, 1),
+    ))
 
 
 def display_help():
-    console.print("""
-[red bold]COMMANDS:[/red bold]
-  [white]help[/white]      - Show this help
-  [white]clear[/white]     - Clear screen
-  [white]plugins[/white]   - List available plugin tools
-  [white]apikey[/white]    - Add or update API credentials in .env
-  [white]update[/white]    - Check for and install updates
-  [white]exit[/white]      - Exit Penzer
-    """)
+    console.print(Panel(build_help_text(), title="Help", border_style="cyan", padding=(0, 1)))
 
 
 def maybe_notify_update() -> None:
@@ -236,7 +245,8 @@ async def main():
         with console.status("[red bold]Loading agent...[/red bold]", spinner="dots"):
             agent = await PenzerAgent().async_init()
 
-        console.print("[bold green]✓ Ready[/bold green]\n")
+        console.print("[bold green]✓ Ready[/bold green]")
+        console.print("[dim]Type a task or run [cyan]help[/cyan] for commands.[/dim]\n")
         maybe_notify_update()
 
         while True:
@@ -309,8 +319,9 @@ async def main():
 
             response = clean_response(response or "No response.")
 
-            console.print()
-            console.print(Markdown(response))
+            if response and response.strip():
+                console.print()
+                console.print(Markdown(response))
 
             matched = getattr(agent, "_matched_skills", [])
             trace = getattr(agent, "_trace", [])
