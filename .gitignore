@@ -80,7 +80,10 @@ agent_memory.json
 model/
 logs/
 
-# User-generated plugin tools and registry
-tools/plugins/
+# User-generated plugin tools (runtime-only, never commit)
+tools/plugins/*.py
 !tools/plugins/__init__.py
-.penzer/plugin_registry.json
+
+# Plugin registry and runtime state (local only)
+.penzer/
+!.penzer/memory/
