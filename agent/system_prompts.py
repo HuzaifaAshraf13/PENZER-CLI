@@ -9,11 +9,21 @@ Fixes:
 """
 import json
 import logging
+import re
 from typing import Optional, List
 
-from session.memory import get_skill_metric
+from session.memory import get_relevant_kv_facts, get_skill_metric
 
 logger = logging.getLogger(__name__)
+
+STOPWORDS = {
+    "about", "after", "all", "also", "and", "any", "are", "around", "before",
+    "best", "between", "but", "can", "check", "create", "does", "during", "each",
+    "for", "from", "give", "have", "how", "into", "its", "just", "make", "need",
+    "next", "not", "only", "onto", "over", "plan", "that", "the", "their", "then",
+    "there", "this", "through", "time", "to", "use", "using", "very", "what",
+    "when", "where", "which", "with", "would", "your", "you"
+}
 
 MAIN_SYSTEM_PROMPT = """\
 You are PENZER — a self-evolving autonomous agent with full system access.
@@ -80,7 +90,8 @@ retrieved from memory for THIS specific task, not generic advice:
 
 Use these BEFORE acting. If "Past Experience" says a tool failed last time
 for this kind of task, do not repeat that exact failure — try the alternative
-noted in "next_time".
+noted in "next_time". If a "Stored Facts" section is present and it contains a
+relevant fact, use it before asking the user again.
 
 ════════════════════════════════════════════════════════
 SKILL PROTOCOL — MANDATORY before any tool call
@@ -199,6 +210,22 @@ def _load_metrics(skill_name: str) -> dict:
         return {"success_count": 0, "failure_count": 0, "success_rate": 0.0}
 
 
+def _tokenize(text: str) -> set[str]:
+    if not text:
+        return set()
+    return {
+        token for token in re.findall(r"[a-z0-9_]+", text.lower())
+        if len(token) > 2 and token not in STOPWORDS
+    }
+
+
+def _skill_token_set(skill) -> set[str]:
+    tokens = set()
+    for field in [skill.name, skill.description, * (skill.keywords or [])]:
+        tokens.update(_tokenize(field))
+    return tokens
+
+
 def _fmt_core_skill(skill) -> str:
     tools    = ", ".join(skill.mcp_tools or []) or "none"
     behavior = (skill.agent_behavior or "").strip()
@@ -261,15 +288,52 @@ def _enrich(skills: List) -> None:
 
 
 def _rank(skills: List, goal: str) -> List:
-    """Rank by: keyword match + real success_rate + base priority."""
+    """Rank by task-language overlap, keyword match, and proven success rate."""
+    goal_tokens = _tokenize(goal)
+    if not goal_tokens:
+        return sorted(
+            skills,
+            key=lambda s: (
+                getattr(s, "priority", 0.5),
+                getattr(s, "success_rate", 0.0),
+            ),
+            reverse=True,
+        )
+
     def score(skill) -> float:
-        base = skill.priority
-        if any(k.lower() in goal.lower() for k in skill.keywords):
-            base += 0.3
-        # Use loaded success_rate — now real not 0
-        base += getattr(skill, "success_rate", 0.0) * 0.2
+        base = float(getattr(skill, "priority", 0.5))
+        skill_tokens = _skill_token_set(skill)
+        overlap = goal_tokens & skill_tokens
+
+        if overlap:
+            base += min(0.7, len(overlap) * 0.16)
+
+        keyword_hits = 0
+        for kw in skill.keywords or []:
+            if _tokenize(kw) & goal_tokens:
+                keyword_hits += 1
+        if keyword_hits:
+            base += min(0.4, keyword_hits * 0.12)
+
+        if any(token in goal_tokens for token in _tokenize(skill.name)):
+            base += 0.08
+
+        base += getattr(skill, "success_rate", 0.0) * 0.15
         return min(1.0, base)
+
     return sorted(skills, key=lambda s: score(s), reverse=True)
+
+
+def _format_kv_context(goal: str, memory_context: str = "") -> str:
+    facts = get_relevant_kv_facts(goal, n=3)
+    if not facts:
+        return memory_context
+    lines = ["## Stored Facts"]
+    for fact in facts:
+        lines.append(f"- {fact['key']}: {fact['value']}")
+    if memory_context:
+        return f"{memory_context}\n\n" + "\n".join(lines)
+    return "\n".join(lines)
 
 
 def build_system_prompt(
@@ -290,6 +354,10 @@ def build_system_prompt(
             "✅ PROVEN = battle-tested. Use by default.",
             "",
         ]
+        if ranked:
+            best = ranked[0]
+            skills_lines.append(f"Best fit for this task: {best.name} — {best.description}")
+            skills_lines.append("")
         for skill in ranked[:12]:
             skills_lines.append(_fmt_core_skill(skill))
 
@@ -309,7 +377,9 @@ def build_system_prompt(
     prompt = MAIN_SYSTEM_PROMPT.replace("{{SKILLS_BLOCK}}", block)
 
     if memory_context:
-        prompt += f"\n\n{memory_context}"
+        prompt += f"\n\n{_format_kv_context(goal, memory_context)}"
+    elif goal:
+        prompt += f"\n\n{_format_kv_context(goal)}"
 
     if extra:
         prompt += f"\n\n## CONTEXT\n{extra}"

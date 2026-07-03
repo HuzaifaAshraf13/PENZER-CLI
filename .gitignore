@@ -57,3 +57,30 @@ agent_memory.json
 .penzer.json
 .penzer/
 generated/
+
+# Project planning / local docs
+project.md
+roadmap.md
+*.local.md
+notes/
+
+# Test / local runtime artifacts
+.coverage
+.pytest_cache/
+htmlcov/
+coverage.xml
+
+# Local session / memory data
+.penzer/
+.penzer_session.json
+session.json
+agent_memory.json
+
+# Local model / tool cache
+model/
+logs/
+
+# User-generated plugin tools and registry
+tools/plugins/
+!tools/plugins/__init__.py
+.penzer/plugin_registry.json

@@ -10,10 +10,31 @@ from tools.executor import execute, get_change_log
 from tools.standards import success, error, warning
 
 _cwd = os.getcwd()
+_SESSION_CWDS: dict[str, str] = {}
 
 
-@mcp.tool()
-def terminal(
+def _resolve_workdir(session_id: str | None, workdir: str | None) -> str:
+    if workdir:
+        target = os.path.abspath(os.path.expanduser(workdir))
+        if session_id:
+            _SESSION_CWDS[session_id] = target
+        return target
+
+    if session_id and session_id in _SESSION_CWDS:
+        return _SESSION_CWDS[session_id]
+
+    return _cwd
+
+
+def _set_session_workdir(session_id: str | None, target: str) -> None:
+    if session_id:
+        _SESSION_CWDS[session_id] = target
+    else:
+        global _cwd
+        _cwd = target
+
+
+def _terminal_impl(
     command: str = None,
     code: str = None,
     script: str = None,
@@ -22,6 +43,7 @@ def terminal(
     workdir: str = None,
     force: bool = False,
     background: bool = False,
+    session_id: str = None,
 ) -> dict:
     """
     Unified execution tool. Use for any terminal, bash, or Python execution.
@@ -35,15 +57,14 @@ def terminal(
         workdir: Working directory override
         force: Bypass dangerous command check
         background: Run detached in background, returns pid
+        session_id: Reuse a working directory and context across related calls
 
     Examples:
         terminal(command="ls -la")
-        terminal(code="import os; print(os.getcwd())")
-        terminal(script="#!/bin/bash\\napt update\\napt install -y curl")
-        terminal(command="python3 app.py", background=True)
+        terminal(code="from pathlib import Path; Path('demo.txt').write_text('hello')")
+        terminal(script="#!/bin/bash\\nmkdir -p build\\necho done")
+        terminal(command="python3 app.py", background=True, session_id="app")
     """
-    global _cwd
-
     # Auto-detect what was passed
     if code is not None:
         payload = code
@@ -60,29 +81,64 @@ def terminal(
     if not payload.strip():
         return error("Empty input provided")
 
-    # Handle cd — persist working directory
+    effective_workdir = _resolve_workdir(session_id, workdir)
+
+    # Handle cd — persist working directory per session
     if mode == "bash" and payload.strip().startswith("cd "):
-        target = os.path.normpath(os.path.join(_cwd, os.path.expanduser(payload.strip()[3:].strip())))
+        target = os.path.normpath(os.path.join(effective_workdir, os.path.expanduser(payload.strip()[3:].strip())))
         if not os.path.isdir(target):
             return error(f"No such directory: {target}")
-        _cwd = target
-        return success(data={"cwd": _cwd})
+        _set_session_workdir(session_id, target)
+        return success(data={"cwd": target, "session_id": session_id})
 
     # Background process
     if background or timeout == 0:
         try:
             proc = subprocess.Popen(
                 ["bash", "-c", payload],
-                cwd=workdir or _cwd,
+                cwd=effective_workdir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            return success(data={"pid": proc.pid, "mode": "background"})
+            return success(data={"pid": proc.pid, "mode": "background", "cwd": effective_workdir, "session_id": session_id})
         except Exception as e:
             return error(str(e))
 
-    return execute(payload, mode=mode, timeout=timeout, workdir=workdir or _cwd, force=force)
+    return execute(
+        payload,
+        mode=mode,
+        timeout=timeout,
+        workdir=effective_workdir,
+        force=force,
+        approval_required=True,
+        confirmation_reason="This action may be destructive or sensitive.",
+    )
+
+
+@mcp.tool()
+def terminal(
+    command: str = None,
+    code: str = None,
+    script: str = None,
+    mode: str = "bash",
+    timeout: int = 60,
+    workdir: str = None,
+    force: bool = False,
+    background: bool = False,
+    session_id: str = None,
+) -> dict:
+    return _terminal_impl(
+        command=command,
+        code=code,
+        script=script,
+        mode=mode,
+        timeout=timeout,
+        workdir=workdir,
+        force=force,
+        background=background,
+        session_id=session_id,
+    )
 
 
 @mcp.tool()

@@ -1,15 +1,14 @@
 ---
 skill_id: core.memory
 name: Memory Manager
-description: Store and retrieve simple facts via the built-in key-value memory tool. Separate from your automatic episodic/semantic memory.
-keywords: [memory, store, remember, retrieve, fact, save, forget, recall, key, value]
+description: Retrieve or store durable user facts and follow-up context with the built-in memory tool; use it for things like IPs, preferences, paths, and prior answers.
+keywords: [memory, store, remember, retrieve, fact, save, forget, recall, key, value, preference, ip, address, public, project, path, config, env, name, email, phone]
 mcp_tools: [memory]
 agent_behavior: |
   WHAT THIS TOOL IS
-    A simple key-value store, NOT your automatic episodic/semantic memory.
-    Episodic and semantic memory update automatically after every task —
-    you never call a tool for that. This "memory" tool is only for facts
-    the user explicitly wants saved under a specific key, on demand.
+    A structured key-value store for facts the user explicitly wants kept.
+    It is separate from automatic episodic and semantic memory, which the agent
+    updates itself and persists in .penzer/memory/ using split JSON files.
 
   ACTIONS (exact syntax — only these four)
     get    → {"tool": "memory", "args": {"action": "get", "key": "..."}}
@@ -18,34 +17,37 @@ agent_behavior: |
     delete → {"tool": "memory", "args": {"action": "delete", "key": "..."}}
 
   BEFORE ACTING — CHECK MEMORY FIRST
-    When: user references something prior · need env context · familiar task
+    When: user references something prior · needs env context · repeats a familiar task
+          · asks for a fact like "my IP" or "my name" · asks to remember something
     How: memory · get · <key>  (or memory · list if key unknown)
-    Hit  → use it, skip re-doing the work
+    Hit  → reuse it and avoid redoing work
     Miss → proceed normally
 
   AFTER SOLVING — STORE IF EXPLICITLY USEFUL
-    When: user says "remember this" · a fact they'll need again (path, config,
-          credential reference, preference) · NOT for general task outcomes
-          (those go to episodic memory automatically)
+    When: the user says "remember this" · a durable fact will be needed again
+          (path, config, preference, command, credential reference) · not for
+          routine task outcomes, which go to automatic episodic/semantic memory
     How: memory · store · <key> · <value>
-    Key   : descriptive snake_case — wifi_scan_cmd · user_os · project_path
-    Value : the actual fact, concise — not a full sentence essay
+    Key   : descriptive snake_case — project_path · user_os · wifi_scan_cmd
+    Value : concise and durable — not a full essay
 
   FORGET — DELETE WHEN STALE
     When: user explicitly asks · info is wrong or outdated · replaced by better data
     How: memory · delete · <key>
 
   HARD RULES
-    - Never ask the user for info you could retrieve from memory
+    - Never ask the user for information you can retrieve from memory
     - Never repeat work you have a stored solution for
-    - Do NOT use this tool to log task outcomes — that happens automatically
-      via episodic/semantic memory after every run
+    - Do NOT use this tool to log routine task outcomes; that happens automatically
+      via episodic and semantic memory after each run
     - Check memory before any task that references "last time" / "remember" / "as before"
-priority: 0.95
+    - Treat this as the explicit, user-owned memory channel for durable facts
+priority: 0.96
 core: true
-version: "4.0"
+version: "5.0"
 ---
 # Memory Manager
-Simple key-value store for explicit facts. get / store / list / delete — exact actions only.
-Your episodic and semantic memory already runs automatically; this tool is just for
-on-demand facts the user wants saved under a name.
+Use the memory tool for explicit, durable facts that the user wants to keep.
+Automatic episodic and semantic memory runs separately and is stored under
+.penzer/memory. Use get / store / list / delete only when appropriate, and avoid
+using this tool for routine task logging.

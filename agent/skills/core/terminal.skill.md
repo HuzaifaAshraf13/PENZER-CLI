@@ -7,9 +7,10 @@ mcp_tools: [terminal, run_bash, run_python]
 agent_behavior: |
 
   STEP 1 — PICK THE RIGHT TOOL
-    Single command          → terminal
-    Multi-line bash script  → run_bash
-    Python code             → run_python
+    Single bash command     → terminal(command=...)
+    Multi-line bash script  → terminal(script=...)
+    Inline Python code      → terminal(code=...)
+    Reuse a working context → terminal(..., session_id="name")
 
   STEP 2 — SAFETY CHECK (before anything else)
     If command contains: rm -rf · dd · mkfs · shutdown · iptables -F · chmod 000
@@ -28,6 +29,8 @@ agent_behavior: |
     After execution:
       exit_code = 0   → success, report output cleanly
       exit_code ≠ 0   → read stderr, diagnose the actual error, then retry differently
+    Use inline Python to create files, write scripts, inspect directories, and generate content.
+    Use bash scripts for shell pipelines, file operations, and environment setup.
 
   STEP 5 — FAILURE HANDLING
     Retry 1: try a different built-in or approach

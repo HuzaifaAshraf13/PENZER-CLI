@@ -1,23 +1,185 @@
 
 # Penzer
 
-Penzer is a local cognitive shell built for AI-powered terminal workflows, autonomous reasoning, and self-evolving task execution.
+Penzer is a local AI terminal assistant that can reason through tasks, use tools, remember what it learns, and grow its own skillset over time.
+
+It is designed for users who want an interactive shell agent that can help with coding, automation, investigation, and repeatable terminal workflows.
+
+> Local-first, agentic, and surprisingly capable.
 
 ---
 
-# Features
+## ✨ Highlights
 
-- **Autonomous Agentic Loop** — Penzer reasons, acts, and observes in a continuous loop with iteration caps and retry logic
-- **Self-Building Skills** — Penzer creates, stores, retrieves, and refines its own skills at runtime — no prebuilt skills
-- **Memory Persistence** — context and learnings persist across sessions via the memory MCP tool
-- **Terminal Control** — full system access via the terminal MCP tool with safety checks, validation, and rollback
-- **Self-Evolution** — Penzer audits its own skill library, detects gaps, and autonomously builds new capabilities
-- **Session Persistence** — sessions saved and resumed via `.penzer_session.json`
-- **Streaming Output** — real-time output during execution
+- **Autonomous task execution** — plan, act, observe, and retry
+- **Persistent memory** — retain useful context across sessions
+- **Runtime skill growth** — create and reuse helper tools
+- **Terminal control** — run shell commands with built-in safety checks
+- **Plugin support** — turn repeated workflows into reusable helpers
 
 ---
 
-# Installation
+## 🚀 Quick start
+
+### 1. Install Penzer
+
+Clone the repository and run the installer:
+
+```bash
+git clone https://github.com/HuzaifaAshraf13/PENZER-CLI
+cd PENZER-CLI
+chmod +x setup.sh
+./setup.sh
+```
+
+The installer sets up the project environment and installs a `penzer` launcher so you can run it from your terminal.
+
+If the command is not found, restart your terminal or run:
+
+```bash
+source ~/.bashrc
+```
+
+### 2. Start Penzer
+
+```bash
+penzer
+```
+
+You should see the Penzer banner and a prompt like `>>>`.
+
+### 3. Configure your model
+
+You can use either a local model server or a cloud API.
+
+### Option A: Cloud API
+
+Create a `.env` file in the project root:
+
+```bash
+touch .env
+```
+
+Then add:
+
+```env
+API_KEY="your-api-key-here"
+URL="your-api-url-here"
+```
+
+### Option B: Local model server
+
+If you run a local server such as Ollama, llama.cpp, vLLM, or LM Studio, add:
+
+```env
+LOCAL_SERVER_URL="http://localhost:8000"
+```
+
+If both cloud and local settings are present, Penzer will ask which one to use.
+
+### 4. Set credentials from inside Penzer
+
+You can also manage credentials directly inside the CLI:
+
+```text
+apikey show
+apikey set <API_KEY> <URL>
+apikey local <LOCAL_SERVER_URL>
+```
+
+Example:
+
+```bash
+apikey set your-api-key https://api.openai.com/v1
+```
+
+---
+
+## ⌨️ Main commands inside Penzer
+
+```text
+help          Show help
+clear         Clear the screen
+plugins       List available runtime plugin tools
+apikey show   Show current API settings from .env
+apikey set    Set cloud API credentials
+apikey local  Set a local model server URL
+update        Check for updates
+exit          Exit Penzer
+```
+
+---
+
+## 🧩 Plugin tools
+
+Penzer can create and reuse lightweight plugin helpers at runtime.
+
+To see what plugins are available:
+
+```bash
+plugins
+```
+
+Generated plugins are stored under `tools/plugins/`, and their registry is kept in `.penzer/plugin_registry.json`.
+
+---
+
+## 🗂️ Project structure
+
+```text
+PENZER-CLI/
+├── cli.py                   # Main CLI entry point
+├── setup.py                 # Package setup
+├── setup.sh                 # Installer script
+├── requirements.txt         # Python dependencies
+├── .env                     # API credentials
+├── agent/                   # Agent orchestration and prompts
+├── session/                 # Memory and persistence
+├── tools/                   # Built-in tools and plugin support
+└── logs/                    # Runtime logs
+```
+
+---
+
+## 🧠 How it works
+
+1. You enter a task or goal.
+2. Penzer reasons about the best next step.
+3. It selects tools, skills, or plugins to act.
+4. It executes, observes the result, and adapts.
+5. It stores useful lessons for later tasks.
+
+```text
+User goal → Reasoning → Tool use → Observation → Memory
+```
+
+---
+
+## 🛠️ Troubleshooting
+
+If `penzer` does not start, try:
+
+```bash
+source ~/.bashrc
+penzer
+```
+
+If you want to reconfigure model access, use:
+
+```bash
+apikey show
+apikey set <API_KEY> <URL>
+```
+
+---
+
+## 👤 Author
+
+Huzaifa Ashraf
+
+---
+
+## ⚙️ Installation
 
 Clone the repository:
 
@@ -26,6 +188,8 @@ git clone https://github.com/HuzaifaAshraf13/PENZER-CLI
 cd PENZER-CLI
 ```
 
+### Recommended install (system-wide user install)
+
 Run the installer:
 
 ```bash
@@ -33,20 +197,30 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-Or manually set up a virtual environment:
+This script updates package sources, installs required system dependencies, and installs Penzer in editable mode so the `penzer` command becomes available in your user environment.
+
+If the command is not found immediately, restart your terminal or run:
+
+```bash
+source ~/.bashrc
+```
+
+### Local virtual environment install
+
+If you prefer to keep everything inside the repository, use:
 
 ```bash
 python -m venv env
-source env/bin/activate  # Windows: env\Scripts\activate
+source env/bin/activate  
 pip install -r requirements.txt
 pip install -e .
 ```
 
 ---
 
-# Configuration
+## ⚙️ Configuration
 
-## Cloud API
+### Cloud API
 
 Create a `.env` file in the project root:
 
@@ -61,7 +235,7 @@ API_KEY="your-api-key-here"
 URL="your-api-url-here"
 ```
 
-## Local Server
+### Local Server
 
 If you want to run Penzer with a local model server (llama.cpp, vLLM, ollama, LM Studio):
 
@@ -86,22 +260,75 @@ Multiple model sources detected. Choose which to use:
 
 ---
 
-# Running Penzer
+## ▶️ Running Penzer
+
+After installation, start the CLI with:
 
 ```bash
 penzer
 ```
 
-If the command is not found:
+Inside the REPL, you can use the following built-in commands:
+
+```text
+help          Show available commands
+clear         Clear the screen
+plugins       List available runtime plugin tools
+apikey show   Show current API settings from .env
+apikey set    Set cloud API credentials
+apikey local  Set a local model server URL
+update        Check for updates
+exit          Exit Penzer
+```
+
+Example:
 
 ```bash
-source ~/.bashrc
-penzer
+apikey set your-api-key https://api.openai.com/v1
 ```
 
 ---
 
-# How It Works
+# Plugin tools
+
+Penzer can create and reuse lightweight plugin helpers at runtime. Use the built-in CLI command to inspect available plugins:
+
+```bash
+plugins
+```
+
+Generated plugins live under `tools/plugins/`, and the registry is persisted in `.penzer/plugin_registry.json`.
+
+---
+
+## 🔐 API key management
+
+Penzer supports in-CLI API credential management via the `apikey` command. This updates the local `.env` file in the project root.
+
+```bash
+apikey show
+apikey set <API_KEY> <URL>
+apikey local <LOCAL_SERVER_URL>
+```
+
+Example:
+
+```bash
+apikey set mykey https://api.openai.com/v1
+```
+
+The command writes values into `.env` like:
+
+```env
+API_KEY="your-api-key-here"
+URL="your-api-url-here"
+```
+
+Use `apikey show` to verify current credentials.
+
+---
+
+## 🧠 How It Works
 
 ```
 User enters a task
@@ -120,7 +347,7 @@ Next similar task → skill already exists
 
 ---
 
-# Project Structure
+## 🗂️ Project Structure
 
 ```
 PENZER-CLI/

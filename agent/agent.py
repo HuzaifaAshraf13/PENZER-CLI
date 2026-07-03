@@ -26,7 +26,7 @@ Implements:
   14. Proactive compression   — goal-aware trim with concurrency lock
   15. Memory consolidation    — episodic → semantic on schedule
 """
-import json, logging, inspect, asyncio, signal, time, psutil, random
+import json, logging, inspect, asyncio, signal, time, psutil, random, re
 from typing import Any, Callable
 from datetime import datetime
 from collections import defaultdict, deque
@@ -41,11 +41,13 @@ from session.memory import (
     get_similar_trajectories, get_episode_replay,
     score_complexity, should_consolidate, consolidate_memory,
     update_skill_metric, add_checkpoint,
-    get_storage_summary,
+    get_storage_summary, get_relevant_kv_facts,
     kv_store, kv_get, kv_list, kv_delete,
 )
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
+from tools.plugins import create_plugin_tool, load_plugin_tools
+from tools.executor import get_execution_state, update_execution_state, set_execution_state
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,8 @@ class PenzerAgent:
         self._shutdown      = False
         self._backoff       = 1.0
         self._rate_attempts = 0
+        self._resume_state  = {}
+        self._plugin_tools  = load_plugin_tools()
 
         signal.signal(signal.SIGINT, self._handle_shutdown)
 
@@ -197,6 +201,35 @@ class PenzerAgent:
         self.tools.setdefault("memory", "builtin")
         return self
 
+    def list_plugin_tools(self) -> list[str]:
+        """Return sorted available plugin tool names."""
+        return sorted((getattr(self, "_plugin_tools", {}) or {}).keys())
+
+    def _looks_like_memory_query(self, query: str) -> bool:
+        q = query.lower()
+        if any(cue in q for cue in (
+            "remember", "memory", "recall", "stored", "last time", "as before",
+            "what do you know", "what did you", "my ", "me ", "preference",
+            "path", "project", "config", "env", "ip", "address", "name",
+            "email", "phone",
+        )):
+            return True
+        return False
+
+    def _match_core_skills(self, user_input: str) -> list:
+        lowered = user_input.lower()
+        matched = []
+        facts = get_relevant_kv_facts(user_input, n=3)
+        for skill in self.core_skills:
+            skill_name = (skill.name or "").lower()
+            keyword_hit = any(k.lower() in lowered for k in skill.keywords or [])
+            if keyword_hit:
+                matched.append(skill)
+                continue
+            if "memory" in skill_name and (facts or self._looks_like_memory_query(lowered)):
+                matched.append(skill)
+        return matched
+
     # ── Public ──────────────────────────────────────────────────────────────────
 
     async def run(self, user_input: str) -> str:
@@ -228,10 +261,7 @@ class PenzerAgent:
             user_input, self.gen_skills,
             context=build_context_from_history(self.history),
         )
-        matched_core = [
-            s for s in self.core_skills
-            if any(k.lower() in user_input.lower() for k in s.keywords)
-        ]
+        matched_core = self._match_core_skills(user_input)
         self._active_skills       = matched_core + list(matched_gen)
         self._matched_skills      = [s.name for s in self._active_skills]
         self._last_matched_skills = self._matched_skills
@@ -276,6 +306,16 @@ class PenzerAgent:
             extra=skills_hint + insight_hint + mortem_hint,
             goal=user_input,
         )
+        self._resume_state = {
+            "goal": user_input,
+            "current_step": "Start",
+            "completed_steps": [],
+            "blocked_steps": [],
+            "next_action": "Reason about the next tool call",
+            "needs_confirmation": False,
+            "confirmation_reason": "",
+        }
+        set_execution_state({"state": self._resume_state})
 
         # Hierarchical planner for complex tasks
         if self._is_complex_task:
@@ -729,6 +769,15 @@ class PenzerAgent:
 
             # Speculative execution for independent subtasks
             results = await self._run_speculative(filtered_calls)
+            if any(self._is_error(raw) for raw, _ in results):
+                fallback_results = []
+                for call, (raw, elapsed) in zip(filtered_calls, results):
+                    if self._is_error(raw):
+                        fb_raw, fb_elapsed = await self._run_with_fallback(call)
+                        fallback_results.append((fb_raw, fb_elapsed))
+                    else:
+                        fallback_results.append((raw, elapsed))
+                results = fallback_results
 
             for c, (raw, elapsed) in zip(filtered_calls, results):
                 name  = c["name"]
@@ -742,6 +791,12 @@ class PenzerAgent:
                     "success": ok, "error_type": etype,
                     "elapsed_sec": elapsed,
                 })
+                self._resume_state["current_step"] = self._fmt_action(name, c.get("arguments", {}))
+                self._resume_state["completed_steps"] = self._resume_state.get("completed_steps", []) + [self._fmt_action(name, c.get("arguments", {}))]
+                self._resume_state["next_action"] = "Continue to the next step if needed"
+                if not ok:
+                    self._resume_state["blocked_steps"] = self._resume_state.get("blocked_steps", []) + [self._fmt_action(name, c.get("arguments", {}))]
+                set_execution_state({"state": self._resume_state})
 
                 if ok: self._consec_errors[name] = 0
                 else:  self._consec_errors[name] += 1
@@ -754,6 +809,9 @@ class PenzerAgent:
 
                 if ok and self._skill_plan:
                     self._mark_skill_step_done(name)
+
+                if ok and name == "terminal" and self._maybe_auto_create_plugin():
+                    self.history.append({"role": "user", "content": "[Auto-plugin] Repeated terminal workflow detected; created a reusable plugin tool."})
 
                 self.history.append({
                     "role": "tool",
@@ -873,6 +931,30 @@ class PenzerAgent:
 
         return results
 
+    def _fallback_tool(self, tool_name: str) -> str | None:
+        return FALLBACKS.get(tool_name)
+
+    async def _run_with_fallback(self, call: dict) -> tuple[str, float]:
+        name = call.get("name")
+        if not name:
+            return "No tool name provided", 0.0
+
+        results = await self._run_parallel([call])
+        raw, elapsed = results[0] if results else ("", 0.0)
+        if raw and not self._is_error(raw):
+            return raw, elapsed
+
+        fallback = self._fallback_tool(name)
+        if fallback and fallback in self.tools:
+            self.on_status(f"Fallback → {fallback}…")
+            fb_call = {**call, "name": fallback}
+            fb_results = await self._run_parallel([fb_call])
+            fb_raw, fb_elapsed = fb_results[0] if fb_results else ("", 0.0)
+            if fb_raw and not self._is_error(fb_raw):
+                return fb_raw, fb_elapsed
+            return fb_raw, fb_elapsed
+        return raw, elapsed
+
     async def _run_parallel(self, calls: list) -> list[tuple[str, float]]:
         async def run_one(c: dict) -> tuple[str, float]:
             name  = c["name"]
@@ -943,8 +1025,16 @@ class PenzerAgent:
     # ── Tool execution ───────────────────────────────────────────────────────────
 
     async def _run(self, name: str, args: dict) -> str:
-        if name == "memory" or self.tools.get(name) == "builtin":
+        tools = getattr(self, "tools", {}) or {}
+        if name == "memory" or tools.get(name) == "builtin":
             return self._run_memory_tool(args)
+        if name == "plugin_tool":
+            return self._run_plugin_tool(args)
+        if name in self._plugin_tools:
+            try:
+                return str(self._plugin_tools[name](**args))
+            except Exception as e:
+                return f"Plugin error: {e}"
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
         if key in self._cache:
             return self._cache[key]
@@ -981,6 +1071,73 @@ class PenzerAgent:
         if action == "list":   return kv_list()
         if action == "delete": return kv_delete(key)
         return f"Unknown memory action '{action}'. Use: get, store, list, delete"
+
+    def _maybe_auto_create_plugin(self) -> bool:
+        """Reuse an existing plugin when possible; otherwise create one for a repeated terminal workflow."""
+        if not getattr(self, "_trace", None):
+            return False
+
+        repeated = []
+        for item in self._trace:
+            tool = item.get("tool")
+            args = item.get("args") or {}
+            if tool == "terminal" and item.get("success"):
+                command = str(args.get("command", "")).strip()
+                if command:
+                    repeated.append(command)
+
+        if len(repeated) < 2:
+            return False
+
+        counts = {}
+        for command in repeated:
+            counts[command] = counts.get(command, 0) + 1
+
+        recurring = [cmd for cmd, count in counts.items() if count >= 2]
+        if not recurring:
+            return False
+
+        command = recurring[0]
+        if command in {""}:
+            return False
+
+        slug = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
+        name = slug[:40]
+        existing_tools = getattr(self, "_plugin_tools", {}) or {}
+        if name in existing_tools:
+            return True
+
+        description = f"Reusable helper for: {command[:80]}"
+        code = (
+            "import subprocess\n\n"
+            f"def {name}(**kwargs):\n"
+            f"    return subprocess.check_output({command!r}, shell=True, text=True)"
+        )
+        try:
+            create_plugin_tool(name=name, description=description, code=code)
+            self._plugin_tools = load_plugin_tools()
+            return name in self._plugin_tools
+        except Exception:
+            return False
+
+    def _run_plugin_tool(self, args: dict) -> str:
+        action = (args.get("action") or "").strip().lower()
+        if action == "create":
+            name = str(args.get("name", "")).strip()
+            description = str(args.get("description", "")).strip()
+            code = str(args.get("code", "")).strip()
+            if not name or not code:
+                return "Plugin creation requires a name and code"
+            try:
+                result = create_plugin_tool(name=name, description=description or "Generated plugin", code=code)
+            except Exception as exc:
+                return f"Plugin creation failed: {exc}"
+            self._plugin_tools = load_plugin_tools()
+            tool_name = result.get("name", name)
+            if tool_name in self._plugin_tools:
+                return f"Plugin created successfully: {tool_name}"
+            return f"Plugin created but not yet available: {tool_name}"
+        return "Unknown plugin action"
 
     # ── Output ───────────────────────────────────────────────────────────────────
 

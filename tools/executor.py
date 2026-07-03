@@ -9,6 +9,7 @@ import subprocess
 import logging
 import resource
 from typing import Optional
+from dataclasses import dataclass, field, asdict
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,21 @@ _cwd = os.getcwd()
 _change_log: list = []
 _exec_count: int = 0
 _exec_budget: int = 100  # max executions per session
+_execution_state: dict = {}
+
+
+@dataclass
+class ExecutionState:
+    goal: str = ""
+    current_step: str = ""
+    completed_steps: list[str] = field(default_factory=list)
+    blocked_steps: list[str] = field(default_factory=list)
+    next_action: str = ""
+    needs_confirmation: bool = False
+    confirmation_reason: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 # ─────────────────────────────────────────
@@ -42,6 +58,18 @@ def is_dangerous(command: str) -> tuple[bool, str]:
         if p.lower() in command.lower():
             return True, p
     return False, ""
+
+
+def confirm_action(command: str, reason: str = "") -> bool:
+    """Prompt the user for explicit approval before running a risky command."""
+    prompt = "This action may be destructive or sensitive. Approve execution? [y/N]: "
+    if reason:
+        prompt = f"{reason}\n{prompt}"
+    try:
+        response = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return response in {"y", "yes"}
 
 
 def _set_limits():
@@ -64,6 +92,9 @@ def execute(
     workdir: Optional[str] = None,
     force: bool = False,
     venv_path: Optional[str] = None,
+    approval_required: bool = False,
+    confirmation_reason: str = "",
+    state: Optional[dict] = None,
 ) -> dict:
     """
     Unified executor for bash commands and Python code.
@@ -92,7 +123,18 @@ def execute(
     if not force:
         dangerous, pattern = is_dangerous(command)
         if dangerous:
-            return _warn(f"Dangerous pattern '{pattern}' detected. Set force=True to run.")
+            reason = f"Dangerous pattern '{pattern}' detected."
+            if approval_required:
+                update_execution_state(
+                    needs_confirmation=True,
+                    confirmation_reason=reason,
+                )
+                if confirm_action(command, reason):
+                    force = True
+                else:
+                    return _warn(f"{reason} Execution cancelled by user.")
+            else:
+                return _warn(f"{reason} Set force=True to run.")
 
     # Resolve working directory
     cwd = workdir or _cwd
@@ -104,6 +146,9 @@ def execute(
         cmd = [python_bin, "-c", command]
     else:
         cmd = ["bash", "-c", command]
+
+    if state:
+        set_execution_state(state)
 
     logger.info(f"executor[{mode}][{cwd}]: {command[:150]}")
 
@@ -147,6 +192,11 @@ def execute(
             "exec_count": _exec_count,
         }
 
+        update_execution_state(
+            needs_confirmation=False,
+            confirmation_reason="",
+        )
+
         return _success(data) if proc.returncode == 0 else _warn_data(data, f"Exit code {proc.returncode}")
 
     except subprocess.TimeoutExpired:
@@ -181,9 +231,52 @@ def set_exec_budget(budget: int) -> None:
 
 
 def reset() -> None:
-    global _change_log, _exec_count
+    global _change_log, _exec_count, _execution_state
     _change_log = []
     _exec_count = 0
+    _execution_state = {}
+
+
+def set_execution_state(state: dict) -> None:
+    global _execution_state
+    _execution_state = state
+
+
+def get_execution_state() -> dict:
+    return _execution_state
+
+
+def format_execution_state() -> str:
+    state = get_execution_state().get("state", {}) if isinstance(get_execution_state(), dict) else {}
+    goal = state.get("goal", "") or ""
+    current_step = state.get("current_step", "") or ""
+    completed = state.get("completed_steps", []) or []
+    blocked = state.get("blocked_steps", []) or []
+    next_action = state.get("next_action", "") or ""
+    lines = []
+    if goal:
+        lines.append(f"Goal: {goal}")
+    if current_step:
+        lines.append(f"Current step: {current_step}")
+    if completed:
+        lines.append("Completed steps: " + " · ".join(completed[-3:]))
+    if blocked:
+        lines.append("Blocked steps: " + " · ".join(blocked[-3:]))
+    if next_action:
+        lines.append(f"Next action: {next_action}")
+    if not lines:
+        return "No execution state yet."
+    return "\n".join(lines)
+
+
+def update_execution_state(**updates) -> dict:
+    global _execution_state
+    state = _execution_state.setdefault("state", ExecutionState().to_dict())
+    if not isinstance(state, dict):
+        state = {}
+    state.update(updates)
+    _execution_state["state"] = state
+    return _execution_state
 
 
 def _success(data: dict) -> dict:

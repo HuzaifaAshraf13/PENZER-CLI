@@ -19,11 +19,26 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+
+MEMORY_DIR = Path(".penzer") / "memory"
+MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
 logger = logging.getLogger(__name__)
 
 STORAGE_DIR  = Path(".penzer")
 STORAGE_FILE = STORAGE_DIR / "session.json"
 STORAGE_DIR.mkdir(exist_ok=True)
+MEMORY_FILES = {
+    "episodic": MEMORY_DIR / "episodic.json",
+    "semantic": MEMORY_DIR / "semantic.json",
+    "insights": MEMORY_DIR / "insights.json",
+    "post_mortem": MEMORY_DIR / "post_mortem.json",
+    "kv": MEMORY_DIR / "kv.json",
+    "history": MEMORY_DIR / "history.json",
+    "skill_metrics": MEMORY_DIR / "skill_metrics.json",
+    "checkpoints": MEMORY_DIR / "checkpoints.json",
+    "consolidation": MEMORY_DIR / "consolidation.json",
+}
 
 MAX_EPISODIC     = 300
 MAX_SEMANTIC     = 150
@@ -59,22 +74,53 @@ def _fresh() -> dict:
     }
 
 
-def _load() -> dict:
+def _load_section(section: str) -> any:
+    path = MEMORY_FILES.get(section)
+    if not path:
+        return None
     try:
+        if path.exists():
+            with open(path) as f:
+                return json.load(f)
+    except Exception as e:
+        logger.debug("Section load %s: %s", section, e)
+    return None
+
+
+def _save_section(section: str, value: any) -> None:
+    path = MEMORY_FILES.get(section)
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(value, f, indent=2)
+    except Exception as e:
+        logger.error("Section save %s: %s", section, e)
+
+
+def _load() -> dict:
+    data = _fresh()
+    try:
+        for key in data:
+            loaded = _load_section(key)
+            if loaded is not None:
+                data[key] = loaded
         if STORAGE_FILE.exists():
             with open(STORAGE_FILE) as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                for k, v in _fresh().items():
+                legacy = json.load(f)
+            if isinstance(legacy, dict):
+                for k, v in legacy.items():
                     data.setdefault(k, v)
-                return data
     except Exception as e:
         logger.debug("Storage load: %s", e)
-    return _fresh()
+    return data
 
 
 def _save(data: dict) -> None:
     try:
+        for key in ["episodic", "semantic", "insights", "post_mortem", "kv", "history", "skill_metrics", "checkpoints", "consolidation"]:
+            _save_section(key, data.get(key, _fresh().get(key)))
         with open(STORAGE_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
@@ -344,6 +390,22 @@ def get_post_mortems(query: str, n: int = 2) -> list[dict]:
 
 # ── Dual-Tier Retrieval (HyMem 2026) ────────────────────────
 
+def semantic_search(query: str, n: int = 5) -> list[dict]:
+    """Return semantically relevant memories using keyword overlap and recency."""
+    data = _load()
+    scored = []
+    for sem in data.get("semantic", []):
+        score = _relevance(sem.get("pattern", ""), query) + sem.get("confidence", 0.0) * 0.2
+        if score > 0.0:
+            scored.append((score, sem))
+    for ep in data.get("episodic", []):
+        score = _relevance(ep.get("event", "") + " " + ep.get("outcome", ""), query) * 0.7 + _recency(ep.get("timestamp", "")) * 0.2
+        if score > 0.0:
+            scored.append((score, ep))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item for _, item in scored[:n]]
+
+
 def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
     data = _load()
 
@@ -519,6 +581,34 @@ def kv_store(key: str, value: str) -> str:
     return f"Stored: {key}"
 
 
+def get_relevant_kv_facts(query: str, n: int = 3) -> list[dict]:
+    data = _load()
+    items = []
+    q = (query or "").lower()
+    query_tokens = set(q.split())
+    ip_keywords = {"ip", "address", "public", "external", "my", "what"}
+
+    for key, entry in data.get("kv", {}).items():
+        value = str(entry.get("value", ""))
+        key_text = f"{key} {value}".lower()
+        score = 0.0
+        if key.lower() in q:
+            score += 0.8
+        if q and value.lower() in q:
+            score += 0.7
+        if any(token in key_text for token in ["ip", "address", "public"]):
+            score += 0.2
+        if query_tokens and any(token in key_text for token in query_tokens):
+            score += 0.3
+        if any(token in q for token in ip_keywords) and any(token in key_text for token in ip_keywords):
+            score += 0.4
+        score += _relevance(key_text, q) * 0.6
+        if score > 0.1:
+            items.append({"key": key, "value": value, "timestamp": entry.get("timestamp", ""), "score": score})
+    items.sort(key=lambda item: item["score"], reverse=True)
+    return items[:n]
+
+
 def kv_get(key: str) -> str:
     data  = _load()
     entry = data.get("kv", {}).get(key)
@@ -643,3 +733,6 @@ def get_storage_summary() -> dict:
 def clear_all() -> None:
     if STORAGE_FILE.exists():
         STORAGE_FILE.unlink()
+    for path in MEMORY_FILES.values():
+        if path.exists():
+            path.unlink()
