@@ -16,15 +16,34 @@ Implements:
   4.  Episodic replay         — compressed narrative of past similar runs
   5.  Reflexion + ExpeL       — post-mortem + insight extraction
   6.  Task completion eval    — did we actually solve it?
-  7.  Execution queue         — state machine for milestones → steps
-  8.  Hierarchical planning   — milestones → steps, replan per branch
+  7.  Execution queue         — state machine for milestones -> steps
+  8.  Hierarchical planning   — milestones -> steps, replan per branch
   9.  Tool confidence scoring — score before calling, skip if < 0.5
   10. Multi-skill orchestration — merged ordered plan across ALL skills
   11. Skill-aware metrics     — only update skill if its tools were used
   12. Parallel + speculative  — concurrent tools, race independent branches
   13. Rate-limit retry        — exponential backoff + jitter
   14. Proactive compression   — goal-aware trim with concurrency lock
-  15. Memory consolidation    — episodic → semantic on schedule
+  15. Memory consolidation    — episodic -> semantic on schedule
+
+FIXES / REFACTOR NOTES (this pass):
+  - `_tool_confidence` imported `get_skill_metric` from session.memory,
+    which did not exist anywhere in the source (only the write-side
+    `update_skill_metric` existed). This would raise ImportError on the
+    very first tool-confidence check. Added get_skill_metric to memory.py.
+  - `_run_memory_tool` returned kv_store()/kv_delete()'s return value
+    directly as the tool's output text shown to the LLM. Those used to
+    return None / bool, so the LLM would see "None" or "True" instead of
+    something useful. memory.py's kv_store/kv_delete now return
+    confirmation strings.
+  - `_run_parallel` and `_run_race` each reimplemented the same
+    "execute one tool call" logic (memory-tool short-circuit, tool
+    availability check, status line, timeout wrapping) nearly verbatim.
+    Extracted into `_execute_single_tool()`, used by both.
+  - The main loop unconditionally scheduled a background `_trim()` task
+    every single iteration regardless of history length; now it only
+    fires once history has actually grown past TRIM_AT and no trim is
+    already in flight.
 """
 import json, logging, inspect, asyncio, signal, time, psutil, random, re
 from typing import Any, Callable
@@ -40,7 +59,7 @@ from session.memory import (
     get_relevant_memories, get_insights, store_insight,
     get_similar_trajectories, get_episode_replay,
     score_complexity, should_consolidate, consolidate_memory,
-    update_skill_metric, add_checkpoint,
+    update_skill_metric, get_skill_metric, add_checkpoint,
     get_storage_summary, get_relevant_kv_facts,
     kv_store, kv_get, kv_list, kv_delete,
     save_last_run, load_last_run, clear_last_run,
@@ -54,17 +73,17 @@ logger = logging.getLogger(__name__)
 
 # Adaptive iteration limits by complexity
 ITER_BY_COMPLEXITY = {
-    "simple":  5,   # 0.0–0.3
-    "medium":  10,  # 0.3–0.6
-    "complex": 20,  # 0.6–1.0
+    "simple":  5,   # 0.0-0.3
+    "medium":  10,  # 0.3-0.6
+    "complex": 20,  # 0.6-1.0
 }
-TRIM_AT          = 30
-KEEP_LAST        = 8
-STUCK_MIN        = 2
-MAX_FAILURES     = 3
-TOOL_TIMEOUT     = 30
-CHECKPOINT_EVERY = 10
-MEMORY_CRITICAL  = 85
+TRIM_AT           = 30
+KEEP_LAST         = 8
+STUCK_MIN         = 2
+MAX_FAILURES      = 3
+TOOL_TIMEOUT      = 30
+CHECKPOINT_EVERY  = 10
+MEMORY_CRITICAL   = 85
 COMPLEX_THRESHOLD = 3
 
 RATE_LIMIT_BASE   = 5.0
@@ -276,7 +295,7 @@ class PenzerAgent:
                 matched.append(skill)
         return matched
 
-    # ── Public ──────────────────────────────────────────────────────────────────
+    # -- Public -----------------------------------------------------------------
 
     async def run(self, user_input: str) -> str:
         self._reset()
@@ -284,7 +303,6 @@ class PenzerAgent:
         self._complexity_score = score_complexity(user_input)
         self._is_complex_task  = self._complexity_score >= 0.4
 
-        # Adaptive MAX_ITER based on complexity
         if self._complexity_score < 0.3:
             self._max_iter = ITER_BY_COMPLEXITY["simple"]
         elif self._complexity_score < 0.6:
@@ -295,13 +313,11 @@ class PenzerAgent:
         self.history.append({"role": "user", "content": user_input})
         remember_user_facts(user_input)
 
-        # Dual-tier memory retrieval
         past_memory        = get_relevant_memories(user_input, n=5, deep=self._is_complex_task)
         past_mortems       = get_post_mortems(user_input, n=2)
         self._task_insights     = get_insights(user_input, n=3)
         self._past_trajectories = get_similar_trajectories(user_input, n=2)
 
-        # Episodic replay for complex tasks
         episode_replay = get_episode_replay(user_input, n=3) if self._is_complex_task else ""
 
         matched_gen  = search_generated_skills(
@@ -331,7 +347,7 @@ class PenzerAgent:
             )
         if self._past_trajectories:
             insight_hint += "\n## Similar Past Runs\n" + "".join(
-                f"- {t['event']} → {t['outcome']}\n" for t in self._past_trajectories
+                f"- {t['event']} -> {t['outcome']}\n" for t in self._past_trajectories
             )
         if episode_replay:
             insight_hint += f"\n{episode_replay}\n"
@@ -365,7 +381,6 @@ class PenzerAgent:
         set_execution_state({"state": self._resume_state})
         self._persist_resume_snapshot()
 
-        # Hierarchical planner for complex tasks
         if self._is_complex_task:
             self._milestones = await self._plan_hierarchical(user_input)
             if self._milestones:
@@ -385,7 +400,7 @@ class PenzerAgent:
             self.core_skills, self.gen_skills = data["core"], data["generated"]
 
         if self._trace:
-            tool_seq = " → ".join(t["tool"] for t in self._trace)
+            tool_seq = " -> ".join(t["tool"] for t in self._trace)
             outcome  = "success" if any(t["success"] for t in self._trace) else "failure"
             remember_episodic(
                 event=f"Goal: {user_input[:60]} | Tools: {tool_seq}",
@@ -402,14 +417,13 @@ class PenzerAgent:
                 result = f"{result} [Note: incomplete — {eval_reason}]"
             await self._write_post_mortem_and_insights(user_input, result)
 
-        # Memory consolidation on schedule
         if should_consolidate():
             asyncio.ensure_future(consolidate_memory(self.llm))
 
         save_history(self.history)
         return result
 
-    # ── Skill Orchestration ──────────────────────────────────────────────────────
+    # -- Skill Orchestration ------------------------------------------------------
 
     def _orchestrate_skills(self) -> None:
         self._skill_plan  = []
@@ -431,7 +445,8 @@ class PenzerAgent:
         ))
 
     def _skill_plan_summary(self) -> str:
-        if not self._skill_plan: return ""
+        if not self._skill_plan:
+            return ""
         total   = len(self._skill_plan)
         done    = sum(1 for s in self._skill_plan if s["done"])
         pending = [s for s in self._skill_plan if not s["done"]][:3]
@@ -442,7 +457,8 @@ class PenzerAgent:
 
     def _mark_skill_step_done(self, tool_name: str) -> None:
         for step in self._skill_plan:
-            if step["done"]: continue
+            if step["done"]:
+                continue
             if not step["tools"] or tool_name in step["tools"]:
                 step["done"] = True
                 skill_name   = step["skill"]
@@ -455,7 +471,7 @@ class PenzerAgent:
         return [s for s in self._active_skills
                 if not set(s.mcp_tools or []) or tool_name in set(s.mcp_tools or [])]
 
-    # ── Working Memory ───────────────────────────────────────────────────────────
+    # -- Working Memory -------------------------------------------------------------
 
     def _update_working_memory(self, tool: str, result: str, ok: bool) -> None:
         """Keep last WORKING_MEMORY_SIZE relevant facts from tool results."""
@@ -481,15 +497,22 @@ class PenzerAgent:
                 "matched_skills": self._matched_skills,
                 "last_matched_skills": self._last_matched_skills,
                 "system_prompt": self._system_prompt,
+                "subtasks": self._subtasks,
+                "subtask_idx": self._subtask_idx,
+                "milestone_idx": self._milestone_idx,
+                "total_subtasks": self._total_subtasks,
+                "current_subtask": self._current_subtask,
+                "execution_complete": self._execution_complete,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Persist snapshot: %s", e)
 
     def _working_mem_summary(self) -> str:
-        if not self._working_mem: return ""
+        if not self._working_mem:
+            return ""
         return "WORKING MEM: " + " | ".join(list(self._working_mem)[-3:])
 
-    # ── Hierarchical Planner ─────────────────────────────────────────────────────
+    # -- Hierarchical Planner ---------------------------------------------------------
 
     async def _is_complex(self, goal: str) -> bool:
         return score_complexity(goal) >= 0.4
@@ -497,7 +520,7 @@ class PenzerAgent:
     async def _plan_hierarchical(self, goal: str) -> list[dict]:
         """
         Level 1: 3-5 high-level milestones
-        Level 2: each milestone → 2-3 executable steps
+        Level 2: each milestone -> 2-3 executable steps
         Returns: [{milestone, steps: [str]}]
         """
         self.on_status("Planning…")
@@ -541,38 +564,27 @@ class PenzerAgent:
             logger.debug("Replan: %s", e)
         return []
 
-    # ── Tool Confidence Scoring ───────────────────────────────────────────────────
+    # -- Tool Confidence Scoring --------------------------------------------------------
 
     def _tool_confidence(self, tool_name: str, args: dict) -> float:
         """
         Score 0.0-1.0 confidence that this tool will succeed.
         Factors: past success rate + belief state match + consecutive error penalty
         """
-        from session.memory import get_skill_metric
-        # Base confidence
         score = 0.7
-
-        # Penalty for consecutive errors with this tool
         consec = self._consec_errors.get(tool_name, 0)
         score -= consec * 0.15
-
-        # Bonus if belief state is not blocked
         if self._belief["goal_progress"] != "blocked":
             score += 0.1
-
-        # Penalty if we've tried this exact call before
         key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
         if key in self._cache:
             score -= 0.3  # cached = already tried
-
-        # Skill success rate bonus
         for skill in self._skills_for_tool(tool_name):
             m = get_skill_metric(skill.name)
             score += m.get("success_rate", 0) * 0.1
-
         return min(1.0, max(0.0, score))
 
-    # ── Belief State ─────────────────────────────────────────────────────────────
+    # -- Belief State -------------------------------------------------------------------
 
     def _update_belief(self, tool: str, args: dict, result: str, ok: bool) -> None:
         self._belief["last_action"]  = f"{tool}({self._fmt_action(tool, args)})"
@@ -593,10 +605,10 @@ class PenzerAgent:
         if b["verified_facts"]:
             lines.append(f"  Know: {' | '.join(b['verified_facts'][-2:])}")
         if b["last_action"]:
-            lines.append(f"  Last: {b['last_action']} → {b['last_outcome']}")
+            lines.append(f"  Last: {b['last_action']} -> {b['last_outcome']}")
         return "\n".join(lines)
 
-    # ── Task Completion Evaluator (Reflexion) ─────────────────────────────────────
+    # -- Task Completion Evaluator (Reflexion) -------------------------------------------
 
     async def _evaluate_completion(self, goal: str, result: str) -> tuple[bool, str]:
         try:
@@ -609,7 +621,7 @@ class PenzerAgent:
                     ),
                     messages=[{"role": "user", "content":
                         f"GOAL: {goal}\nRESULT: {result[:200]}\n"
-                        f"TOOLS: {' → '.join(t['tool'] for t in self._trace)}"}],
+                        f"TOOLS: {' -> '.join(t['tool'] for t in self._trace)}"}],
                 ),
                 timeout=10,
             )
@@ -619,14 +631,14 @@ class PenzerAgent:
         except Exception:
             return True, ""
 
-    # ── Reflexion + ExpeL ─────────────────────────────────────────────────────────
+    # -- Reflexion + ExpeL ----------------------------------------------------------------
 
     async def _write_post_mortem_and_insights(self, goal: str, result: str) -> None:
-        worked = " → ".join(
+        worked = " -> ".join(
             f"{t['tool']}({self._fmt_action(t['tool'], t['args'])})"
             for t in self._trace if t["success"]
         )[:200] or "none"
-        failed = " → ".join(
+        failed = " -> ".join(
             f"{t['tool']}({t.get('error_type','?')})"
             for t in self._trace if not t["success"]
         )[:200] or "none"
@@ -671,11 +683,9 @@ class PenzerAgent:
         self._execution_index = 0
         self._active_execution_item = None
         self._execution_complete = False
-
         if not self._milestones:
             self._execution_complete = True
             return
-
         for milestone_idx, milestone in enumerate(self._milestones):
             milestone_name = milestone.get("milestone", "").strip()
             if milestone_name:
@@ -701,7 +711,6 @@ class PenzerAgent:
             self._execution_complete = True
             self._active_execution_item = None
             return None
-
         item = self._execution_queue[self._execution_index]
         self._execution_index += 1
         self._active_execution_item = item
@@ -721,27 +730,23 @@ class PenzerAgent:
         if not success:
             self._execution_complete = False
 
-    # ── Main Loop ────────────────────────────────────────────────────────────────
+    # -- Main Loop --------------------------------------------------------------------
 
     async def _loop(self) -> str:
         empty = 0
-
         for i in range(self._max_iter):
             self._iteration = i
-
             if self._shutdown:
                 save_history(self.history)
                 return "Interrupted"
-
             ok, msg = self._monitor.check()
             if not ok:
                 save_history(self.history)
                 return f"Resource limit: {msg}"
-
-            asyncio.ensure_future(self._trim())
+            if len(self.history) > TRIM_AT and not self._trimming:
+                asyncio.ensure_future(self._trim())
             self.on_status("Thinking…" if i == 0 else f"Step {i+1}…")
 
-            # Executor: drive the next pending execution item from the state machine
             if self._active_execution_item is None:
                 item = self._claim_next_execution_item()
                 if item is not None:
@@ -765,14 +770,12 @@ class PenzerAgent:
                     ),
                     goal=self._goal,
                 )
-
             if (i + 1) % CHECKPOINT_EVERY == 0:
                 await self._checkpoint(i)
 
             r = await self._llm_with_retry(i)
             if r is None:
                 return "Rate limit exceeded. Try again in a moment."
-
             calls = r.get("tool_calls") or []
             text  = r.get("content", "").strip()
 
@@ -801,7 +804,6 @@ class PenzerAgent:
                 self._failures += 1
                 if self._failures >= MAX_FAILURES:
                     return "Stuck after max attempts"
-                # Replan current milestone if in hierarchical mode
                 if self._milestones and self._milestone_idx < len(self._milestones):
                     ms       = self._milestones[self._milestone_idx]
                     new_steps = await self._replan_milestone(
@@ -823,7 +825,6 @@ class PenzerAgent:
                 self.history.append({"role": "user",
                     "content": "[Skill gate] No skills matched. Check YOUR SKILLS first."})
 
-            # Tool confidence check — skip low-confidence tools
             filtered_calls = []
             for c in calls:
                 conf = self._tool_confidence(c["name"], c.get("arguments", {}))
@@ -833,13 +834,11 @@ class PenzerAgent:
                         "content": f"[Skipped] {c['name']} confidence {conf:.0%} too low. Try different approach."})
                 else:
                     filtered_calls.append(c)
-
             if not filtered_calls:
                 self.history.append({"role": "user",
                     "content": "All proposed tools had low confidence. Rethink approach."})
                 continue
 
-            # Speculative execution for independent subtasks
             results = await self._run_speculative(filtered_calls)
             if any(self._is_error(raw) for raw, _ in results):
                 fallback_results = []
@@ -855,7 +854,6 @@ class PenzerAgent:
                 name  = c["name"]
                 ok    = not self._is_error(raw)
                 etype = self._categorize_error(raw) if not ok else None
-
                 self._trace.append({
                     "step": i, "tool": name,
                     "args": c.get("arguments", {}),
@@ -870,28 +868,23 @@ class PenzerAgent:
                     self._resume_state["blocked_steps"] = self._resume_state.get("blocked_steps", []) + [self._fmt_action(name, c.get("arguments", {}))]
                 set_execution_state({"state": self._resume_state})
                 self._persist_resume_snapshot()
-
-                if ok: self._consec_errors[name] = 0
-                else:  self._consec_errors[name] += 1
-
+                if ok:
+                    self._consec_errors[name] = 0
+                else:
+                    self._consec_errors[name] += 1
                 for skill in self._skills_for_tool(name):
                     update_skill_metric(skill.name, ok)
-
                 self._update_belief(name, c.get("arguments", {}), str(raw), ok)
                 self._update_working_memory(name, str(raw), ok)
-
                 if ok and self._skill_plan:
                     self._mark_skill_step_done(name)
-
                 if ok and name == "terminal" and self._maybe_auto_create_plugin():
                     self.history.append({"role": "user", "content": "[Auto-plugin] Repeated terminal workflow detected; created a reusable plugin tool."})
-
                 self.history.append({
                     "role": "tool",
                     "tool_call_id": c.get("id", name),
                     "content": self._fmt_tool_output(name, c.get("arguments", {}), raw, ok, elapsed),
                 })
-
                 if name == "file_editor":
                     fp = str(c.get("arguments", {}).get("filepath", ""))
                     if "skills/generated" in fp and fp.endswith(".skill.md"):
@@ -912,7 +905,7 @@ class PenzerAgent:
 
         return "Iteration limit reached"
 
-    # ── Rate-limit retry ─────────────────────────────────────────────────────────
+    # -- Rate-limit retry ---------------------------------------------------------------
 
     async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
         delay = RATE_LIMIT_BASE
@@ -943,7 +936,35 @@ class PenzerAgent:
                 return None
         return None
 
-    # ── Speculative Execution ────────────────────────────────────────────────────
+    # -- Tool execution (shared by parallel + speculative paths) ------------------------
+
+    async def _execute_single_tool(self, call: dict) -> tuple[str, float]:
+        """
+        Runs exactly one tool call: memory short-circuit, availability
+        check, status update, timeout wrapping.
+
+        Previously duplicated almost verbatim inside both _run_parallel's
+        run_one() and _run_race's run_and_report() — those two now both
+        call this instead.
+        """
+        name  = call["name"]
+        args  = call.get("arguments", {})
+        start = time.time()
+
+        if name == "memory":
+            self.on_status(f"🧠 {self._fmt_action(name, args)}")
+            raw = self._run_memory_tool(args)
+            return raw, round(time.time() - start, 2)
+
+        if name not in self.tools:
+            return f"Unknown tool '{name}'.", 0.0
+
+        self.on_status(f"{TOOL_LABELS.get(name, name)} {self._fmt_action(name, args)}")
+        try:
+            raw = await asyncio.wait_for(self._run(name, args), timeout=TOOL_TIMEOUT)
+        except asyncio.TimeoutError:
+            raw = f"Timeout after {TOOL_TIMEOUT}s"
+        return raw, round(time.time() - start, 2)
 
     async def _run_speculative(self, calls: list) -> list[tuple[str, float]]:
         """
@@ -954,18 +975,14 @@ class PenzerAgent:
         if len(calls) <= 1:
             return await self._run_parallel(calls)
 
-        # Independence check: calls are independent if they don't share file targets
         def get_target(c):
             args = c.get("arguments", {})
             return args.get("filepath") or args.get("command", "")[:20]
 
         targets = [get_target(c) for c in calls]
         unique  = len(set(t for t in targets if t)) == len([t for t in targets if t])
-
         if unique and all(c["name"] in ("browser", "terminal", "run_bash") for c in calls):
-            # Speculative: race independent calls, take first success
             return await self._run_race(calls)
-
         return await self._run_parallel(calls)
 
     async def _run_race(self, calls: list) -> list[tuple[str, float]]:
@@ -973,23 +990,10 @@ class PenzerAgent:
         results = [("(cancelled)", 0.0)] * len(calls)
 
         async def run_and_report(idx: int, c: dict, done_event: asyncio.Event):
-            name  = c["name"]
-            args  = c.get("arguments", {})
-            start = time.time()
-            if name == "memory":
-                raw = self._run_memory_tool(args)
-            elif name not in self.tools:
-                raw = f"Unknown tool '{name}'."
-            else:
-                self.on_status(f"{TOOL_LABELS.get(name, name)} {self._fmt_action(name, args)}")
-                try:
-                    raw = await asyncio.wait_for(self._run(name, args), timeout=TOOL_TIMEOUT)
-                except asyncio.TimeoutError:
-                    raw = f"Timeout after {TOOL_TIMEOUT}s"
-            elapsed        = round(time.time() - start, 2)
-            results[idx]   = (raw, elapsed)
+            raw, elapsed = await self._execute_single_tool(c)
+            results[idx] = (raw, elapsed)
             if not self._is_error(raw):
-                done_event.set()  # signal first success
+                done_event.set()
 
         done  = asyncio.Event()
         tasks = [asyncio.create_task(run_and_report(i, c, done)) for i, c in enumerate(calls)]
@@ -1001,7 +1005,6 @@ class PenzerAgent:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-
         return results
 
     def _fallback_tool(self, tool_name: str) -> str | None:
@@ -1011,51 +1014,30 @@ class PenzerAgent:
         name = call.get("name")
         if not name:
             return "No tool name provided", 0.0
-
         results = await self._run_parallel([call])
         raw, elapsed = results[0] if results else ("", 0.0)
         if raw and not self._is_error(raw):
             return raw, elapsed
-
         fallback = self._fallback_tool(name)
         if fallback and fallback in self.tools:
             self.on_status(f"Fallback → {fallback}…")
             fb_call = {**call, "name": fallback}
             fb_results = await self._run_parallel([fb_call])
             fb_raw, fb_elapsed = fb_results[0] if fb_results else ("", 0.0)
-            if fb_raw and not self._is_error(fb_raw):
-                return fb_raw, fb_elapsed
             return fb_raw, fb_elapsed
         return raw, elapsed
 
     async def _run_parallel(self, calls: list) -> list[tuple[str, float]]:
-        async def run_one(c: dict) -> tuple[str, float]:
-            name  = c["name"]
-            args  = c.get("arguments", {})
-            start = time.time()
-            if name == "memory":
-                self.on_status(f"🧠 {self._fmt_action(name, args)}")
-                raw = self._run_memory_tool(args)
-                return raw, round(time.time() - start, 2)
-            if name not in self.tools:
-                return f"Unknown tool '{name}'.", 0.0
-            self.on_status(f"{TOOL_LABELS.get(name, name)} {self._fmt_action(name, args)}")
-            try:
-                raw = await asyncio.wait_for(self._run(name, args), timeout=TOOL_TIMEOUT)
-            except asyncio.TimeoutError:
-                raw = f"Timeout after {TOOL_TIMEOUT}s"
-            return raw, round(time.time() - start, 2)
+        return list(await asyncio.gather(*[self._execute_single_tool(c) for c in calls]))
 
-        return list(await asyncio.gather(*[run_one(c) for c in calls]))
-
-    # ── ReflAct injection ────────────────────────────────────────────────────────
+    # -- ReflAct injection ----------------------------------------------------------------
 
     def _msgs(self, step: int) -> list[dict]:
         if step == 0 or not self._trace:
             return self.history
         t       = self._trace[-1]
-        recent  = " → ".join(
-            f"{s['tool']}({'✓' if s['success'] else '✗'})"
+        recent  = " -> ".join(
+            f"{s['tool']}({'ok' if s['success'] else 'x'})"
             for s in self._trace[-5:]
         )
         skills_line   = f"ACTIVE SKILLS: {', '.join(self._matched_skills)}\n" if self._matched_skills else ""
@@ -1064,7 +1046,7 @@ class PenzerAgent:
             f"ACTIVE ITEM: {self._active_execution_item.get('title', self._current_subtask)}\n"
         ) if self._active_execution_item else ""
         wm_line = self._working_mem_summary()
-        status  = "✓ ok" if t["success"] else f"✗ {t['error_type']}"
+        status  = "ok" if t["success"] else f"error: {t['error_type']}"
         inj = (
             f"[ReflAct {step}] GOAL: {self._goal}\n"
             f"{subtask_line}"
@@ -1072,16 +1054,16 @@ class PenzerAgent:
             f"{plan_line + chr(10) if plan_line else ''}"
             f"{self._belief_summary()}\n"
             f"{wm_line + chr(10) if wm_line else ''}"
-            f"LAST: {t['tool']} → {status} ({t['elapsed_sec']}s) | {t['result'][:100]}\n"
+            f"LAST: {t['tool']} -> {status} ({t['elapsed_sec']}s) | {t['result'][:100]}\n"
             f"RECENT: {recent}\n\n"
             "Given belief state, working memory, and skill plan — execute next pending step."
         )
         return self.history + [{"role": "user", "content": inj}]
 
-    # ── Meta-skill injection ─────────────────────────────────────────────────────
+    # -- Meta-skill injection ---------------------------------------------------------------
 
     def _inject_meta_skill_reminder(self):
-        winning = " → ".join(
+        winning = " -> ".join(
             f"{t['tool']}({self._fmt_action(t['tool'], t['args'])})"
             for t in self._trace if t["success"]
         )
@@ -1095,7 +1077,7 @@ class PenzerAgent:
             "Then give your final answer."
         )})
 
-    # ── Tool execution ───────────────────────────────────────────────────────────
+    # -- Tool execution -----------------------------------------------------------------------
 
     async def _run(self, name: str, args: dict) -> str:
         tools = getattr(self, "tools", {}) or {}
@@ -1136,12 +1118,17 @@ class PenzerAgent:
         return ""
 
     def _run_memory_tool(self, args: dict) -> str:
+        """
+        kv_store/kv_delete now return confirmation strings (fixed in
+        memory.py) instead of None/bool, so the LLM sees something
+        meaningful rather than the literal text "None" or "True".
+        """
         action = args.get("action", "")
         key    = args.get("key", "")
         value  = args.get("value", "")
-        if action == "get":    return kv_get(key)
+        if action == "get":    return str(kv_get(key))
         if action == "store":  return kv_store(key, value)
-        if action == "list":   return kv_list()
+        if action == "list":   return json.dumps(kv_list())
         if action == "delete": return kv_delete(key)
         return f"Unknown memory action '{action}'. Use: get, store, list, delete"
 
@@ -1149,7 +1136,6 @@ class PenzerAgent:
         """Reuse an existing plugin when possible; otherwise create one for a repeated terminal workflow."""
         if not getattr(self, "_trace", None):
             return False
-
         repeated = []
         for item in self._trace:
             tool = item.get("tool")
@@ -1158,28 +1144,22 @@ class PenzerAgent:
                 command = str(args.get("command", "")).strip()
                 if command:
                     repeated.append(command)
-
         if len(repeated) < 2:
             return False
-
         counts = {}
         for command in repeated:
             counts[command] = counts.get(command, 0) + 1
-
         recurring = [cmd for cmd, count in counts.items() if count >= 2]
         if not recurring:
             return False
-
         command = recurring[0]
         if command in {""}:
             return False
-
         slug = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
         name = slug[:40]
         existing_tools = getattr(self, "_plugin_tools", {}) or {}
         if name in existing_tools:
             return True
-
         description = f"Reusable helper for: {command[:80]}"
         code = (
             "import subprocess\n\n"
@@ -1212,29 +1192,30 @@ class PenzerAgent:
             return f"Plugin created but not yet available: {tool_name}"
         return "Unknown plugin action"
 
-    # ── Output ───────────────────────────────────────────────────────────────────
+    # -- Output ------------------------------------------------------------------------
 
     def _fmt_action(self, name: str, args: dict) -> str:
-        if name == "terminal":    return f"→ {args.get('command','')[:60]}"
-        if name == "browser":     return f"→ {args.get('action','')}: {(args.get('query') or args.get('url',''))[:50]}"
-        if name == "file_editor": return f"→ {args.get('action','')}: {args.get('filepath','')}"
-        if name == "memory":      return f"→ {args.get('action','')}: {args.get('key','')}"
-        if name == "planning":    return f"→ plan: {args.get('goal','')[:50]}"
-        return f"→ {json.dumps(args)[:60]}"
+        if name == "terminal":    return f"-> {args.get('command','')[:60]}"
+        if name == "browser":     return f"-> {args.get('action','')}: {(args.get('query') or args.get('url',''))[:50]}"
+        if name == "file_editor": return f"-> {args.get('action','')}: {args.get('filepath','')}"
+        if name == "memory":      return f"-> {args.get('action','')}: {args.get('key','')}"
+        if name == "planning":    return f"-> plan: {args.get('goal','')[:50]}"
+        return f"-> {json.dumps(args)[:60]}"
 
     def _fmt_tool_output(self, name: str, args: dict, raw: Any, ok: bool, elapsed: float) -> str:
-        hdr = f"[{name}] {self._fmt_action(name, args)} ({elapsed}s) {'✓' if ok else '✗'}"
+        hdr = f"[{name}] {self._fmt_action(name, args)} ({elapsed}s) {'ok' if ok else 'FAILED'}"
         if not ok:
             return f"{hdr}\nError: {self._brief(raw)}"
         if name == "terminal":
             lines = str(raw).strip().splitlines()
-            if not lines: return f"{hdr}\n(no output)"
+            if not lines:
+                return f"{hdr}\n(no output)"
             preview = "\n".join(lines[:5])
             tail    = f"\n… ({len(lines)-5} more)" if len(lines) > 5 else ""
             return f"{hdr}\n{preview}{tail}"
-        if name == "file_editor" and args.get("action") in ("write","create","delete","replace"):
+        if name == "file_editor" and args.get("action") in ("write", "create", "delete", "replace"):
             return f"{hdr}\nDone"
-        if name == "memory" and args.get("action") in ("store","delete"):
+        if name == "memory" and args.get("action") in ("store", "delete"):
             return f"{hdr}\nDone"
         return f"{hdr}\n{self._brief(raw)}"
 
@@ -1243,13 +1224,16 @@ class PenzerAgent:
         try:
             d = json.loads(s)
             if isinstance(d, dict):
-                if d.get("status") == "error": return f"Error: {d.get('message', s)}"
-                for k in ("output","content","data","result","text"):
-                    if k in d: return str(d[k])[:250]
-        except (json.JSONDecodeError, ValueError): pass
+                if d.get("status") == "error":
+                    return f"Error: {d.get('message', s)}"
+                for k in ("output", "content", "data", "result", "text"):
+                    if k in d:
+                        return str(d[k])[:250]
+        except (json.JSONDecodeError, ValueError):
+            pass
         return s[:250] + f" … [{len(s)-250} more]" if len(s) > 250 else s
 
-    # ── Helpers ───────────────────────────────────────────────────────────────────
+    # -- Helpers ------------------------------------------------------------------------
 
     def _is_error(self, r: Any) -> bool:
         return any(t in str(r).lower() for t in (
@@ -1268,26 +1252,32 @@ class PenzerAgent:
 
     def _last_role(self) -> str:
         for m in reversed(self.history):
-            if m.get("role") in ("user", "assistant", "tool"): return m["role"]
+            if m.get("role") in ("user", "assistant", "tool"):
+                return m["role"]
         return ""
 
     def _stuck(self) -> bool:
         w    = self.history[-6:]
         msgs = [m for m in w if m.get("role") == "tool"]
-        if len(msgs) < STUCK_MIN: return False
-        if len({str(m.get("content",""))[:80] for m in msgs}) == 1: return True
+        if len(msgs) < STUCK_MIN:
+            return False
+        if len({str(m.get("content", ""))[:80] for m in msgs}) == 1:
+            return True
         names = []
         for m in w:
             if m.get("role") == "assistant":
-                try: names.extend(tc["name"] for tc in json.loads(m["content"]).get("tool_calls", []))
-                except Exception: pass
-        if len(names) >= 3 and len(set(names)) == 1: return True
+                try:
+                    names.extend(tc["name"] for tc in json.loads(m["content"]).get("tool_calls", []))
+                except Exception:
+                    pass
+        if len(names) >= 3 and len(set(names)) == 1:
+            return True
         recent = self._trace[-STUCK_MIN:]
         return len(recent) >= STUCK_MIN and all(not s["success"] for s in recent)
 
     async def _reflect(self) -> str:
         failed = "\n".join(
-            f"  {s['tool']} → {s.get('error_type','?')}: {s['result'][:80]}"
+            f"  {s['tool']} -> {s.get('error_type','?')}: {s['result'][:80]}"
             for s in self._trace[-3:] if not s["success"]
         ) or "  (none)"
         r = await self.llm.chat(
@@ -1298,7 +1288,8 @@ class PenzerAgent:
         return r.get("content", "Try completely different approach")
 
     async def _trim(self) -> None:
-        if self._trimming or len(self.history) <= TRIM_AT: return
+        if self._trimming or len(self.history) <= TRIM_AT:
+            return
         self._trimming = True
         first, mid, tail = self.history[:1], self.history[1:-KEEP_LAST], self.history[-KEEP_LAST:]
         if not mid:

@@ -9,16 +9,17 @@ import logging
 import subprocess
 import os
 from pathlib import Path
+
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+
 from logger import get_logger
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state
 from config import DEFAULT_PROFILE, PROFILE_OPTIONS, get_profile_settings
 
 logger = get_logger("cli")
-
 for _log in [
     "agent.agent", "penzer.core", "penzer.server",
     "agent.skills.search", "agent.skills.loader",
@@ -81,10 +82,8 @@ def clean_response(text: str) -> str:
             return data.get("answer") or data.get("thought") or data.get("content") or text
     except (json.JSONDecodeError, ValueError):
         pass
-
     if text and text[0] in "⏳🔑🔐⚠️🔌⏱️🌐❌":
         return text
-
     text = re.sub(r'^(thought|answer)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
     text = re.sub(r'```[\w]*\n?', '', text).strip()
 
@@ -131,6 +130,7 @@ def build_help_text() -> str:
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
 
+
 PENZER_LOGO = r"""
  ____   _____   _   _   _____   _____   ____  
 |  _ \ | ____| | \ | | |__  / | ____| |  _ \ 
@@ -139,15 +139,18 @@ PENZER_LOGO = r"""
 |_|    |_____| |_| \_| /____| |_____| |_| \_\
 """.strip("\n")
 
+
 def display_banner():
     console.print(f"[bold red]{PENZER_LOGO}")
     console.print(Panel(
         "[bold white]Autonomous Terminal Agent[/bold white]\n"
-        "[cyan]You're talking to something that plans[/cyan]\n"
+        "[cyan]Autonomy comes up with constraints[/cyan]\n"
         f"[dim]v{get_version()} · type 'help' to get started[/dim]",
         border_style="red",
         padding=(0, 1),
     ))
+
+
 def display_help():
     console.print(Panel(build_help_text(), title="Help", border_style="cyan", padding=(0, 1)))
 
@@ -226,20 +229,17 @@ def _handle_apikey_command(user_input: str) -> None:
         console.print(f"  API_KEY={api_key}")
         console.print(f"  URL={api_url}")
         return
-
     if len(tokens) >= 3 and tokens[1] == "local":
         local_url = tokens[2]
         _write_env({"LOCAL_SERVER_URL": local_url})
         console.print(f"[green]LOCAL_SERVER_URL set to {local_url}[/green]")
         return
-
     if len(tokens) >= 4 and tokens[1] in ("set", "update"):
         api_key = tokens[2]
         api_url = tokens[3]
         _write_env({"API_KEY": api_key, "URL": api_url})
         console.print("[green]API_KEY and URL updated in .env[/green]")
         return
-
     console.print("[yellow]Usage:[/yellow]")
     console.print("  apikey show")
     console.print("  apikey set <API_KEY> <URL>")
@@ -250,19 +250,15 @@ def _handle_apikey_command(user_input: str) -> None:
 async def main():
     try:
         display_banner()
-
         logging.getLogger("penzer.server").setLevel(logging.CRITICAL)
         server_thread = threading.Thread(target=start_server, daemon=True)
         server_thread.start()
         await asyncio.sleep(0.5)
-
         with console.status("[red bold]Loading agent...[/red bold]", spinner="dots"):
             agent = await PenzerAgent().async_init()
-
         console.print("[bold green]✓ Ready[/bold green]")
         console.print("[dim]Type a task or run [cyan]help[/cyan] for commands.[/dim]\n")
         maybe_notify_update()
-
         while True:
             try:
                 user_input = console.input("[bold cyan]▸ [/bold cyan]").strip()
@@ -270,23 +266,18 @@ async def main():
                 agent.clear_session()
                 console.print("\n[dim]Session cleared. Memory retained.[/dim]")
                 break
-
             if not user_input:
                 continue
-
             if user_input.lower() in ("exit", "quit"):
                 agent.clear_session()
                 console.print("[dim]Session cleared. Memory retained.[/dim]")
                 break
-
             if user_input.lower() == "help":
                 display_help()
                 continue
-
             if user_input.lower() == "clear":
                 console.clear()
                 continue
-
             if user_input.lower() == "plugins":
                 from tools.plugins import list_plugin_metadata
                 plugin_names = agent.list_plugin_tools()
@@ -303,11 +294,9 @@ async def main():
                     for entry in metadata:
                         console.print(f"  - {entry['name']}: {', '.join(entry['functions']) or 'no functions'}")
                 continue
-
             if user_input.lower().startswith("apikey"):
                 _handle_apikey_command(user_input)
                 continue
-
             if user_input.lower() == "update":
                 try:
                     result = perform_update()
@@ -315,11 +304,9 @@ async def main():
                 except Exception as exc:
                     console.print(f"[red]Update failed: {exc}[/red]")
                 continue
-
             if user_input.lower() == "state":
                 console.print(Panel(format_execution_state(), title="Execution State", border_style="yellow"))
                 continue
-
             if user_input.lower() == "memory":
                 from session.memory import kv_list, load_history
                 console.print(Panel(
@@ -333,7 +320,6 @@ async def main():
                     border_style="magenta",
                 ))
                 continue
-
             if user_input.lower() == "checkpoints":
                 from session.memory import load_checkpoints
                 checkpoints = load_checkpoints()
@@ -343,7 +329,6 @@ async def main():
                 else:
                     console.print("[dim]No checkpoints saved yet.[/dim]")
                 continue
-
             if user_input.lower() == "resume":
                 from session.memory import load_last_run
                 snapshot = load_last_run()
@@ -364,7 +349,6 @@ async def main():
                 console.print()
                 console.print(Markdown(clean_response(response or "No response.")))
                 continue
-
             if user_input.lower().startswith("profile"):
                 parts = user_input.split()
                 if len(parts) > 1:
@@ -380,7 +364,6 @@ async def main():
                     for name, description in PROFILE_OPTIONS.items():
                         console.print(f"  - {name}: {description}")
                 continue
-
             if user_input.lower() == "benchmark":
                 from session.memory import load_history
                 history = load_history()
@@ -402,29 +385,19 @@ async def main():
                 continue
 
             console.print()
-
             calls_before  = getattr(agent.llm, "call_count", 0)
             tokens_before = getattr(agent.llm, "token_estimate", 0)
-
             status_view = LiveStatusView()
             with console.status("[cyan]Working…[/cyan]", spinner="dots") as status:
                 def _on_status(msg: str) -> None:
                     status_view.update(msg)
                     status.update(f"[cyan]{status_view.current}[/cyan]")
-
                 agent.on_status = _on_status
                 response = await agent.run(user_input)
 
-            from tools.executor import format_execution_state
-            state_summary = format_execution_state()
-            if state_summary and state_summary != "No execution state yet.":
-                console.print(f"[dim]{state_summary}[/dim]")
-
             calls_used  = getattr(agent.llm, "call_count", 0) - calls_before
             tokens_used = getattr(agent.llm, "token_estimate", 0) - tokens_before
-
             response = clean_response(response or "No response.")
-
             if response and response.strip():
                 console.print()
                 console.print(Markdown(response))
@@ -441,7 +414,6 @@ async def main():
                 console.print()
                 for line in summary_lines:
                     console.print(f"[dim]{line}[/dim]")
-
             console.print()
 
     except Exception as e:
