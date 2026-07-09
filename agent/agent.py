@@ -46,7 +46,7 @@ REFACTOR NOTES (this pass — code health, not new features):
     a new tool or error category is a one-line addition, not a new
     branch buried in a method body.
 """
-import json, logging, inspect, asyncio, signal, time, psutil, random, re
+import json, logging, inspect, asyncio, signal, time, psutil, random, re, itertools
 from typing import Any, Callable
 from datetime import datetime
 from collections import defaultdict, deque
@@ -64,6 +64,9 @@ from session.memory import (
     get_storage_summary, get_relevant_kv_facts,
     kv_store, kv_get, kv_list, kv_delete,
     save_last_run, load_last_run, clear_last_run,
+    append_steps as _append_steps_to_disk,
+    get_steps as _get_persisted_steps,
+    clear_steps as _clear_persisted_steps,
 )
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
@@ -82,6 +85,9 @@ TRIM_AT           = 30
 KEEP_LAST         = 8
 STUCK_MIN         = 2
 MAX_FAILURES      = 3
+ITER_EXTENSION_SIZE  = 8      # iterations granted per extension, repeatable
+MAX_RUNTIME_SECONDS  = 900    # wall-clock backstop (15 min) — the real limit
+ABSOLUTE_MAX_ITER    = 500    # sanity ceiling against runaway bugs, not meant to bind in practice
 TOOL_TIMEOUT      = 30
 CHECKPOINT_EVERY  = 10
 MEMORY_CRITICAL   = 85
@@ -235,6 +241,8 @@ class PenzerAgent:
         self._is_complex_task:     bool  = False
         self._complexity_score:    float = 0.0
         self._max_iter:            int   = 10
+        self._run_start_time:      float = time.time()
+        self._resume_boundary_trace_len: int = 0
         self._task_insights:       list  = []
         self._past_trajectories:   list  = []
         self._trimming:            bool  = False
@@ -270,6 +278,12 @@ class PenzerAgent:
         }
         # Single source of truth for coordination — see Phase docstring above.
         self._phase: Phase = Phase.PLANNING
+        # Structured, retrievable step log (distinct from `history`, the
+        # raw LLM transcript). `_steps` is the full in-memory log for THIS
+        # run; `_pending_steps` is the not-yet-flushed-to-disk tail of it.
+        self._steps:         list = []
+        self._pending_steps: list = []
+        self._run_id:        str  = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
     def _handle_shutdown(self, signum, frame):
         self._shutdown = True
@@ -314,6 +328,54 @@ class PenzerAgent:
         self._phase = to
         self._belief["goal_progress"] = PHASE_TO_GOAL_PROGRESS[to]
 
+    def _record_step(self, kind: str, description: str, **extra) -> dict:
+        """
+        Append one structured, human-readable step. `kind` is intentionally
+        open-ended ("reasoning", "tool_call", "tool_result", "planning",
+        "recovery", "final_answer", "rate_limit", "give_up", ...) so a new
+        step type is just a new string at the call site, not a change to
+        this method or to storage. Also drives the live `on_status`
+        callback, so this replaces the old generic "Step N…" messages with
+        actual content.
+        """
+        step = {
+            "iteration":   self._iteration,
+            "phase":       self._phase.value,
+            "kind":        kind,
+            "description": description,
+            **extra,
+        }
+        self._steps.append(step)
+        self._pending_steps.append(step)
+        self.on_status(description)
+        return step
+
+    def _flush_steps(self) -> None:
+        """Write any not-yet-persisted steps to disk in one batch. Called
+        once per iteration (not once per step — see append_steps' own
+        docstring for why) plus once more in `_finalize()` to catch steps
+        from any early-return path that skips the per-iteration point."""
+        if not self._pending_steps:
+            return
+        try:
+            _append_steps_to_disk(self._run_id, self._pending_steps)
+            self._pending_steps = []
+        except Exception as e:
+            logger.error("Flush steps: %s", e)
+
+    def get_steps(self, n: int = 50) -> list[dict]:
+        """In-memory steps for the current run — fast, no disk access."""
+        return self._steps[-n:]
+
+    def get_persisted_steps(self, run_id: str | None = None, n: int = 100) -> list[dict]:
+        """Disk-backed steps — survive a crash/restart, retrievable from a
+        different process or agent instance. Defaults to this agent's own
+        run (which stays the same run_id across a resume)."""
+        return _get_persisted_steps(run_id=run_id or self._run_id, n=n)
+
+    def clear_run_steps(self, run_id: str | None = None) -> int:
+        return _clear_persisted_steps(run_id=run_id or self._run_id)
+
     @staticmethod
     def _extract_json(text: str, default: str = "{}") -> Any:
         """Strip code-fence/`json` noise the LLM sometimes wraps JSON in, then parse.
@@ -327,6 +389,7 @@ class PenzerAgent:
 
     def _restore_snapshot(self, snapshot: dict) -> None:
         self._goal = snapshot.get("goal", self._goal)
+        self._run_id = snapshot.get("run_id", self._run_id)
         self.history = snapshot.get("history", self.history)
         self._trace = snapshot.get("trace", self._trace)
         self._resume_state = snapshot.get("resume_state", self._resume_state)
@@ -362,6 +425,14 @@ class PenzerAgent:
             return "No resumable execution state found."
         self._restore_snapshot(snapshot)
         self._max_iter = self._max_iter_for_complexity(self._complexity_score)
+        self._run_start_time = time.time()
+        # Restored `_trace`/`history` are the pre-crash record. Without
+        # this boundary, the stuck-detector's window includes those stale
+        # entries and can trip on the very first turn of the resumed
+        # attempt — a false "stuck" from a failure that happened in a
+        # different context before the crash, not from anything this
+        # resumed attempt has actually done yet.
+        self._resume_boundary_trace_len = len(self._trace)
         result = await self._loop()
         return await self._finalize(self._goal, result)
 
@@ -455,6 +526,7 @@ class PenzerAgent:
             memory_context=past_memory,
             extra=skills_hint + insight_hint + mortem_hint,
             goal=user_input,
+            plugin_tools=self.get_plugin_tool_descriptions(),
         )
         self._resume_state = {
             "goal": user_input,
@@ -479,8 +551,10 @@ class PenzerAgent:
             self._execution_index = 0
             self._active_execution_item = None
             self._execution_complete = True
+            self._record_step("planning", "Simple task — no milestone breakdown needed.")
 
         self._transition(Phase.EXECUTING, reason="initial planning complete")
+        self._flush_steps()
         result = await self._loop()
         return await self._finalize(user_input, result)
 
@@ -503,6 +577,11 @@ class PenzerAgent:
         from, so the snapshot was being deleted before `resume_last_task`
         could ever be useful for them.
         """
+        # Catches steps from any return path that exits _loop() before its
+        # own per-iteration flush point (e.g. an immediate final answer on
+        # iteration 0 never reaches the tool-execution block at all).
+        self._flush_steps()
+
         if self._skills_dirty:
             data = load_all_skills()
             self.core_skills, self.gen_skills = data["core"], data["generated"]
@@ -587,6 +666,7 @@ class PenzerAgent:
         try:
             save_last_run({
                 "goal": self._goal,
+                "run_id": self._run_id,
                 "history": self.history,
                 "trace": self._trace,
                 "resume_state": self._resume_state,
@@ -639,9 +719,15 @@ class PenzerAgent:
             )
             plan = self._extract_json(r.get("content", ""), default="[]")
             if isinstance(plan, list) and plan:
+                self._record_step(
+                    "planning",
+                    f"Planned {len(plan)} milestones: " +
+                    "; ".join(m.get("milestone", "") for m in plan)[:200],
+                )
                 return plan
         except Exception as e:
             logger.debug("Hierarchical planner: %s", e)
+        self._record_step("planning", "No hierarchical plan needed — proceeding directly.")
         return []
 
     async def _replan_milestone(self, milestone: str, reason: str) -> list[str]:
@@ -680,7 +766,7 @@ class PenzerAgent:
         for skill in self._skills_for_tool(tool_name):
             m = get_skill_metric(skill.name)
             score += m.get("success_rate", 0) * 0.1
-        return min(1.0, max(0.0, score))
+        return round(min(1.0, max(0.0, score)), 6)
 
     # -- Belief State -------------------------------------------------------------------
     def _update_belief(self, tool: str, args: dict, result: str, ok: bool) -> None:
@@ -702,6 +788,10 @@ class PenzerAgent:
         lines = [f"BELIEF: {b['goal_progress'].upper()}"]
         if b["verified_facts"]:
             lines.append(f"  Know: {' | '.join(b['verified_facts'][-2:])}")
+        if b["assumptions"]:
+            lines.append(f"  Assuming: {' | '.join(b['assumptions'][:2])}")
+        if b["unknowns"]:
+            lines.append(f"  Unknown: {' | '.join(b['unknowns'][:2])}")
         if b["last_action"]:
             lines.append(f"  Last: {b['last_action']} -> {b['last_outcome']}")
         return "\n".join(lines)
@@ -735,7 +825,8 @@ class PenzerAgent:
                 )
 
         if (
-            self._execution_complete
+            self._is_complex_task
+            and self._execution_complete
             and self._active_execution_item is None
             and self._milestones == []
             and self._phase not in (Phase.DONE, Phase.FAILED, Phase.PLANNING)
@@ -880,9 +971,60 @@ class PenzerAgent:
             self._milestones = []
 
     # -- Main Loop --------------------------------------------------------------------
+    def _can_extend_iterations(self) -> bool:
+        """
+        Called only when about to hit the current iteration cap. Iteration
+        count is an arbitrary proxy — `score_complexity()` can't know a
+        plainly-worded task ("check open ports") needs several discovery
+        calls, so budgeting by iteration count alone means either
+        over-granting for genuinely simple tasks or hard-stopping
+        legitimate ones partway through. The real questions are: is it
+        still making progress, is it burning too much wall-clock time,
+        and is it burning too many resources — not "has it called a tool
+        N times". Extension is unlimited in *count*; these are the actual
+        backstops.
+        """
+        if self._phase in (Phase.DONE, Phase.FAILED):
+            return False
+        if self._iteration >= ABSOLUTE_MAX_ITER:
+            return False
+        if time.time() - self._run_start_time > MAX_RUNTIME_SECONDS:
+            return False
+        resource_ok, _ = self._monitor.check()
+        if not resource_ok:
+            return False
+        if not self._trace:
+            return False
+        return any(t["success"] for t in self._trace[-3:]) and not self._stuck()
+
     async def _loop(self) -> str:
         empty = 0
-        for i in range(self._max_iter):
+        for i in itertools.count():
+            if i >= self._max_iter:
+                if self._can_extend_iterations():
+                    self._max_iter += ITER_EXTENSION_SIZE
+                    elapsed = int(time.time() - self._run_start_time)
+                    self._record_step(
+                        "extend",
+                        f"Hit the iteration budget but still making progress — "
+                        f"extending by {ITER_EXTENSION_SIZE} "
+                        f"({elapsed}s elapsed of {MAX_RUNTIME_SECONDS}s budget).",
+                    )
+                else:
+                    reason = "iteration limit reached"
+                    if time.time() - self._run_start_time > MAX_RUNTIME_SECONDS:
+                        reason = f"time budget exceeded ({MAX_RUNTIME_SECONDS}s)"
+                    elif self._iteration >= ABSOLUTE_MAX_ITER:
+                        reason = "absolute iteration ceiling reached"
+                    elif self._trace and not any(t["success"] for t in self._trace[-3:]):
+                        reason = "stopped making progress"
+                    if self._phase not in (Phase.DONE, Phase.FAILED):
+                        self._transition(Phase.FAILED, reason=reason)
+                    self._record_step("give_up", f"Stopping: {reason}.")
+                    set_execution_state({"state": self._resume_state})
+                    self._persist_resume_snapshot()
+                    self._flush_steps()
+                    return f"Stopped: {reason}" if reason != "iteration limit reached" else "Iteration limit reached"
             self._iteration = i
             if self._shutdown:
                 save_history(self.history)
@@ -894,7 +1036,7 @@ class PenzerAgent:
             if len(self.history) > TRIM_AT and not self._trimming:
                 asyncio.ensure_future(self._trim())
 
-            self.on_status("Thinking…" if i == 0 else f"Step {i+1}…")
+            self.on_status("Reasoning about next step…" if i == 0 else "Continuing…")
 
             if self._active_execution_item is None:
                 item = self._claim_next_execution_item()
@@ -918,6 +1060,7 @@ class PenzerAgent:
                         self._goal, n=3, deep=self._is_complex_task
                     ),
                     goal=self._goal,
+                    plugin_tools=self.get_plugin_tool_descriptions(),
                 )
             if (i + 1) % CHECKPOINT_EVERY == 0:
                 await self._checkpoint(i)
@@ -929,12 +1072,32 @@ class PenzerAgent:
             calls = r.get("tool_calls") or []
             text  = r.get("content", "").strip()
 
+            # ReflAct belief-state fields — optional in the model's JSON
+            # output. Only overwrite when the model actually provides a
+            # non-empty list; omitting them means "unchanged" (per the
+            # system prompt's "omit them entirely if nothing's changed"),
+            # so they persist across turns instead of getting silently
+            # cleared to [] every time the model doesn't restate them.
+            new_assumptions = r.get("assumptions")
+            if new_assumptions:
+                self._belief["assumptions"] = [str(a)[:120] for a in new_assumptions][:5]
+            new_unknowns = r.get("unknowns")
+            if new_unknowns:
+                self._belief["unknowns"] = [str(u)[:120] for u in new_unknowns][:5]
+
             if not calls:
                 if text:
                     self.history.append({"role": "assistant", "content": text})
+                    self._record_step("final_answer", text[:200])
                     self._transition(Phase.DONE, reason="final answer given")
+                    # Reaching DONE closes out queue/milestone bookkeeping even
+                    # if the LLM finished before formally exhausting every
+                    # planned item — otherwise a stale, non-empty `_milestones`
+                    # survives into DONE (and into a resume snapshot).
                     if self._active_execution_item is not None:
                         self._complete_current_execution_item(success=True)
+                    self._execution_complete = True
+                    self._milestones = []
                     violations = self._check_consistency()
                     if violations:
                         logger.warning("State consistency violations at completion: %s", violations)
@@ -947,19 +1110,24 @@ class PenzerAgent:
                         f"Goal: {self._goal}\nGive final answer or call next tool."})
                 continue
             empty = 0
+            if text:
+                self._record_step("reasoning", text[:200])
 
             self.history.append({
                 "role": "assistant",
                 "content": json.dumps({"reasoning": text, "tool_calls": calls}),
             })
 
-            if len(self._trace) >= STUCK_MIN and self._stuck():
+            if len(self._trace) - self._resume_boundary_trace_len >= STUCK_MIN and self._stuck():
                 self._failures += 1
                 self._transition(Phase.REFLECTING, reason="stuck detected")
+                self._record_step("recovery", f"Stuck detected (attempt {self._failures}/{MAX_FAILURES}) — looking for a way forward.")
                 if self._failures >= MAX_FAILURES:
                     self._transition(Phase.FAILED, reason="max failures reached")
+                    self._record_step("give_up", "Giving up after max failed attempts.")
                     set_execution_state({"state": self._resume_state})
                     self._persist_resume_snapshot()
+                    self._flush_steps()
                     return "Stuck after max attempts"
                 if self._milestones and self._milestone_idx < len(self._milestones):
                     ms       = self._milestones[self._milestone_idx]
@@ -970,12 +1138,18 @@ class PenzerAgent:
                         self._subtasks    = new_steps
                         self._subtask_idx = 0
                         self._transition(Phase.EXECUTING, reason="replanned milestone")
+                        self._record_step(
+                            "recovery",
+                            f"Replanned '{ms.get('milestone','')}': {'; '.join(new_steps)}"[:200],
+                        )
                         self.history.append({"role": "user",
                             "content": f"[Replan] New steps for '{ms.get('milestone','')}': "
                                        f"{new_steps}"})
                         continue
+                diagnosis = await self._reflect()
                 self.history.append({"role": "user",
-                    "content": f"[Recovery] {await self._reflect()}"})
+                    "content": f"[Recovery] {diagnosis}"})
+                self._record_step("recovery", diagnosis[:200])
                 self._transition(Phase.EXECUTING, reason="recovery attempted")
                 continue
 
@@ -998,6 +1172,13 @@ class PenzerAgent:
                 self.history.append({"role": "user",
                     "content": "All proposed tools had low confidence. Rethink approach."})
                 continue
+
+            for c in filtered_calls:
+                self._record_step(
+                    "tool_call",
+                    f"{c['name']} {self._fmt_action(c['name'], c.get('arguments', {}))}",
+                    tool=c["name"], args=c.get("arguments", {}),
+                )
 
             results = await self._run_speculative(filtered_calls)
             if any(self._is_error(raw) for raw, _ in results):
@@ -1049,10 +1230,16 @@ class PenzerAgent:
                     fp = str(c.get("arguments", {}).get("filepath", ""))
                     if "skills/generated" in fp and fp.endswith(".skill.md"):
                         self._skills_dirty = True
+                self._record_step(
+                    "tool_result",
+                    f"{name} {'done' if ok else 'failed'} ({elapsed}s): {self._brief(raw)[:100]}",
+                    tool=name, success=ok, elapsed_sec=elapsed,
+                )
 
             # Persist once per iteration rather than once per tool call.
             set_execution_state({"state": self._resume_state})
             self._persist_resume_snapshot()
+            self._flush_steps()
 
             if self._active_execution_item is not None:
                 any_success = any(t["success"] for t in self._trace[-len(filtered_calls):]) if filtered_calls else False
@@ -1091,7 +1278,10 @@ class PenzerAgent:
                     self._rate_attempts += 1
                     jitter = random.uniform(0, RATE_LIMIT_JITTER)
                     wait   = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + jitter)
-                    self.on_status(f"Rate limit — waiting {wait:.0f}s…")
+                    self._record_step(
+                        "rate_limit",
+                        f"Rate limited — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}",
+                    )
                     await asyncio.sleep(wait)
                     continue
                 logger.error("LLM error: %s", e)
@@ -1110,7 +1300,14 @@ class PenzerAgent:
             self.on_status(f"🧠 {self._fmt_action(name, args)}")
             raw = self._run_memory_tool(args)
             return raw, round(time.time() - start, 2)
-        if name not in self.tools:
+        # A call is valid if it's a registered MCP tool, the plugin_tool
+        # creation action, or a dynamically created plugin (auto- or
+        # explicitly-created). This used to check `self.tools` (the MCP
+        # registry) only — so a plugin tool could be created successfully
+        # and still get rejected as "Unknown tool" the moment anything
+        # tried to actually call it, since `_run()`'s own plugin-dispatch
+        # branch (`if name in self._plugin_tools`) was never reached.
+        if name != "plugin_tool" and name not in self._plugin_tools and name not in self.tools:
             return f"Unknown tool '{name}'.", 0.0
         self.on_status(f"{TOOL_LABELS.get(name, name)} {self._fmt_action(name, args)}")
         try:
@@ -1173,7 +1370,8 @@ class PenzerAgent:
             return raw, elapsed
         fallback = self._fallback_tool(name)
         if fallback and fallback in self.tools:
-            self.on_status(f"Fallback → {fallback}…")
+            self._record_step("tool_call", f"{name} failed — falling back to {fallback}",
+                               tool=fallback, fallback_from=name)
             fb_call = {**call, "name": fallback}
             fb_results = await self._run_parallel([fb_call])
             fb_raw, fb_elapsed = fb_results[0] if fb_results else ("", 0.0)
@@ -1264,7 +1462,8 @@ class PenzerAgent:
                 if attempt == 1:
                     fb = FALLBACKS.get(name)
                     if fb and fb in self.tools:
-                        self.on_status(f"Fallback → {fb}…")
+                        self._record_step("tool_call", f"{name} errored — falling back to {fb}",
+                                           tool=fb, fallback_from=name)
                         cmd = args.get("command") or args.get("query") or args.get("code") or ""
                         return await self._run(fb, {"command": cmd})
                     return f"Error: {e}"
@@ -1310,23 +1509,55 @@ class PenzerAgent:
         if not recurring:
             return False
         command = recurring[0]
+        # A truncated 40-char slug alone isn't unique — two different
+        # commands that share the same first 30ish characters would
+        # collide, and the `if name in existing_tools: return True` below
+        # would then silently report success for the WRONG command's
+        # plugin. The hash suffix guarantees distinct commands get
+        # distinct names.
         slug = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
-        name = slug[:40]
+        name = f"{slug[:30]}_{abs(hash(command)) % 10000}"
         existing_tools = getattr(self, "_plugin_tools", {}) or {}
         if name in existing_tools:
             return True
         description = f"Reusable helper for: {command[:80]}"
+        # `command` is a default arg, not hardcoded into the call, so the
+        # LLM can override it later with a similar-but-different command
+        # via `command=...` instead of getting a frozen one-off replay of
+        # the exact string that happened to succeed twice.
         code = (
             "import subprocess\n\n"
-            f"def {name}(**kwargs):\n"
-            f"    return subprocess.check_output({command!r}, shell=True, text=True)"
+            f"def {name}(command: str = {command!r}, **kwargs):\n"
+            f"    {description!r}\n"
+            f"    return subprocess.check_output(command, shell=True, text=True)"
         )
         try:
             create_plugin_tool(name=name, description=description, code=code)
             self._plugin_tools = load_plugin_tools()
-            return name in self._plugin_tools
+            created = name in self._plugin_tools
+            if created:
+                self._record_step(
+                    "plugin_created",
+                    f"Created reusable tool '{name}' from a repeated command: {command[:80]}",
+                    tool=name,
+                )
+            return created
         except Exception:
             return False
+
+    def get_plugin_tool_descriptions(self) -> dict[str, str]:
+        """
+        name -> description for every currently loaded plugin tool, read
+        from each function's docstring (which `create_plugin_tool` calls
+        set, and which `_maybe_auto_create_plugin` now embeds directly in
+        the generated code). Used to make plugin tools visible in the
+        system prompt — see the note on `list_plugin_tools` below.
+        """
+        out = {}
+        for name, fn in (getattr(self, "_plugin_tools", {}) or {}).items():
+            doc = (getattr(fn, "__doc__", None) or "").strip()
+            out[name] = doc or "(no description)"
+        return out
 
     def _run_plugin_tool(self, args: dict) -> str:
         action = (args.get("action") or "").strip().lower()
@@ -1343,7 +1574,12 @@ class PenzerAgent:
             self._plugin_tools = load_plugin_tools()
             tool_name = result.get("name", name)
             if tool_name in self._plugin_tools:
-                return f"Plugin created successfully: {tool_name}"
+                self._record_step(
+                    "plugin_created",
+                    f"Created reusable tool '{tool_name}': {description or 'Generated plugin'}",
+                    tool=tool_name,
+                )
+                return f"Plugin created successfully: {tool_name}. It's now callable directly by name."
             return f"Plugin created but not yet available: {tool_name}"
         return "Unknown plugin action"
 
@@ -1387,7 +1623,7 @@ class PenzerAgent:
     def _is_error(self, r: Any) -> bool:
         return any(t in str(r).lower() for t in (
             "error", "failed", "exception", "traceback",
-            "not found", "permission denied", "timeout",
+            "not found", "unknown tool", "permission denied", "timeout",
         ))
 
     def _categorize_error(self, result: Any) -> str:
@@ -1488,6 +1724,7 @@ class PenzerAgent:
     def get_metrics(self) -> dict:
         return {
             "goal":            self._goal,
+            "run_id":          self._run_id,
             "phase":           self._phase.value,
             "belief":          self._belief["goal_progress"],
             "complexity":      round(self._complexity_score, 2),
@@ -1497,5 +1734,6 @@ class PenzerAgent:
             "active_skills":   self._matched_skills,
             "working_mem":     list(self._working_mem),
             "insights_used":   len(self._task_insights),
+            "recent_steps":    [s["description"] for s in self.get_steps(5)],
             "storage":         get_storage_summary(),
         }

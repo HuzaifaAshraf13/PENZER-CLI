@@ -8,7 +8,9 @@ import json
 import logging
 import subprocess
 import os
+import signal
 from pathlib import Path
+from typing import Optional, Callable
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -34,45 +36,63 @@ console = Console(force_terminal=True, width=100)
 
 
 def compose_summary_lines(matched: list[str] | None = None, trace: list | None = None, calls_used: int = 0, tokens_used: int = 0) -> list[str]:
+    """Generate formatted status lines with rich formatting."""
     lines = []
     if matched:
-        lines.append("Skills: " + " · ".join(matched))
+        skill_text = "[bold cyan]Skills:[/] " + "[dim]·[/] ".join(f"[green]{s}[/]" for s in matched)
+        lines.append(skill_text)
     if trace:
-        tools_used = " · ".join(dict.fromkeys(trace))
-        lines.append("Tools: " + tools_used)
+        tools_text = "[bold cyan]Tools:[/] " + "[dim]·[/] ".join(f"[yellow]{t}[/]" for t in dict.fromkeys(trace))
+        lines.append(tools_text)
     if calls_used or tokens_used:
-        lines.append(f"LLM: {calls_used} calls · ~{tokens_used} tokens")
+        llm_text = f"[bold cyan]LLM:[/] [magenta]{calls_used}[/] calls [dim]·[/] ~[magenta]{tokens_used}[/] tokens"
+        lines.append(llm_text)
     return lines
 
 
 class LiveStatusView:
     def __init__(self) -> None:
-        self.current = "Starting…"
+        self.current = "[dim]Starting…[/]"
         self.events: list[str] = []
-
+        self._lock = threading.Lock()
+        self.current_skill = ""
+        
+    def update_skill(self, skill_name: str) -> None:
+        with self._lock:
+            self.current_skill = f"[bold green]Using:[/] [cyan]{skill_name}[/]"
+            
     def update(self, message: str) -> None:
         if not message:
             return
         message = str(message).strip()
-        if message == self.current and self.events and self.events[-1] == message:
-            return
-        self.current = message
-        self.events.append(message)
-        self.events = self.events[-6:]
+        with self._lock:
+            if message == self.current and self.events and self.events[-1] == message:
+                return
+            self.current = message
+            self.events.append(message)
+            self.events = self.events[-6:]
 
     def render(self) -> str:
-        lines = [f"● {self.current}"]
-        recent = [event for event in self.events[-3:] if event != self.current]
-        if recent:
-            lines.append("  ↳ " + " → ".join(recent))
-        state = format_execution_state()
-        if state and state != "No execution state yet.":
-            first_state = state.splitlines()[0]
-            lines.append(f"  ↳ {first_state}")
-        return "\n".join(lines)
+        with self._lock:
+            lines = []
+            if self.current_skill:
+                lines.append(self.current_skill)
+            lines.append(f"[bold]●[/] {self.current}")
+            recent = [event for event in self.events[-3:] if event != self.current]
+            if recent:
+                lines.append("  [dim]↳[/] " + " [dim]→[/] ".join(recent))
+            state = format_execution_state()
+            if state and state != "No execution state yet.":
+                first_state = state.splitlines()[0]
+                lines.append(f"  [dim]↳[/] {first_state}")
+            return "\n".join(lines)
 
 
 def clean_response(text: str) -> str:
+    """Clean and parse CLI response text with robust error handling."""
+    if not text:
+        return ""
+    
     text = text.strip()
     try:
         data = json.loads(text)
@@ -80,8 +100,12 @@ def clean_response(text: str) -> str:
             if data.get("tool_calls") or data.get("tool"):
                 return "Executing task..."
             return data.get("answer") or data.get("thought") or data.get("content") or text
-    except (json.JSONDecodeError, ValueError):
-        pass
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.debug(f"Failed to parse response JSON: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error parsing response: {e}")
+        
+    # Fallback to basic cleaning if JSON parsing fails
     if text and text[0] in "⏳🔑🔐⚠️🔌⏱️🌐❌":
         return text
     text = re.sub(r'^(thought|answer)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
@@ -245,6 +269,49 @@ def _handle_apikey_command(user_input: str) -> None:
     console.print("  apikey set <API_KEY> <URL>")
     console.print("  apikey local <LOCAL_SERVER_URL>")
     console.print("[dim]Example: apikey set mykey https://api.openai.com/v1[/dim]")
+
+
+class ShutdownHandler:
+    """Handles graceful shutdown of CLI components."""
+    def __init__(self):
+        self._should_exit = threading.Event()
+        self._cleanup_handlers: list[Callable] = []
+        
+    def register_cleanup(self, handler: Callable):
+        """Register a cleanup function to be called on shutdown."""
+        self._cleanup_handlers.append(handler)
+        
+    def shutdown(self, signum=None, frame=None):
+        """Initiate graceful shutdown."""
+        if self._should_exit.is_set():
+            return
+            
+        logger.info("Initiating graceful shutdown...")
+        self._should_exit.set()
+        
+        # Run cleanup handlers in reverse order
+        for handler in reversed(self._cleanup_handlers):
+            try:
+                handler()
+            except Exception as e:
+                logger.error(f"Cleanup handler failed: {e}")
+        
+    def should_exit(self) -> bool:
+        """Check if shutdown was requested."""
+        return self._should_exit.is_set()
+
+
+def safe_subprocess_run(*args, **kwargs) -> subprocess.CompletedProcess:
+    """Wrapper for subprocess.run with enhanced error handling."""
+    try:
+        return subprocess.run(*args, **kwargs, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Command failed: {e.cmd}")
+        logger.debug(f"Error output: {e.stderr}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected subprocess error: {e}")
+        raise
 
 
 async def main():

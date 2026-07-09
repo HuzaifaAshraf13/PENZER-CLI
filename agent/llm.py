@@ -1,5 +1,37 @@
 """
 Minimal LLM interface - supports local servers and any cloud API
+
+Fixes (this pass):
+  1. `_call_with_backoff` only retried on HTTP 429. Transient server-side
+     errors (500, 502, 503, 504) raised immediately on the first attempt
+     instead of getting the same backoff-and-retry treatment — despite
+     `chat()` having dedicated friendly messages for exactly those codes
+     ("LLM server error. Try again in a moment.", "LLM service
+     unavailable. Server is down.") which implied they were expected to
+     be retried. Confirmed with a mocked transport: a 500-then-200
+     sequence returned the friendly error message after a single
+     attempt instead of succeeding on retry. `RETRYABLE_STATUS` now
+     covers 429 plus the common transient 5xx codes; 401/403 (auth
+     failures, where retrying the same credentials is pointless) are
+     correctly left out and still fail immediately, unchanged from
+     before.
+  Everything else in this file — the JSON-in-text tool-call/answer
+  parsing in `_extract_json`/`chat()`, markdown-fenced JSON extraction,
+  provider dispatch, and the 429 retry path — was verified working
+  against a mocked HTTP transport and left as-is.
+
+Known limitation, not changed here: `_call_gemini` flattens the entire
+message list (including the system prompt and all prior turns) into one
+text blob sent as a single `parts` entry, rather than using Gemini's
+structured `contents` array with proper user/model roles and a separate
+`system_instruction` field. It works — instruction-tuned models can
+generally follow "ROLE: content" formatted text — but it doesn't use the
+provider's actual multi-turn API and loses the role distinction Gemini's
+own API would preserve. Flagging rather than rewriting since I can't
+verify a rewrite against a live Gemini endpoint from here (no network
+access to googleapis.com in this environment) — happy to do it if you
+can confirm the exact response shape you're seeing, or test it yourself
+against the real API first.
 """
 import os
 import json
@@ -11,6 +43,12 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).parent.parent
 RETRY_DELAYS = [0, 2, 4, 8, 16]
+
+# 429 (rate limited) and the common transient 5xx server errors all
+# benefit from backoff-and-retry. 401/403 (auth failures) deliberately
+# are NOT here — retrying with the same bad credentials just wastes the
+# whole retry budget for a request that can never succeed.
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 def _detect_provider(url: str) -> str:
@@ -176,7 +214,7 @@ class LLM:
             try:
                 return await self.model.create_chat_completion(messages)
             except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429 and attempt < len(RETRY_DELAYS) - 1:
+                if e.response.status_code in RETRYABLE_STATUS and attempt < len(RETRY_DELAYS) - 1:
                     last_error = e
                     continue
                 raise
@@ -221,12 +259,26 @@ class LLM:
 
         data = self._extract_json(raw)
         if not data:
-            return {"content": raw.strip(), "tool_calls": []}
+            return {"content": raw.strip(), "tool_calls": [], "assumptions": [], "unknowns": []}
 
         # Support both new format (answer) and old format (thought)
         answer    = data.get("answer") or data.get("thought", "")
         tool_name = str(data.get("tool", "")).strip()
         tool_args = data.get("args", {})
+
+        # Belief-state fields (ReflAct): optional — the model isn't
+        # required to include these, but if it does, they're captured
+        # here rather than silently dropped. Previously not read at all,
+        # so even a model that dutifully reasoned about its assumptions
+        # and unknowns in valid JSON had that discarded before agent.py
+        # ever saw it.
+        def _as_list(v) -> list:
+            if not v:
+                return []
+            return v if isinstance(v, list) else [str(v)]
+
+        assumptions = _as_list(data.get("assumptions"))
+        unknowns    = _as_list(data.get("unknowns"))
 
         # If tool is specified, return tool call
         if tool_name:
@@ -237,10 +289,12 @@ class LLM:
                     "name": tool_name,
                     "arguments": tool_args if isinstance(tool_args, dict) else {},
                 }],
+                "assumptions": assumptions,
+                "unknowns": unknowns,
             }
 
         # Otherwise, return as final answer
-        return {"content": answer or raw.strip(), "tool_calls": []}
+        return {"content": answer or raw.strip(), "tool_calls": [], "assumptions": assumptions, "unknowns": unknowns}
 
 
 def get_model_choice() -> LLM:

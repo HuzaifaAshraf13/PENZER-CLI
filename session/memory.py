@@ -85,6 +85,7 @@ MEMORY_FILES = {
     "consolidation": MEMORY_DIR / "consolidation.json",
     "graph_nodes": MEMORY_DIR / "graph_nodes.json",
     "graph_edges": MEMORY_DIR / "graph_edges.json",
+    "steps": MEMORY_DIR / "steps.json",
 }
 LAST_RUN_PATH = STORAGE_DIR / "last_run.json"
 
@@ -94,6 +95,7 @@ MAX_INSIGHTS       = 100
 MAX_POST_MORTEM    = 50
 MAX_HISTORY        = 500
 MAX_CHECKPOINTS    = 5
+MAX_STEPS          = 500  # persisted step log, across all runs (see append_steps/get_steps)
 CONSOLIDATE_EVERY  = 20   # consolidate after every N new episodic entries
 
 # Category-specific half-lives (hours)
@@ -141,6 +143,7 @@ def _fresh() -> dict:
         "graph_nodes":   {},   # node_id -> {name, type, attrs, created_at}
         "graph_edges":   [],   # {id, subject_id, relation, object_id, confidence,
                                 #  valid_from, valid_until, source_event}
+        "steps":         [],   # {id, run_id, iteration, phase, kind, description, timestamp, ...extra}
     }
 
 
@@ -222,7 +225,7 @@ def _save(data: dict) -> None:
     try:
         for key in ["episodic", "semantic", "insights", "post_mortem", "kv",
                     "history", "skill_metrics", "checkpoints", "consolidation",
-                    "graph_nodes", "graph_edges"]:
+                    "graph_nodes", "graph_edges", "steps"]:
             _save_section(key, data.get(key, _fresh().get(key)))
         with open(STORAGE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -975,6 +978,57 @@ def prune_invalidated_edges(older_than_days: int = 90) -> int:
 
     data["graph_edges"] = [e for e in data["graph_edges"] if keep(e)]
     removed = before - len(data["graph_edges"])
+    if removed:
+        _save(data)
+    return removed
+
+
+# -- Step Log (structured, retrievable "what is the agent doing") -----------
+#
+# Distinct from `history` (the raw LLM message transcript) and `trace`
+# (agent.py's own in-memory per-run list) — this is a durable, queryable
+# record of human-readable steps, tagged with a `kind` that's intentionally
+# open-ended so new step types don't require touching this module. Steps
+# are appended in batches (one call per agent iteration, not one call per
+# step) for the same reason `get_relevant_memories` batches its
+# reinforcement writes — avoiding an extra full load/save cycle per item.
+def append_steps(run_id: str, new_steps: list[dict]) -> None:
+    """Append a batch of steps for one run in a single load/save cycle."""
+    if not new_steps:
+        return
+    data = _load()
+    next_id = len(data["steps"]) + 1
+    for i, s in enumerate(new_steps):
+        entry = dict(s)
+        entry["run_id"] = run_id
+        entry.setdefault("timestamp", datetime.now().isoformat())
+        entry["id"] = next_id + i
+        data["steps"].append(entry)
+    if len(data["steps"]) > MAX_STEPS:
+        data["steps"] = data["steps"][-MAX_STEPS:]
+    _save(data)
+
+
+def get_steps(run_id: str | None = None, n: int = 100) -> list[dict]:
+    """Retrieve the most recent steps, optionally filtered to one run.
+    Works from any process — a UI or a different agent instance can call
+    this to show what a specific run (past or in-progress) actually did."""
+    data = _load()
+    steps = data["steps"]
+    if run_id:
+        steps = [s for s in steps if s.get("run_id") == run_id]
+    return steps[-n:]
+
+
+def clear_steps(run_id: str | None = None) -> int:
+    """Clear steps, optionally only for one run. Returns count removed."""
+    data = _load()
+    before = len(data["steps"])
+    if run_id:
+        data["steps"] = [s for s in data["steps"] if s.get("run_id") != run_id]
+    else:
+        data["steps"] = []
+    removed = before - len(data["steps"])
     if removed:
         _save(data)
     return removed

@@ -5,7 +5,46 @@ Fixes:
   1. _enrich() now loads real metrics from storage
   2. _rank() uses loaded success_rate correctly
   3. Generated skills show failure_modes
-  4. Skill display includes usage stats from memory
+  4. Skill display includes usage stats from memory — fixed the field
+     mapping. `get_skill_metric()` returns {"uses", "successes",
+     "success_rate"}; this module was reading `success_count`/
+     `failure_count`, which don't exist in that dict, so both silently
+     read as 0 and every generated skill showed as "UNTESTED" regardless
+     of actual track record. `success_rate` happened to work since that
+     key name matched by coincidence, which is likely why this went
+     unnoticed. _load_metrics now maps uses/successes correctly.
+  5. `_fmt_core_skill`/`_fmt_generated_skill` now read `.priority` and
+     `.description` defensively via getattr, matching how `_rank()`
+     already treats them as possibly-missing (`getattr(s, "priority",
+     0.5)`) instead of accessing them directly and risking an
+     AttributeError on a skill object that lacks one.
+
+CORRECTION NOTE: an earlier pass at this file rewrote the "OUTPUT FORMAT"
+/ "Tool syntax" sections, believing agent.py's native `tool_calls`
+handling meant the LLM used structured function-calling. That was wrong
+— confirmed against agent/llm.py, whose `chat()` parses the model's raw
+text as JSON (`{"answer": "..."}` / `{"tool": "...", "args": {...}}`)
+and only then reshapes it into the `{"content", "tool_calls"}` dict
+agent.py consumes. The JSON-in-text protocol below is correct and
+matches llm.py's `_extract_json` exactly; it has been restored verbatim.
+
+PLUGIN TOOL VISIBILITY FIX: `plugin_tool` didn't appear anywhere in
+AVAILABLE TOOLS or the Tool syntax examples, and there was no way for a
+currently-loaded plugin (auto-created from a repeated command, or
+explicitly created by the model) to ever be listed for the model to see
+— `list_plugin_tools()` in agent.py had zero call sites. Added
+`plugin_tool` to the documented tool list, and a new `plugin_tools`
+param to `build_system_prompt()` that renders a `## AVAILABLE PLUGIN
+TOOLS` block from whatever's currently loaded, via
+`{{PLUGIN_TOOLS_BLOCK}}`.
+
+BELIEF STATE COMPLETION: `assumptions`/`unknowns` were described here as
+part of the belief state, but there was no JSON key the model could
+actually use to report them, `agent/llm.py`'s `chat()` never read any
+such key, and `agent.py` never displayed them even if populated —
+ReflAct's belief-state mechanism was running at half capacity. Added the
+actual keys to the JSON examples here, matching the corresponding fix in
+`agent/llm.py` and `agent.py`.
 """
 import json
 import logging
@@ -43,6 +82,8 @@ browser     → search web, fetch pages, scrape
 file_editor → read / write / edit / list / delete files
 memory      → store / retrieve / list / delete key-value facts
 planning    → create and follow multi-step plans
+plugin_tool → manually create a new reusable tool when you expect a
+              specific workflow to repeat across this task or future ones
 
 Tool syntax:
   {"tool": "terminal",    "args": {"command": "ls -la"}}
@@ -53,6 +94,17 @@ Tool syntax:
   {"tool": "memory",      "args": {"action": "list"}}
   {"tool": "memory",      "args": {"action": "delete", "key": "x"}}
   {"tool": "planning",    "args": {"action": "create", "goal": "...", "steps": [...]}}
+  {"tool": "plugin_tool", "args": {"action": "create", "name": "snake_case_name",
+                                    "description": "...", "code": "def snake_case_name(**kwargs): ..."}}
+
+Once a plugin tool is created, call it directly BY NAME like any other
+tool — {"tool": "your_plugin_name", "args": {...}} — do not route back
+through plugin_tool to use it. The agent also auto-creates a plugin on
+its own when it notices you've run the exact same terminal command
+twice; you don't need to do that yourself, but you can still hand-write
+one for anything more structured than a shell command.
+
+{{PLUGIN_TOOLS_BLOCK}}
 
 Note: the "memory" tool is a simple key-value store (built-in, not MCP).
 Use it to persist facts the user explicitly shares (preferences, project paths,
@@ -67,6 +119,14 @@ You maintain an explicit belief state at all times:
   - verified_facts: things confirmed true by tool results
   - assumptions   : things you're assuming (not confirmed)
   - unknowns      : things still to find out
+
+Your BELIEF injection each turn shows what's currently tracked. To
+update assumptions/unknowns, include them directly in your JSON output:
+  {"tool": "...", "args": {...}, "assumptions": ["..."], "unknowns": ["..."]}
+  {"answer": "...", "assumptions": ["..."], "unknowns": ["..."]}
+Both are optional and get replaced each turn with whatever you provide —
+they reflect your CURRENT understanding, not a running log. Omit them
+entirely if nothing's changed.
 
 Before each action:
   "Given my belief state and goal, what is the next step?"
@@ -203,9 +263,24 @@ Never access files outside working directory
 
 
 def _load_metrics(skill_name: str) -> dict:
-    """Load real metrics from storage for a skill."""
+    """
+    Load real metrics from storage for a skill, normalized to the
+    {"success_count", "failure_count", "success_rate"} shape this module
+    uses for display. `get_skill_metric()` itself returns
+    {"uses", "successes", "success_rate"} — mapped here rather than
+    changing memory.py's return shape, since agent.py's own
+    `_tool_confidence` already consumes `success_rate` from that same
+    dict directly and has no need for the other two.
+    """
     try:
-        return get_skill_metric(skill_name)
+        m = get_skill_metric(skill_name)
+        uses      = m.get("uses", 0)
+        successes = m.get("successes", 0)
+        return {
+            "success_count": successes,
+            "failure_count": max(0, uses - successes),
+            "success_rate":  m.get("success_rate", 0.0),
+        }
     except Exception:
         return {"success_count": 0, "failure_count": 0, "success_rate": 0.0}
 
@@ -221,7 +296,7 @@ def _tokenize(text: str) -> set[str]:
 
 def _skill_token_set(skill) -> set[str]:
     tokens = set()
-    for field in [skill.name, skill.description, * (skill.keywords or [])]:
+    for field in [skill.name, getattr(skill, "description", ""), *(skill.keywords or [])]:
         tokens.update(_tokenize(field))
     return tokens
 
@@ -230,6 +305,8 @@ def _fmt_core_skill(skill) -> str:
     tools    = ", ".join(skill.mcp_tools or []) or "none"
     behavior = (skill.agent_behavior or "").strip()
     keywords = ", ".join(skill.keywords[:4]) if skill.keywords else "none"
+    priority = getattr(skill, "priority", 0.5)
+    version  = getattr(skill, "version", "1.0")
 
     rate = getattr(skill, "success_rate", None)
     if rate is not None:
@@ -245,18 +322,21 @@ def _fmt_core_skill(skill) -> str:
         f"### {skill.name}{badge}\n"
         f"  Triggers : {keywords}\n"
         f"  Tools    : {tools}\n"
-        f"  Priority : {skill.priority}  v{getattr(skill, 'version', '1.0')}\n"
+        f"  Priority : {priority}  v{version}\n"
         f"{behavior}\n"
     )
 
 
 def _fmt_generated_skill(skill) -> str:
-    lines   = [l.strip() for l in (skill.agent_behavior or "").splitlines() if l.strip()]
-    step1   = lines[0] if lines else "(no steps)"
-    success = getattr(skill, "success_count", 0)
-    failure = getattr(skill, "failure_count", 0)
-    total   = success + failure
-    rate    = (success / total * 100) if total > 0 else 0
+    lines       = [l.strip() for l in (skill.agent_behavior or "").splitlines() if l.strip()]
+    step1       = lines[0] if lines else "(no steps)"
+    description = getattr(skill, "description", "")
+    priority    = getattr(skill, "priority", 0.5)
+    version     = getattr(skill, "version", "1.0")
+    success     = getattr(skill, "success_count", 0)
+    failure     = getattr(skill, "failure_count", 0)
+    total       = success + failure
+    rate        = (success / total * 100) if total > 0 else 0
 
     if total >= 10 and rate > 80:   status = "🔥 VERY HOT"
     elif total >= 5 and rate > 75:  status = "🟠 HOT"
@@ -270,9 +350,9 @@ def _fmt_generated_skill(skill) -> str:
 
     return (
         f"- **{skill.name}** {status}\n"
-        f"  {skill.description}\n"
+        f"  {description}\n"
         f"  {success}✓ {failure}✗ ({int(rate)}%) | "
-        f"Priority: {skill.priority} v{getattr(skill, 'version', '1.0')}\n"
+        f"Priority: {priority} v{version}\n"
         f"  Step 1: {step1}\n"
         f"{failure_line}"
     )
@@ -324,6 +404,22 @@ def _rank(skills: List, goal: str) -> List:
     return sorted(skills, key=lambda s: score(s), reverse=True)
 
 
+def _fmt_plugin_tools_block(plugin_tools: Optional[dict]) -> str:
+    """
+    Render currently-loaded plugin tools so the model actually knows they
+    exist and are callable by name. Previously `list_plugin_tools()` had
+    zero call sites anywhere in agent.py — a plugin could be created (auto
+    or explicit) and the model would never learn it exists unless it
+    happened to re-derive the exact same name itself.
+    """
+    if not plugin_tools:
+        return ""
+    lines = ["## AVAILABLE PLUGIN TOOLS", "Created earlier — call these directly by name:"]
+    for name, description in sorted(plugin_tools.items()):
+        lines.append(f"  {name} → {description}")
+    return "\n".join(lines) + "\n"
+
+
 def _format_kv_context(goal: str, memory_context: str = "") -> str:
     facts = get_relevant_kv_facts(goal, n=3)
     if not facts:
@@ -342,6 +438,7 @@ def build_system_prompt(
     memory_context: str              = "",
     extra: str                       = "",
     goal: str                        = "",
+    plugin_tools: Optional[dict]     = None,
 ) -> str:
     skills_lines: List[str] = []
 
@@ -356,7 +453,7 @@ def build_system_prompt(
         ]
         if ranked:
             best = ranked[0]
-            skills_lines.append(f"Best fit for this task: {best.name} — {best.description}")
+            skills_lines.append(f"Best fit for this task: {best.name} — {getattr(best, 'description', '')}")
             skills_lines.append("")
         for skill in ranked[:12]:
             skills_lines.append(_fmt_core_skill(skill))
@@ -375,6 +472,7 @@ def build_system_prompt(
 
     block  = "\n".join(skills_lines).strip()
     prompt = MAIN_SYSTEM_PROMPT.replace("{{SKILLS_BLOCK}}", block)
+    prompt = prompt.replace("{{PLUGIN_TOOLS_BLOCK}}", _fmt_plugin_tools_block(plugin_tools))
 
     if memory_context:
         prompt += f"\n\n{_format_kv_context(goal, memory_context)}"
