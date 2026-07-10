@@ -1,5 +1,6 @@
 """
-PENZER — Research-Grade Agent
+PENZER — Research-Grade Agent (thin orchestrator)
+
 Research sources:
   ReflAct    (Kim 2025)       — belief-state injection, 27.7% improvement
   ExpeL      (Zhao AAAI 2024) — insight extraction, trajectory recall
@@ -7,50 +8,27 @@ Research sources:
   HyMem      (Zhao 2026)      — dual-tier retrieval, complexity scoring
   MemoryBank (Zhong 2024)     — Ebbinghaus decay + spaced repetition
   Active CC  (Arxiv 2601)     — goal-aware context compression
-Implements:
-  1.  Belief state            — updated every tool call
-  2.  Working memory buffer   — 7-item active context (Miller's Law)
-  3.  Dual-tier memory        — fast for simple, deep for complex
-  4.  Episodic replay         — compressed narrative of past similar runs
-  5.  Reflexion + ExpeL       — post-mortem + insight extraction
-  6.  Task completion eval    — did we actually solve it?
-  7.  Execution queue         — state machine for milestones -> steps
-  8.  Hierarchical planning   — milestones -> steps, replan per branch
-  9.  Tool confidence scoring — score before calling, skip if < 0.5
-  10. Multi-skill orchestration — merged ordered plan across ALL skills
-  11. Skill-aware metrics     — only update skill if its tools were used
-  12. Parallel + speculative  — concurrent tools, race independent branches
-  13. Rate-limit retry        — exponential backoff + jitter
-  14. Proactive compression   — goal-aware trim with concurrency lock
-  15. Memory consolidation    — episodic -> semantic on schedule
 
-REFACTOR NOTES (this pass — code health, not new features):
-  - Duplicated "score -> max_iter" if/elif chain (appeared 3x across
-    `run()` and `resume_last_task()`) extracted into
-    `_max_iter_for_complexity()`.
-  - Removed `_is_complex()` — an async method that was never called
-    anywhere (dead code; `score_complexity()` is used directly instead).
-  - `resume_last_task()` restored goal/complexity/is_complex/max_iter
-    via `_restore_snapshot()` and then immediately re-read the exact
-    same four fields from the same snapshot again. Removed the
-    duplicate block.
-  - Duplicated JSON-cleanup pattern (strip fences, lstrip "json",
-    json.loads in a try/except) appeared 4x in the planner/evaluator/
-    post-mortem methods. Extracted `_extract_json()`.
-  - `set_execution_state()` + `_persist_resume_snapshot()` were called
-    once per *tool call* inside the result-processing loop, so an
-    iteration with 3 tool calls wrote the snapshot 3 times. Moved to
-    fire once per iteration, after all results are processed.
-  - `_fmt_action`, `_categorize_error`, and the memory-tool action
-    dispatch were if/elif chains. Converted to lookup tables so adding
-    a new tool or error category is a one-line addition, not a new
-    branch buried in a method body.
+MODULARIZATION (this pass): the previous single-file agent.py (~1700
+lines) is split into penzermodule/ — belief_manager, memory_manager,
+planner, execution_manager, reflection_manager, persistence_manager,
+resource_monitor. State ownership didn't change (PenzerAgent still holds
+every instance attribute exactly as before), only where the *behavior*
+lives: each manager takes the owning PenzerAgent explicitly as `agent`
+in its methods and reads/writes its state directly. PenzerAgent keeps
+every original method name as a one-line delegate (e.g. `self._transition(...)`
+still works exactly as before), so nothing calling the agent — including
+the existing test suite — needed to change. `_loop`, `run`, `_finalize`,
+`resume_last_task`, `_msgs`, `_llm_with_retry`, and the small pure
+formatting helpers (`_fmt_action` etc.) stay here since they ARE the
+orchestration — deciding when to call planner vs execution vs reflection
+vs belief vs persistence is the one thing that doesn't belong in any
+single manager.
 """
 import json, logging, inspect, asyncio, signal, time, psutil, random, re, itertools
 from typing import Any, Callable
 from datetime import datetime
 from collections import defaultdict, deque
-from enum import Enum
 from agent.core import mcp
 from agent.llm import LLM
 from session.memory import (
@@ -73,43 +51,46 @@ from agent.skills import load_all_skills, search_generated_skills, build_context
 from tools.plugins import create_plugin_tool, load_plugin_tools
 from tools.executor import get_execution_state, update_execution_state, set_execution_state
 
+from agent.penzermodule import (
+    Phase, PHASE_TRANSITIONS, PHASE_TO_GOAL_PROGRESS,
+    BeliefManager, MemoryManager, Planner, ExecutionManager,
+    ReflectionManager, PersistenceManager, ResourceMonitor,
+)
+
 logger = logging.getLogger(__name__)
 
 # Adaptive iteration limits by complexity
 ITER_BY_COMPLEXITY = {
-    "simple":  5,   # 0.0-0.3
-    "medium":  10,  # 0.3-0.6
-    "complex": 20,  # 0.6-1.0
+    "simple":  5,
+    "medium":  10,
+    "complex": 20,
 }
-TRIM_AT           = 30
-KEEP_LAST         = 8
-STUCK_MIN         = 2
-MAX_FAILURES      = 3
-ITER_EXTENSION_SIZE  = 8      # iterations granted per extension, repeatable
-MAX_RUNTIME_SECONDS  = 900    # wall-clock backstop (15 min) — the real limit
-ABSOLUTE_MAX_ITER    = 500    # sanity ceiling against runaway bugs, not meant to bind in practice
-TOOL_TIMEOUT      = 30
-CHECKPOINT_EVERY  = 10
-MEMORY_CRITICAL   = 85
-COMPLEX_THRESHOLD = 3
-RATE_LIMIT_BASE   = 5.0
-RATE_LIMIT_MAX    = 60.0
-RATE_LIMIT_JITTER = 2.0
+TRIM_AT              = 30
+KEEP_LAST            = 8
+STUCK_MIN            = 2
+MAX_FAILURES         = 3
+ITER_EXTENSION_SIZE  = 8
+MAX_RUNTIME_SECONDS  = 900
+ABSOLUTE_MAX_ITER    = 500
+TOOL_TIMEOUT         = 30
+CHECKPOINT_EVERY     = 10
+MEMORY_CRITICAL      = 85
+COMPLEX_THRESHOLD    = 3
+RATE_LIMIT_BASE      = 5.0
+RATE_LIMIT_MAX       = 60.0
+RATE_LIMIT_JITTER    = 2.0
 
-# Working memory: max 7 items (Miller's Law)
 WORKING_MEMORY_SIZE = 7
 
 TOOL_LABELS = {
-    "browser": "🌐", "terminal": "⚡", "run_python": "🐍",
-    "run_bash": "📜", "file_editor": "📁", "memory": "🧠", "planning": "📋",
+    "browser": "\U0001F310", "terminal": "\u26A1", "run_python": "\U0001F40D",
+    "run_bash": "\U0001F4DC", "file_editor": "\U0001F4C1", "memory": "\U0001F9E0", "planning": "\U0001F4CB",
 }
 FALLBACKS = {
     "terminal": "run_bash", "run_bash": "run_python",
     "run_python": "terminal", "file_editor": "terminal",
 }
 
-# Error substring -> category. Add a new (substring, LABEL) tuple to
-# extend without touching any method body.
 ERROR_PATTERNS = [
     ("timeout", "TIMEOUT"),
     ("permission", "PERMISSION"),
@@ -118,93 +99,13 @@ ERROR_PATTERNS = [
     ("invalid", "INVALID"),
 ]
 
-# Tool name -> formatter for its args. Add a new tool by adding a key.
-ACTION_FORMATTERS: dict[str, Callable[[dict], str]] = {
+ACTION_FORMATTERS: dict = {
     "terminal":    lambda a: f"-> {a.get('command', '')[:60]}",
     "browser":     lambda a: f"-> {a.get('action', '')}: {(a.get('query') or a.get('url', ''))[:50]}",
     "file_editor": lambda a: f"-> {a.get('action', '')}: {a.get('filepath', '')}",
     "memory":      lambda a: f"-> {a.get('action', '')}: {a.get('key', '')}",
     "planning":    lambda a: f"-> plan: {a.get('goal', '')[:50]}",
 }
-
-
-# -- Agent phase (single source of truth for coordination) -------------------
-#
-# Previously "what is the agent doing right now" lived in four places at
-# once — self._belief["goal_progress"] (a free-form string set ad hoc from
-# four different call sites), the execution queue's own completion flag,
-# the skill plan's done-set, and whatever the last _stuck() check decided.
-# Nothing stopped these from disagreeing (e.g. belief == "blocked" while
-# the execution queue had already moved on to the next milestone), and the
-# longer a task runs — more replans, more stuck-recovery cycles — the more
-# chances there are for that drift to actually happen and to be exactly
-# what gets written into a resume snapshot.
-#
-# Phase is the one thing everything else derives from. All transitions go
-# through PenzerAgent._transition(), which validates against
-# PHASE_TRANSITIONS and keeps self._belief["goal_progress"] (kept for
-# backward-compat / existing prompt text) in sync as a read-only mirror,
-# rather than a second thing that gets set independently.
-class Phase(Enum):
-    PLANNING   = "planning"    # building/replanning milestones, no tool calls yet
-    EXECUTING  = "executing"   # normal steady state — calling tools, making progress
-    REFLECTING = "reflecting"  # stuck-recovery: replanning a branch or running _reflect()
-    BLOCKED    = "blocked"     # last tool call failed, not yet recovered
-    DONE       = "done"        # final answer given
-    FAILED     = "failed"      # gave up (max failures / resource limit)
-
-PHASE_TRANSITIONS: dict[Phase, set[Phase]] = {
-    Phase.PLANNING:   {Phase.EXECUTING, Phase.FAILED},
-    Phase.EXECUTING:  {Phase.REFLECTING, Phase.BLOCKED, Phase.DONE, Phase.FAILED},
-    Phase.BLOCKED:    {Phase.EXECUTING, Phase.REFLECTING, Phase.FAILED},
-    Phase.REFLECTING: {Phase.EXECUTING, Phase.PLANNING, Phase.BLOCKED, Phase.FAILED},
-    Phase.DONE:       set(),                  # terminal — completed runs clear their
-                                               # snapshot in _finalize(), so DONE never
-                                               # needs a way back out via resume.
-    Phase.FAILED:     {Phase.EXECUTING},       # NOT fully terminal: _finalize() only
-                                               # clears the snapshot on DONE, so a FAILED
-                                               # run's snapshot is still resumable, and a
-                                               # successful tool call after resuming needs
-                                               # a legal way out of FAILED.
-}
-
-# Mirrors Phase into the existing free-form belief string so every
-# pre-existing reader of self._belief["goal_progress"] (prompt text,
-# _finalize()'s completion check, get_metrics()) keeps working unchanged.
-PHASE_TO_GOAL_PROGRESS = {
-    Phase.PLANNING:   "not_started",
-    Phase.EXECUTING:  "in_progress",
-    Phase.REFLECTING: "in_progress",
-    Phase.BLOCKED:    "blocked",
-    Phase.DONE:       "complete",
-    Phase.FAILED:     "failed",
-}
-
-
-class ResourceMonitor:
-    def __init__(self):
-        self._proc  = psutil.Process()
-        self._start = time.time()
-
-    def check(self) -> tuple[bool, str]:
-        try:
-            mem = self._proc.memory_percent()
-            if mem > MEMORY_CRITICAL:
-                return False, f"Memory critical: {mem:.1f}%"
-            if mem > 70:
-                logger.warning("Memory high: %.1f%%", mem)
-        except Exception:
-            pass
-        return True, ""
-
-    def stats(self) -> dict:
-        try:
-            return {
-                "memory_mb":   round(self._proc.memory_info().rss / 1e6, 1),
-                "elapsed_sec": round(time.time() - self._start, 1),
-            }
-        except Exception:
-            return {}
 
 
 class PenzerAgent:
@@ -223,6 +124,15 @@ class PenzerAgent:
         self._rate_attempts = 0
         self._resume_state  = {}
         self._plugin_tools  = load_plugin_tools()
+        # Managers hold no state of their own — they take `self` (this
+        # agent) explicitly in every method and operate on its state
+        # directly. See penzermodule/__init__.py.
+        self.belief      = BeliefManager()
+        self.memory      = MemoryManager()
+        self.planner     = Planner()
+        self.execution   = ExecutionManager()
+        self.reflection  = ReflectionManager()
+        self.persistence = PersistenceManager()
         signal.signal(signal.SIGINT, self._handle_shutdown)
 
     def _reset(self):
@@ -284,10 +194,8 @@ class PenzerAgent:
         self._steps:         list = []
         self._pending_steps: list = []
         self._run_id:        str  = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-
     def _handle_shutdown(self, signum, frame):
         self._shutdown = True
-
     async def async_init(self) -> "PenzerAgent":
         try:
             import tools.tools
@@ -299,124 +207,24 @@ class PenzerAgent:
             logger.debug("MCP: %s", e)
         self.tools.setdefault("memory", "builtin")
         return self
-
-    # -- Shared small helpers -----------------------------------------------------------
-    @staticmethod
-    def _max_iter_for_complexity(score: float) -> int:
-        if score < 0.3:
-            return ITER_BY_COMPLEXITY["simple"]
-        if score < 0.6:
-            return ITER_BY_COMPLEXITY["medium"]
-        return ITER_BY_COMPLEXITY["complex"]
-
+    def _max_iter_for_complexity(self, score: float) -> int:
+        return self.planner._max_iter_for_complexity(score)
     def _transition(self, to: Phase, reason: str = "") -> None:
-        """
-        The only place self._phase (and its self._belief["goal_progress"]
-        mirror) gets written. An invalid transition is logged loudly —
-        it means two parts of the agent disagree about what's
-        happening — but is still applied rather than raised, so a
-        coordination bug degrades to a log line instead of taking down
-        a live run. Tests can set `PenzerAgent._phase_strict = True` on
-        the class to make invalid transitions raise instead, to catch
-        these during development.
-        """
-        if to != self._phase and to not in PHASE_TRANSITIONS.get(self._phase, set()):
-            msg = f"Invalid phase transition {self._phase.value} -> {to.value} ({reason})"
-            if getattr(self, "_phase_strict", False):
-                raise ValueError(msg)
-            logger.warning(msg)
-        self._phase = to
-        self._belief["goal_progress"] = PHASE_TO_GOAL_PROGRESS[to]
-
+        return self.belief._transition(self, to, reason)
     def _record_step(self, kind: str, description: str, **extra) -> dict:
-        """
-        Append one structured, human-readable step. `kind` is intentionally
-        open-ended ("reasoning", "tool_call", "tool_result", "planning",
-        "recovery", "final_answer", "rate_limit", "give_up", ...) so a new
-        step type is just a new string at the call site, not a change to
-        this method or to storage. Also drives the live `on_status`
-        callback, so this replaces the old generic "Step N…" messages with
-        actual content.
-        """
-        step = {
-            "iteration":   self._iteration,
-            "phase":       self._phase.value,
-            "kind":        kind,
-            "description": description,
-            **extra,
-        }
-        self._steps.append(step)
-        self._pending_steps.append(step)
-        self.on_status(description)
-        return step
-
+        return self.memory._record_step(self, kind, description, **extra)
     def _flush_steps(self) -> None:
-        """Write any not-yet-persisted steps to disk in one batch. Called
-        once per iteration (not once per step — see append_steps' own
-        docstring for why) plus once more in `_finalize()` to catch steps
-        from any early-return path that skips the per-iteration point."""
-        if not self._pending_steps:
-            return
-        try:
-            _append_steps_to_disk(self._run_id, self._pending_steps)
-            self._pending_steps = []
-        except Exception as e:
-            logger.error("Flush steps: %s", e)
-
+        return self.memory._flush_steps(self)
     def get_steps(self, n: int = 50) -> list[dict]:
-        """In-memory steps for the current run — fast, no disk access."""
-        return self._steps[-n:]
-
+        return self.memory.get_steps(self, n)
     def get_persisted_steps(self, run_id: str | None = None, n: int = 100) -> list[dict]:
-        """Disk-backed steps — survive a crash/restart, retrievable from a
-        different process or agent instance. Defaults to this agent's own
-        run (which stays the same run_id across a resume)."""
-        return _get_persisted_steps(run_id=run_id or self._run_id, n=n)
-
+        return self.memory.get_persisted_steps(self, run_id, n)
     def clear_run_steps(self, run_id: str | None = None) -> int:
-        return _clear_persisted_steps(run_id=run_id or self._run_id)
-
-    @staticmethod
-    def _extract_json(text: str, default: str = "{}") -> Any:
-        """Strip code-fence/`json` noise the LLM sometimes wraps JSON in, then parse.
-        Used by the planner, replanner, completion evaluator, and post-mortem writer,
-        which previously each repeated this cleanup inline."""
-        raw = (text or default).strip().strip("```").lstrip("json").strip()
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return json.loads(default)
-
+        return self.memory.clear_run_steps(self, run_id)
+    def _extract_json(self, text: str, default: str = "{}"):
+        return self.reflection._extract_json(text, default)
     def _restore_snapshot(self, snapshot: dict) -> None:
-        self._goal = snapshot.get("goal", self._goal)
-        self._run_id = snapshot.get("run_id", self._run_id)
-        self.history = snapshot.get("history", self.history)
-        self._trace = snapshot.get("trace", self._trace)
-        self._resume_state = snapshot.get("resume_state", self._resume_state)
-        self._milestones = snapshot.get("milestones", self._milestones)
-        self._execution_queue = snapshot.get("execution_queue", self._execution_queue)
-        self._execution_index = snapshot.get("execution_index", self._execution_index)
-        self._active_execution_item = snapshot.get("active_execution_item", self._active_execution_item)
-        self._belief = snapshot.get("belief", self._belief)
-        try:
-            self._phase = Phase(snapshot.get("phase", self._phase.value))
-        except ValueError:
-            self._phase = Phase.PLANNING
-        self._complexity_score = snapshot.get("complexity_score", self._complexity_score)
-        self._is_complex_task = snapshot.get("is_complex_task", self._is_complex_task)
-        self._max_iter = snapshot.get("max_iter", self._max_iter)
-        self._matched_skills = snapshot.get("matched_skills", self._matched_skills)
-        self._last_matched_skills = snapshot.get("last_matched_skills", self._last_matched_skills)
-        self._system_prompt = snapshot.get("system_prompt", self._system_prompt)
-        self._subtasks = snapshot.get("subtasks", self._subtasks)
-        self._subtask_idx = snapshot.get("subtask_idx", self._subtask_idx)
-        self._milestone_idx = snapshot.get("milestone_idx", self._milestone_idx)
-        self._total_subtasks = snapshot.get("total_subtasks", self._total_subtasks)
-        self._current_subtask = snapshot.get("current_subtask", self._current_subtask)
-        self._execution_complete = snapshot.get("execution_complete", self._execution_complete)
-        if self._resume_state:
-            set_execution_state({"state": self._resume_state})
-
+        return self.persistence._restore_snapshot(self, snapshot)
     async def resume_last_task(self) -> str:
         snapshot = load_last_run()
         if not snapshot:
@@ -435,35 +243,12 @@ class PenzerAgent:
         self._resume_boundary_trace_len = len(self._trace)
         result = await self._loop()
         return await self._finalize(self._goal, result)
-
     def list_plugin_tools(self) -> list[str]:
-        """Return sorted available plugin tool names."""
-        return sorted((getattr(self, "_plugin_tools", {}) or {}).keys())
-
+        return self.execution.list_plugin_tools(self)
     def _looks_like_memory_query(self, query: str) -> bool:
-        q = query.lower()
-        return any(cue in q for cue in (
-            "remember", "memory", "recall", "stored", "last time", "as before",
-            "what do you know", "what did you", "my ", "me ", "preference",
-            "path", "project", "config", "env", "ip", "address", "name",
-            "email", "phone",
-        ))
-
+        return self.planner._looks_like_memory_query(self, query)
     def _match_core_skills(self, user_input: str) -> list:
-        lowered = user_input.lower()
-        matched = []
-        facts = get_relevant_kv_facts(user_input, n=3)
-        for skill in self.core_skills:
-            skill_name = (skill.name or "").lower()
-            keyword_hit = any(k.lower() in lowered for k in skill.keywords or [])
-            if keyword_hit:
-                matched.append(skill)
-                continue
-            if "memory" in skill_name and (facts or self._looks_like_memory_query(lowered)):
-                matched.append(skill)
-        return matched
-
-    # -- Public -----------------------------------------------------------------
+        return self.planner._match_core_skills(self, user_input)
     async def run(self, user_input: str) -> str:
         self._reset()
         self._goal             = user_input
@@ -557,7 +342,6 @@ class PenzerAgent:
         self._flush_steps()
         result = await self._loop()
         return await self._finalize(user_input, result)
-
     async def _finalize(self, user_input: str, result: str) -> str:
         """
         Shared post-loop wrap-up for both `run()` and `resume_last_task()`.
@@ -608,395 +392,44 @@ class PenzerAgent:
             asyncio.ensure_future(consolidate_memory(self.llm))
         save_history(self.history)
         return result
-
-    # -- Skill Orchestration ------------------------------------------------------
     def _orchestrate_skills(self) -> None:
-        self._skill_plan  = []
-        self._skill_steps = {s.name: 0 for s in self._active_skills}
-        self._skill_done  = set()
-        for skill in self._active_skills:
-            behavior = (skill.agent_behavior or "").strip()
-            lines    = [l.strip() for l in behavior.splitlines()
-                        if l.strip() and not l.strip().startswith("#")]
-            tools    = set(skill.mcp_tools or [])
-            for idx, line in enumerate(lines):
-                self._skill_plan.append({
-                    "skill": skill.name, "step": idx,
-                    "instruction": line, "tools": tools, "done": False,
-                })
-        tool_order = ["memory", "planning", "browser", "terminal", "file_editor"]
-        self._skill_plan.sort(key=lambda s: next(
-            (i for i, t in enumerate(tool_order) if t in s["tools"]), len(tool_order)
-        ))
-
+        return self.planner._orchestrate_skills(self)
     def _skill_plan_summary(self) -> str:
-        if not self._skill_plan:
-            return ""
-        total   = len(self._skill_plan)
-        done    = sum(1 for s in self._skill_plan if s["done"])
-        pending = [s for s in self._skill_plan if not s["done"]][:3]
-        lines   = [f"SKILL PLAN [{done}/{total} steps]"]
-        for s in pending:
-            lines.append(f"  [{s['skill']}] step {s['step']+1}: {s['instruction'][:80]}")
-        return "\n".join(lines)
-
+        return self.planner._skill_plan_summary(self)
     def _mark_skill_step_done(self, tool_name: str) -> None:
-        for step in self._skill_plan:
-            if step["done"]:
-                continue
-            if not step["tools"] or tool_name in step["tools"]:
-                step["done"] = True
-                skill_name   = step["skill"]
-                self._skill_steps[skill_name] = step["step"] + 1
-                if all(s["done"] for s in self._skill_plan if s["skill"] == skill_name):
-                    self._skill_done.add(skill_name)
-                break
-
+        return self.planner._mark_skill_step_done(self, tool_name)
     def _skills_for_tool(self, tool_name: str) -> list:
-        return [s for s in self._active_skills
-                if not set(s.mcp_tools or []) or tool_name in set(s.mcp_tools or [])]
-
-    # -- Working Memory -------------------------------------------------------------
+        return self.planner._skills_for_tool(self, tool_name)
     def _update_working_memory(self, tool: str, result: str, ok: bool) -> None:
-        """Keep last WORKING_MEMORY_SIZE relevant facts from tool results."""
-        if ok and result and result != "(empty)":
-            self._working_mem.append(f"{tool}: {result[:80]}")
-
+        return self.memory._update_working_memory(self, tool, result, ok)
     def _persist_resume_snapshot(self) -> None:
-        try:
-            save_last_run({
-                "goal": self._goal,
-                "run_id": self._run_id,
-                "history": self.history,
-                "trace": self._trace,
-                "resume_state": self._resume_state,
-                "milestones": self._milestones,
-                "execution_queue": self._execution_queue,
-                "execution_index": self._execution_index,
-                "active_execution_item": self._active_execution_item,
-                "belief": self._belief,
-                "phase": self._phase.value,
-                "complexity_score": self._complexity_score,
-                "is_complex_task": self._is_complex_task,
-                "max_iter": self._max_iter,
-                "matched_skills": self._matched_skills,
-                "last_matched_skills": self._last_matched_skills,
-                "system_prompt": self._system_prompt,
-                "subtasks": self._subtasks,
-                "subtask_idx": self._subtask_idx,
-                "milestone_idx": self._milestone_idx,
-                "total_subtasks": self._total_subtasks,
-                "current_subtask": self._current_subtask,
-                "execution_complete": self._execution_complete,
-            })
-        except Exception as e:
-            logger.error("Persist snapshot: %s", e)
-
+        return self.persistence._persist_resume_snapshot(self)
     def _working_mem_summary(self) -> str:
-        if not self._working_mem:
-            return ""
-        return "WORKING MEM: " + " | ".join(list(self._working_mem)[-3:])
-
-    # -- Hierarchical Planner ---------------------------------------------------------
+        return self.memory._working_mem_summary(self)
     async def _plan_hierarchical(self, goal: str) -> list[dict]:
-        """
-        Level 1: 3-5 high-level milestones
-        Level 2: each milestone -> 2-3 executable steps
-        Returns: [{milestone, steps: [str]}]
-        """
-        self.on_status("Planning…")
-        try:
-            r = await asyncio.wait_for(
-                self.llm.chat(
-                    system=(
-                        "Create a hierarchical plan. Return JSON array of objects: "
-                        '[{"milestone": "...", "steps": ["step1", "step2"]}]. '
-                        "2-4 milestones, 2-3 steps each. No markdown."
-                    ),
-                    messages=[{"role": "user", "content": f"Goal: {goal}"}],
-                ),
-                timeout=15,
-            )
-            plan = self._extract_json(r.get("content", ""), default="[]")
-            if isinstance(plan, list) and plan:
-                self._record_step(
-                    "planning",
-                    f"Planned {len(plan)} milestones: " +
-                    "; ".join(m.get("milestone", "") for m in plan)[:200],
-                )
-                return plan
-        except Exception as e:
-            logger.debug("Hierarchical planner: %s", e)
-        self._record_step("planning", "No hierarchical plan needed — proceeding directly.")
-        return []
-
+        return await self.planner._plan_hierarchical(self, goal)
     async def _replan_milestone(self, milestone: str, reason: str) -> list[str]:
-        """Replan only the failed milestone branch — not the whole task."""
-        try:
-            r = await asyncio.wait_for(
-                self.llm.chat(
-                    system="Task replanner. Return JSON array of 2-3 new steps. No markdown.",
-                    messages=[{"role": "user", "content":
-                        f"Milestone: {milestone}\nFailed because: {reason}\n"
-                        f"Context: {self._belief_summary()}\nNew steps:"}],
-                ),
-                timeout=10,
-            )
-            steps = self._extract_json(r.get("content", ""), default="[]")
-            if isinstance(steps, list) and steps:
-                return steps
-        except Exception as e:
-            logger.debug("Replan: %s", e)
-        return []
-
-    # -- Tool Confidence Scoring --------------------------------------------------------
+        return await self.planner._replan_milestone(self, milestone, reason)
     def _tool_confidence(self, tool_name: str, args: dict) -> float:
-        """
-        Score 0.0-1.0 confidence that this tool will succeed.
-        Factors: past success rate + belief state match + consecutive error penalty
-        """
-        score = 0.7
-        consec = self._consec_errors.get(tool_name, 0)
-        score -= consec * 0.15
-        if self._belief["goal_progress"] != "blocked":
-            score += 0.1
-        key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
-        if key in self._cache:
-            score -= 0.3  # cached = already tried
-        for skill in self._skills_for_tool(tool_name):
-            m = get_skill_metric(skill.name)
-            score += m.get("success_rate", 0) * 0.1
-        return round(min(1.0, max(0.0, score)), 6)
-
-    # -- Belief State -------------------------------------------------------------------
+        return self.execution._tool_confidence(self, tool_name, args)
     def _update_belief(self, tool: str, args: dict, result: str, ok: bool) -> None:
-        self._belief["last_action"]  = f"{tool}({self._fmt_action(tool, args)})"
-        self._belief["last_outcome"] = "ok" if ok else f"failed: {result[:60]}"
-        if ok:
-            fact = f"{tool}: {result[:80]}"
-            if fact not in self._belief["verified_facts"]:
-                self._belief["verified_facts"].append(fact)
-                self._belief["verified_facts"] = self._belief["verified_facts"][-5:]
-            if self._phase in (Phase.PLANNING, Phase.BLOCKED, Phase.REFLECTING, Phase.FAILED):
-                self._transition(Phase.EXECUTING, reason=f"{tool} succeeded")
-        else:
-            if self._phase != Phase.BLOCKED:
-                self._transition(Phase.BLOCKED, reason=f"{tool} failed: {result[:60]}")
-
+        return self.belief._update_belief(self, tool, args, result, ok)
     def _belief_summary(self) -> str:
-        b     = self._belief
-        lines = [f"BELIEF: {b['goal_progress'].upper()}"]
-        if b["verified_facts"]:
-            lines.append(f"  Know: {' | '.join(b['verified_facts'][-2:])}")
-        if b["assumptions"]:
-            lines.append(f"  Assuming: {' | '.join(b['assumptions'][:2])}")
-        if b["unknowns"]:
-            lines.append(f"  Unknown: {' | '.join(b['unknowns'][:2])}")
-        if b["last_action"]:
-            lines.append(f"  Last: {b['last_action']} -> {b['last_outcome']}")
-        return "\n".join(lines)
-
-    # -- State consistency (phase vs. skill plan vs. execution queue) -------------------
+        return self.belief._belief_summary(self)
     def _check_consistency(self) -> list[str]:
-        """
-        Cross-checks phase against the two other structures that track
-        "are we done yet" independently — the execution queue and the
-        skill plan. Returns a list of human-readable violations; doesn't
-        raise or log itself, so callers (checkpoints, tests) decide what
-        to do with it. This is read-only — it reports drift, it doesn't
-        try to correct it, since silently overwriting one structure to
-        match another could paper over the actual bug that caused them
-        to disagree in the first place.
-        """
-        violations = []
-
-        if self._phase == Phase.DONE:
-            if self._active_execution_item is not None:
-                violations.append(
-                    f"phase=DONE but execution item still active: {self._active_execution_item.get('title', '?')}"
-                )
-            if self._milestones:
-                violations.append("phase=DONE but hierarchical milestones were not cleared")
-
-        if self._phase in (Phase.PLANNING, Phase.BLOCKED):
-            if self._execution_complete and self._milestones:
-                violations.append(
-                    f"phase={self._phase.value} but the execution queue already reports complete"
-                )
-
-        if (
-            self._is_complex_task
-            and self._execution_complete
-            and self._active_execution_item is None
-            and self._milestones == []
-            and self._phase not in (Phase.DONE, Phase.FAILED, Phase.PLANNING)
-        ):
-            violations.append(
-                f"execution queue is fully drained but phase is still {self._phase.value}, "
-                "not DONE/FAILED"
-            )
-
-        if self._skill_plan and self._matched_skills:
-            all_skill_steps_done = all(s["done"] for s in self._skill_plan)
-            if all_skill_steps_done and self._phase == Phase.PLANNING:
-                violations.append("skill plan fully complete but phase never left PLANNING")
-
-        if self._phase == Phase.BLOCKED and self._belief["last_outcome"].startswith("ok"):
-            violations.append("phase=BLOCKED but the last recorded belief outcome was 'ok'")
-
-        return violations
-
-    # -- Task Completion Evaluator (Reflexion) -------------------------------------------
+        return self.belief._check_consistency(self)
     async def _evaluate_completion(self, goal: str, result: str) -> tuple[bool, str]:
-        try:
-            r = await asyncio.wait_for(
-                self.llm.chat(
-                    system=(
-                        "Evaluate if goal was achieved. "
-                        'Return JSON: {"completed": true/false, "reason": "one sentence"}. '
-                        "Be strict — partial = not completed."
-                    ),
-                    messages=[{"role": "user", "content":
-                        f"GOAL: {goal}\nRESULT: {result[:200]}\n"
-                        f"TOOLS: {' -> '.join(t['tool'] for t in self._trace)}"}],
-                ),
-                timeout=10,
-            )
-            ev = self._extract_json(r.get("content", ""), default="{}")
-            return bool(ev.get("completed", True)), ev.get("reason", "")
-        except Exception:
-            return True, ""
-
-    # -- Reflexion + ExpeL ----------------------------------------------------------------
+        return await self.reflection._evaluate_completion(self, goal, result)
     async def _write_post_mortem_and_insights(self, goal: str, result: str) -> None:
-        worked = " -> ".join(
-            f"{t['tool']}({self._fmt_action(t['tool'], t['args'])})"
-            for t in self._trace if t["success"]
-        )[:200] or "none"
-        failed = " -> ".join(
-            f"{t['tool']}({t.get('error_type','?')})"
-            for t in self._trace if not t["success"]
-        )[:200] or "none"
-        try:
-            r = await asyncio.wait_for(
-                self.llm.chat(
-                    system=(
-                        "Post-mortem + extract insight. "
-                        "JSON keys: what_worked, what_failed, next_time, insight. "
-                        "insight = one general rule for future tasks. One sentence each."
-                    ),
-                    messages=[{"role": "user", "content":
-                        f"Goal: {goal}\nOutcome: {result[:80]}\n"
-                        f"Worked: {worked}\nFailed: {failed}"}],
-                ),
-                timeout=15,
-            )
-            pm = self._extract_json(r.get("content", ""), default="{}")
-            store_post_mortem(
-                task_type=goal[:40],
-                what_worked=pm.get("what_worked", worked),
-                what_failed=pm.get("what_failed", failed),
-                next_time=pm.get("next_time", ""),
-            )
-            if pm.get("insight"):
-                store_insight(
-                    insight=pm["insight"],
-                    source_tasks=[goal[:40]],
-                    confidence=0.7 if any(t["success"] for t in self._trace) else 0.4,
-                )
-            if any(t["success"] for t in self._trace):
-                remember_semantic(
-                    pattern=f"For '{goal[:40]}': {worked}",
-                    confidence=0.7,
-                )
-        except Exception as e:
-            logger.debug("Post-mortem: %s", e)
-
+        return await self.reflection._write_post_mortem_and_insights(self, goal, result)
     def _build_execution_queue(self) -> None:
-        self._execution_queue = []
-        self._execution_index = 0
-        self._active_execution_item = None
-        self._execution_complete = False
-        if not self._milestones:
-            self._execution_complete = True
-            return
-        for milestone_idx, milestone in enumerate(self._milestones):
-            milestone_name = milestone.get("milestone", "").strip()
-            if milestone_name:
-                self._execution_queue.append({
-                    "kind": "milestone",
-                    "title": milestone_name,
-                    "milestone_idx": milestone_idx,
-                    "step_index": None,
-                })
-            for step_idx, step in enumerate(milestone.get("steps", []) or []):
-                if step:
-                    self._execution_queue.append({
-                        "kind": "step",
-                        "title": step,
-                        "milestone_idx": milestone_idx,
-                        "step_index": step_idx,
-                    })
-
+        return self.planner._build_execution_queue(self)
     def _claim_next_execution_item(self) -> dict | None:
-        if self._execution_complete:
-            return None
-        if self._execution_index >= len(self._execution_queue):
-            self._execution_complete = True
-            self._active_execution_item = None
-            return None
-        item = self._execution_queue[self._execution_index]
-        self._execution_index += 1
-        self._active_execution_item = item
-        self._current_subtask = item.get("title", "")
-        self._milestone_idx = item.get("milestone_idx", getattr(self, "_milestone_idx", 0))
-        if self._milestones and self._milestone_idx < len(self._milestones):
-            self._subtasks = self._milestones[self._milestone_idx].get("steps", [])
-        else:
-            self._subtasks = getattr(self, "_subtasks", [])
-        return item
-
+        return self.planner._claim_next_execution_item(self)
     def _complete_current_execution_item(self, success: bool = True) -> None:
-        if self._active_execution_item is None:
-            return
-        self._active_execution_item = None
-        self._execution_complete = self._execution_index >= len(self._execution_queue)
-        if not success:
-            self._execution_complete = False
-        if self._execution_complete:
-            # Previously this only happened at the top of the *next*
-            # iteration's loop body — so a task that gave its final
-            # answer in the same iteration its last step completed would
-            # transition to DONE with `_milestones` still populated.
-            self._milestones = []
-
-    # -- Main Loop --------------------------------------------------------------------
+        return self.planner._complete_current_execution_item(self, success)
     def _can_extend_iterations(self) -> bool:
-        """
-        Called only when about to hit the current iteration cap. Iteration
-        count is an arbitrary proxy — `score_complexity()` can't know a
-        plainly-worded task ("check open ports") needs several discovery
-        calls, so budgeting by iteration count alone means either
-        over-granting for genuinely simple tasks or hard-stopping
-        legitimate ones partway through. The real questions are: is it
-        still making progress, is it burning too much wall-clock time,
-        and is it burning too many resources — not "has it called a tool
-        N times". Extension is unlimited in *count*; these are the actual
-        backstops.
-        """
-        if self._phase in (Phase.DONE, Phase.FAILED):
-            return False
-        if self._iteration >= ABSOLUTE_MAX_ITER:
-            return False
-        if time.time() - self._run_start_time > MAX_RUNTIME_SECONDS:
-            return False
-        resource_ok, _ = self._monitor.check()
-        if not resource_ok:
-            return False
-        if not self._trace:
-            return False
-        return any(t["success"] for t in self._trace[-3:]) and not self._stuck()
-
+        return self.reflection._can_extend_iterations(self)
     async def _loop(self) -> str:
         empty = 0
         for i in itertools.count():
@@ -1254,8 +687,6 @@ class PenzerAgent:
                 self._meta_skill_triggered = True
                 self._inject_meta_skill_reminder()
         return "Iteration limit reached"
-
-    # -- Rate-limit retry ---------------------------------------------------------------
     async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
         delay = RATE_LIMIT_BASE
         for attempt in range(max_attempts):
@@ -1287,101 +718,18 @@ class PenzerAgent:
                 logger.error("LLM error: %s", e)
                 return None
         return None
-
-    # -- Tool execution (shared by parallel + speculative paths) ------------------------
     async def _execute_single_tool(self, call: dict) -> tuple[str, float]:
-        """Runs exactly one tool call: memory short-circuit, availability
-        check, status update, timeout wrapping. Shared by `_run_parallel`
-        and `_run_race` so both stay in sync automatically."""
-        name  = call["name"]
-        args  = call.get("arguments", {})
-        start = time.time()
-        if name == "memory":
-            self.on_status(f"🧠 {self._fmt_action(name, args)}")
-            raw = self._run_memory_tool(args)
-            return raw, round(time.time() - start, 2)
-        # A call is valid if it's a registered MCP tool, the plugin_tool
-        # creation action, or a dynamically created plugin (auto- or
-        # explicitly-created). This used to check `self.tools` (the MCP
-        # registry) only — so a plugin tool could be created successfully
-        # and still get rejected as "Unknown tool" the moment anything
-        # tried to actually call it, since `_run()`'s own plugin-dispatch
-        # branch (`if name in self._plugin_tools`) was never reached.
-        if name != "plugin_tool" and name not in self._plugin_tools and name not in self.tools:
-            return f"Unknown tool '{name}'.", 0.0
-        self.on_status(f"{TOOL_LABELS.get(name, name)} {self._fmt_action(name, args)}")
-        try:
-            raw = await asyncio.wait_for(self._run(name, args), timeout=TOOL_TIMEOUT)
-        except asyncio.TimeoutError:
-            raw = f"Timeout after {TOOL_TIMEOUT}s"
-        return raw, round(time.time() - start, 2)
-
+        return await self.execution._execute_single_tool(self, call)
     async def _run_speculative(self, calls: list) -> list[tuple[str, float]]:
-        """
-        For independent tool calls: race them and take the first success.
-        For dependent calls (share file/env): run sequentially.
-        Otherwise: run in parallel.
-        """
-        if len(calls) <= 1:
-            return await self._run_parallel(calls)
-
-        def get_target(c):
-            args = c.get("arguments", {})
-            return args.get("filepath") or args.get("command", "")[:20]
-
-        targets = [get_target(c) for c in calls]
-        unique  = len(set(t for t in targets if t)) == len([t for t in targets if t])
-        if unique and all(c["name"] in ("browser", "terminal", "run_bash") for c in calls):
-            return await self._run_race(calls)
-        return await self._run_parallel(calls)
-
+        return await self.execution._run_speculative(self, calls)
     async def _run_race(self, calls: list) -> list[tuple[str, float]]:
-        """Launch all calls, cancel losers when first succeeds."""
-        results = [("(cancelled)", 0.0)] * len(calls)
-
-        async def run_and_report(idx: int, c: dict, done_event: asyncio.Event):
-            raw, elapsed = await self._execute_single_tool(c)
-            results[idx] = (raw, elapsed)
-            if not self._is_error(raw):
-                done_event.set()
-
-        done  = asyncio.Event()
-        tasks = [asyncio.create_task(run_and_report(i, c, done)) for i, c in enumerate(calls)]
-        try:
-            await asyncio.wait_for(done.wait(), timeout=TOOL_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
-        finally:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-        return results
-
+        return await self.execution._run_race(self, calls)
     def _fallback_tool(self, tool_name: str) -> str | None:
-        return FALLBACKS.get(tool_name)
-
+        return self.execution._fallback_tool(self, tool_name)
     async def _run_with_fallback(self, call: dict) -> tuple[str, float]:
-        name = call.get("name")
-        if not name:
-            return "No tool name provided", 0.0
-        results = await self._run_parallel([call])
-        raw, elapsed = results[0] if results else ("", 0.0)
-        if raw and not self._is_error(raw):
-            return raw, elapsed
-        fallback = self._fallback_tool(name)
-        if fallback and fallback in self.tools:
-            self._record_step("tool_call", f"{name} failed — falling back to {fallback}",
-                               tool=fallback, fallback_from=name)
-            fb_call = {**call, "name": fallback}
-            fb_results = await self._run_parallel([fb_call])
-            fb_raw, fb_elapsed = fb_results[0] if fb_results else ("", 0.0)
-            return fb_raw, fb_elapsed
-        return raw, elapsed
-
+        return await self.execution._run_with_fallback(self, call)
     async def _run_parallel(self, calls: list) -> list[tuple[str, float]]:
-        return list(await asyncio.gather(*[self._execute_single_tool(c) for c in calls]))
-
-    # -- ReflAct injection ----------------------------------------------------------------
+        return await self.execution._run_parallel(self, calls)
     def _msgs(self, step: int) -> list[dict]:
         if step == 0 or not self._trace:
             return self.history
@@ -1409,185 +757,21 @@ class PenzerAgent:
             "Given belief state, working memory, and skill plan — execute next pending step."
         )
         return self.history + [{"role": "user", "content": inj}]
-
-    # -- Meta-skill injection ---------------------------------------------------------------
     def _inject_meta_skill_reminder(self):
-        winning = " -> ".join(
-            f"{t['tool']}({self._fmt_action(t['tool'], t['args'])})"
-            for t in self._trace if t["success"]
-        )
-        self.history.append({"role": "user", "content": (
-            "[Skill evolution] Complex novel task solved. "
-            f"Winning sequence: {winning}\n"
-            "Before final answer:\n"
-            "1. List agent/skills/generated/ — similar skill exists?\n"
-            "2. If not: write .skill.md with exact sequence + failure_modes.\n"
-            "3. Include: name, description, keywords, agent_behavior, failure_modes, mcp_tools.\n"
-            "Then give your final answer."
-        )})
-
-    # -- Tool execution -----------------------------------------------------------------------
+        return self.reflection._inject_meta_skill_reminder(self)
     async def _run(self, name: str, args: dict) -> str:
-        tools = getattr(self, "tools", {}) or {}
-        if name == "memory" or tools.get(name) == "builtin":
-            return self._run_memory_tool(args)
-        if name == "plugin_tool":
-            return self._run_plugin_tool(args)
-        if name in self._plugin_tools:
-            try:
-                return str(self._plugin_tools[name](**args))
-            except Exception as e:
-                return f"Plugin error: {e}"
-
-        key = f"{name}:{json.dumps(args, sort_keys=True)}"
-        if key in self._cache:
-            return self._cache[key]
-
-        tool = self.tools.get(name)
-        if not tool:
-            return f"Tool '{name}' not available"
-
-        for attempt in range(2):
-            try:
-                fn = getattr(tool, "fn", tool)
-                if fn not in self._fn_cache:
-                    self._fn_cache[fn] = (inspect.signature(fn), inspect.iscoroutinefunction(fn))
-                sig, is_async = self._fn_cache[fn]
-                kw  = {k: v for k, v in args.items() if k in sig.parameters}
-                out = await fn(**kw) if is_async else fn(**kw)
-                self._cache[key] = s = str(out)
-                return s
-            except Exception as e:
-                logger.debug("%s attempt %d: %s", name, attempt + 1, e)
-                if attempt == 1:
-                    fb = FALLBACKS.get(name)
-                    if fb and fb in self.tools:
-                        self._record_step("tool_call", f"{name} errored — falling back to {fb}",
-                                           tool=fb, fallback_from=name)
-                        cmd = args.get("command") or args.get("query") or args.get("code") or ""
-                        return await self._run(fb, {"command": cmd})
-                    return f"Error: {e}"
-        return ""
-
-    # Memory-tool action dispatch. Add a new action by adding a key here.
+        return await self.execution._run(self, name, args)
     def _run_memory_tool(self, args: dict) -> str:
-        """
-        kv_store/kv_delete return confirmation strings (not None/bool),
-        so the LLM sees something meaningful rather than the literal
-        text "None" or "True".
-        """
-        action = args.get("action", "")
-        key    = args.get("key", "")
-        value  = args.get("value", "")
-        handlers = {
-            "get":    lambda: str(kv_get(key)),
-            "store":  lambda: kv_store(key, value),
-            "list":   lambda: json.dumps(kv_list()),
-            "delete": lambda: kv_delete(key),
-        }
-        handler = handlers.get(action)
-        if handler:
-            return handler()
-        return f"Unknown memory action '{action}'. Use: get, store, list, delete"
-
+        return self.execution._run_memory_tool(self, args)
     def _maybe_auto_create_plugin(self) -> bool:
-        """Reuse an existing plugin when possible; otherwise create one for a repeated terminal workflow."""
-        if not getattr(self, "_trace", None):
-            return False
-        repeated = [
-            str((item.get("args") or {}).get("command", "")).strip()
-            for item in self._trace
-            if item.get("tool") == "terminal" and item.get("success")
-        ]
-        repeated = [c for c in repeated if c]
-        if len(repeated) < 2:
-            return False
-        counts = {}
-        for command in repeated:
-            counts[command] = counts.get(command, 0) + 1
-        recurring = [cmd for cmd, count in counts.items() if count >= 2]
-        if not recurring:
-            return False
-        command = recurring[0]
-        # A truncated 40-char slug alone isn't unique — two different
-        # commands that share the same first 30ish characters would
-        # collide, and the `if name in existing_tools: return True` below
-        # would then silently report success for the WRONG command's
-        # plugin. The hash suffix guarantees distinct commands get
-        # distinct names.
-        slug = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
-        name = f"{slug[:30]}_{abs(hash(command)) % 10000}"
-        existing_tools = getattr(self, "_plugin_tools", {}) or {}
-        if name in existing_tools:
-            return True
-        description = f"Reusable helper for: {command[:80]}"
-        # `command` is a default arg, not hardcoded into the call, so the
-        # LLM can override it later with a similar-but-different command
-        # via `command=...` instead of getting a frozen one-off replay of
-        # the exact string that happened to succeed twice.
-        code = (
-            "import subprocess\n\n"
-            f"def {name}(command: str = {command!r}, **kwargs):\n"
-            f"    {description!r}\n"
-            f"    return subprocess.check_output(command, shell=True, text=True)"
-        )
-        try:
-            create_plugin_tool(name=name, description=description, code=code)
-            self._plugin_tools = load_plugin_tools()
-            created = name in self._plugin_tools
-            if created:
-                self._record_step(
-                    "plugin_created",
-                    f"Created reusable tool '{name}' from a repeated command: {command[:80]}",
-                    tool=name,
-                )
-            return created
-        except Exception:
-            return False
-
+        return self.execution._maybe_auto_create_plugin(self)
     def get_plugin_tool_descriptions(self) -> dict[str, str]:
-        """
-        name -> description for every currently loaded plugin tool, read
-        from each function's docstring (which `create_plugin_tool` calls
-        set, and which `_maybe_auto_create_plugin` now embeds directly in
-        the generated code). Used to make plugin tools visible in the
-        system prompt — see the note on `list_plugin_tools` below.
-        """
-        out = {}
-        for name, fn in (getattr(self, "_plugin_tools", {}) or {}).items():
-            doc = (getattr(fn, "__doc__", None) or "").strip()
-            out[name] = doc or "(no description)"
-        return out
-
+        return self.execution.get_plugin_tool_descriptions(self)
     def _run_plugin_tool(self, args: dict) -> str:
-        action = (args.get("action") or "").strip().lower()
-        if action == "create":
-            name = str(args.get("name", "")).strip()
-            description = str(args.get("description", "")).strip()
-            code = str(args.get("code", "")).strip()
-            if not name or not code:
-                return "Plugin creation requires a name and code"
-            try:
-                result = create_plugin_tool(name=name, description=description or "Generated plugin", code=code)
-            except Exception as exc:
-                return f"Plugin creation failed: {exc}"
-            self._plugin_tools = load_plugin_tools()
-            tool_name = result.get("name", name)
-            if tool_name in self._plugin_tools:
-                self._record_step(
-                    "plugin_created",
-                    f"Created reusable tool '{tool_name}': {description or 'Generated plugin'}",
-                    tool=tool_name,
-                )
-                return f"Plugin created successfully: {tool_name}. It's now callable directly by name."
-            return f"Plugin created but not yet available: {tool_name}"
-        return "Unknown plugin action"
-
-    # -- Output ------------------------------------------------------------------------
+        return self.execution._run_plugin_tool(self, args)
     def _fmt_action(self, name: str, args: dict) -> str:
         fmt = ACTION_FORMATTERS.get(name)
         return fmt(args) if fmt else f"-> {json.dumps(args)[:60]}"
-
     def _fmt_tool_output(self, name: str, args: dict, raw: Any, ok: bool, elapsed: float) -> str:
         hdr = f"[{name}] {self._fmt_action(name, args)} ({elapsed}s) {'ok' if ok else 'FAILED'}"
         if not ok:
@@ -1604,7 +788,6 @@ class PenzerAgent:
         if name == "memory" and args.get("action") in ("store", "delete"):
             return f"{hdr}\nDone"
         return f"{hdr}\n{self._brief(raw)}"
-
     def _brief(self, raw: Any) -> str:
         s = str(raw).strip() or "(empty)"
         try:
@@ -1618,109 +801,35 @@ class PenzerAgent:
         except (json.JSONDecodeError, ValueError):
             pass
         return s[:250] + f" … [{len(s)-250} more]" if len(s) > 250 else s
-
-    # -- Helpers ------------------------------------------------------------------------
     def _is_error(self, r: Any) -> bool:
         return any(t in str(r).lower() for t in (
             "error", "failed", "exception", "traceback",
             "not found", "unknown tool", "permission denied", "timeout",
         ))
-
     def _categorize_error(self, result: Any) -> str:
         s = str(result).lower()
         for pattern, label in ERROR_PATTERNS:
             if pattern in s:
                 return label
         return "ERROR"
-
     def _last_role(self) -> str:
         for m in reversed(self.history):
             if m.get("role") in ("user", "assistant", "tool"):
                 return m["role"]
         return ""
-
     def _stuck(self) -> bool:
-        w    = self.history[-6:]
-        msgs = [m for m in w if m.get("role") == "tool"]
-        if len(msgs) < STUCK_MIN:
-            return False
-        if len({str(m.get("content", ""))[:80] for m in msgs}) == 1:
-            return True
-        names = []
-        for m in w:
-            if m.get("role") == "assistant":
-                try:
-                    names.extend(tc["name"] for tc in json.loads(m["content"]).get("tool_calls", []))
-                except Exception:
-                    pass
-        if len(names) >= 3 and len(set(names)) == 1:
-            return True
-        recent = self._trace[-STUCK_MIN:]
-        return len(recent) >= STUCK_MIN and all(not s["success"] for s in recent)
-
+        return self.reflection._stuck(self)
     async def _reflect(self) -> str:
-        failed = "\n".join(
-            f"  {s['tool']} -> {s.get('error_type','?')}: {s['result'][:80]}"
-            for s in self._trace[-3:] if not s["success"]
-        ) or "  (none)"
-        r = await self.llm.chat(
-            system="Debug agent failures. DIAGNOSIS then NEXT STEP.",
-            messages=[{"role": "user", "content":
-                f"GOAL: {self._goal}\n{self._belief_summary()}\nFAILED:\n{failed}\n\nDIAGNOSIS:\nNEXT:"}],
-        )
-        return r.get("content", "Try completely different approach")
-
+        return await self.reflection._reflect(self)
     async def _trim(self) -> None:
-        if self._trimming or len(self.history) <= TRIM_AT:
-            return
-        self._trimming = True
-        first, mid, tail = self.history[:1], self.history[1:-KEEP_LAST], self.history[-KEEP_LAST:]
-        if not mid:
-            self._trimming = False
-            return
-        try:
-            r = await self.llm.chat(
-                system=(
-                    f"Compress history. GOAL: {self._goal}\n"
-                    "Keep goal-relevant facts only. 2-3 sentences: what tried, what worked, what still needed."
-                ),
-                messages=[{"role": "user", "content": "\n".join(
-                    f"{m['role']}: {str(m.get('content',''))[:100]}" for m in mid
-                )}],
-            )
-            self.history = first + [
-                {"role": "assistant", "content": f"[Summary] {r.get('content','')}"}
-            ] + tail
-        except Exception:
-            self.history = first + tail
-        finally:
-            self._trimming = False
-
+        return await self.persistence._trim(self)
     async def _checkpoint(self, iteration: int):
-        try:
-            violations = self._check_consistency()
-            if violations:
-                logger.warning("State consistency violations at iter %d: %s", iteration, violations)
-            add_checkpoint({
-                "timestamp":   datetime.now().isoformat(),
-                "iteration":   iteration,
-                "goal":        self._goal,
-                "belief":      self._belief["goal_progress"],
-                "phase":       self._phase.value,
-                "milestone":   f"{self._milestone_idx}/{len(self._milestones)}",
-                "trace_len":   len(self._trace),
-                "resources":   self._monitor.stats(),
-                "consistency_violations": violations,
-            })
-        except Exception as e:
-            logger.debug("Checkpoint: %s", e)
-
+        return await self.persistence._checkpoint(self, iteration)
     def clear_session(self) -> None:
         self.history.clear()
         self._reset()
         clear_history()
         clear_last_run()
-
     def get_metrics(self) -> dict:
         return {
             "goal":            self._goal,
