@@ -11,30 +11,29 @@ import os
 import signal
 from pathlib import Path
 from typing import Optional, Callable
-
-from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-
-from logger import get_logger
+from logger import get_logger, console as console
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state
 from config import DEFAULT_PROFILE, PROFILE_OPTIONS, get_profile_settings
-
 logger = get_logger("cli")
-for _log in [
-    "agent.agent", "penzer.core", "penzer.server",
-    "agent.skills.search", "agent.skills.loader",
-    "agent.skills.base", "session.memory", "httpx",
-]:
-    logging.getLogger(_log).setLevel(logging.WARNING)
-
 from agent.agent import PenzerAgent
 from agent.server import start_server
-
-console = Console(force_terminal=True, width=100)
-
-
+# Moved here (after all imports) rather than right after `logger = get_logger("cli")`:
+# anything imported above gets a chance to touch its own logger's level at
+# import time, so suppressing before those imports run could get silently
+# overridden by whatever runs later. This is defense-in-depth — the real
+# fix is RichHandler in logger.py, which means even an unsuppressed logger
+# renders cleanly instead of corrupting the terminal, but there's no reason
+# to be noisier than necessary either.
+for _log in [
+    "agent.agent", "agent.penzermodule", "penzer.core", "penzer.server",
+    "agent.skills.search", "agent.skills.loader",
+    "agent.skills.base", "session.memory", "httpx",
+    "tools.executor", "tools.plugins",
+]:
+    logging.getLogger(_log).setLevel(logging.WARNING)
 def compose_summary_lines(matched: list[str] | None = None, trace: list | None = None, calls_used: int = 0, tokens_used: int = 0) -> list[str]:
     """Generate formatted status lines with rich formatting."""
     lines = []
@@ -48,8 +47,6 @@ def compose_summary_lines(matched: list[str] | None = None, trace: list | None =
         llm_text = f"[bold cyan]LLM:[/] [magenta]{calls_used}[/] calls [dim]·[/] ~[magenta]{tokens_used}[/] tokens"
         lines.append(llm_text)
     return lines
-
-
 class LiveStatusView:
     def __init__(self) -> None:
         self.current = "[dim]Starting…[/]"
@@ -71,7 +68,6 @@ class LiveStatusView:
             self.current = message
             self.events.append(message)
             self.events = self.events[-6:]
-
     def render(self) -> str:
         with self._lock:
             lines = []
@@ -86,8 +82,6 @@ class LiveStatusView:
                 first_state = state.splitlines()[0]
                 lines.append(f"  [dim]↳[/] {first_state}")
             return "\n".join(lines)
-
-
 def clean_response(text: str) -> str:
     """Clean and parse CLI response text with robust error handling."""
     if not text:
@@ -110,7 +104,6 @@ def clean_response(text: str) -> str:
         return text
     text = re.sub(r'^(thought|answer)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
     text = re.sub(r'```[\w]*\n?', '', text).strip()
-
     def strip_json_blocks(s: str) -> str:
         result, depth, in_string, escape = [], 0, False, False
         for ch in s:
@@ -132,11 +125,8 @@ def clean_response(text: str) -> str:
             if depth == 0:
                 result.append(ch)
         return ''.join(result).strip()
-
     text = strip_json_blocks(text)
     return text.strip() or "Done."
-
-
 def build_help_text() -> str:
     return "\n".join([
         "[bold]Commands[/bold]",
@@ -153,8 +143,6 @@ def build_help_text() -> str:
         "• [cyan]benchmark[/cyan]  Show a lightweight quality summary",
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
-
-
 PENZER_LOGO = r"""
  ____   _____   _   _   _____   _____   ____  
 |  _ \ | ____| | \ | | |__  / | ____| |  _ \ 
@@ -162,8 +150,6 @@ PENZER_LOGO = r"""
 |  __/ | |___  | |\  |  / /_  | |___  |  _ < 
 |_|    |_____| |_| \_| /____| |_____| |_| \_\
 """.strip("\n")
-
-
 def display_banner():
     console.print(f"[bold red]{PENZER_LOGO}")
     console.print(Panel(
@@ -173,12 +159,8 @@ def display_banner():
         border_style="red",
         padding=(0, 1),
     ))
-
-
 def display_help():
     console.print(Panel(build_help_text(), title="Help", border_style="cyan", padding=(0, 1)))
-
-
 def maybe_notify_update() -> None:
     try:
         result = check_for_update()
@@ -189,12 +171,8 @@ def maybe_notify_update() -> None:
             console.print()
     except Exception:
         pass
-
-
 def _env_path() -> Path:
     return Path(".env")
-
-
 def _read_env() -> dict[str, str]:
     env = {}
     path = _env_path()
@@ -208,8 +186,6 @@ def _read_env() -> dict[str, str]:
         key, value = line.split("=", 1)
         env[key.strip()] = value.strip().strip('"').strip("'")
     return env
-
-
 def _write_env(updates: dict[str, str]) -> None:
     path = _env_path()
     existing_lines = []
@@ -233,14 +209,10 @@ def _write_env(updates: dict[str, str]) -> None:
         if key not in existing_keys:
             existing_lines.append(f'{key}="{value}"')
     path.write_text("\n".join(existing_lines).strip() + "\n", encoding="utf-8")
-
-
 def _mask_key(key: str) -> str:
     if not key:
         return "(none)"
     return key if len(key) <= 8 else f"{key[:4]}...{key[-4:]}"
-
-
 def _handle_apikey_command(user_input: str) -> None:
     tokens = user_input.split()
     if len(tokens) == 1 or tokens[1] in ("help", "show"):
@@ -269,8 +241,6 @@ def _handle_apikey_command(user_input: str) -> None:
     console.print("  apikey set <API_KEY> <URL>")
     console.print("  apikey local <LOCAL_SERVER_URL>")
     console.print("[dim]Example: apikey set mykey https://api.openai.com/v1[/dim]")
-
-
 class ShutdownHandler:
     """Handles graceful shutdown of CLI components."""
     def __init__(self):
@@ -299,8 +269,6 @@ class ShutdownHandler:
     def should_exit(self) -> bool:
         """Check if shutdown was requested."""
         return self._should_exit.is_set()
-
-
 def safe_subprocess_run(*args, **kwargs) -> subprocess.CompletedProcess:
     """Wrapper for subprocess.run with enhanced error handling."""
     try:
@@ -312,8 +280,6 @@ def safe_subprocess_run(*args, **kwargs) -> subprocess.CompletedProcess:
     except Exception as e:
         logger.error(f"Unexpected subprocess error: {e}")
         raise
-
-
 async def main():
     try:
         display_banner()
@@ -450,7 +416,6 @@ async def main():
                     border_style="cyan",
                 ))
                 continue
-
             console.print()
             calls_before  = getattr(agent.llm, "call_count", 0)
             tokens_before = getattr(agent.llm, "token_estimate", 0)
@@ -461,14 +426,12 @@ async def main():
                     status.update(f"[cyan]{status_view.current}[/cyan]")
                 agent.on_status = _on_status
                 response = await agent.run(user_input)
-
             calls_used  = getattr(agent.llm, "call_count", 0) - calls_before
             tokens_used = getattr(agent.llm, "token_estimate", 0) - tokens_before
             response = clean_response(response or "No response.")
             if response and response.strip():
                 console.print()
                 console.print(Markdown(response))
-
             matched = getattr(agent, "_matched_skills", [])
             trace = getattr(agent, "_trace", [])
             summary_lines = compose_summary_lines(
@@ -482,13 +445,10 @@ async def main():
                 for line in summary_lines:
                     console.print(f"[dim]{line}[/dim]")
             console.print()
-
     except Exception as e:
         console.print(f"\n[red bold]ERROR: {str(e)}[/red bold]")
         import traceback
         traceback.print_exc()
-
-
 def main_entrypoint() -> None:
     try:
         asyncio.run(main())
@@ -498,7 +458,5 @@ def main_entrypoint() -> None:
     except Exception as e:
         console.print(f"[red]Fatal: {e}[/red]")
         sys.exit(1)
-
-
 if __name__ == "__main__":
     main_entrypoint()

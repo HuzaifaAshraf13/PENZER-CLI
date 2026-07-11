@@ -1,51 +1,43 @@
-"""
-Logging infrastructure for PENZER-CLI
-Structured logging with file rotation and colored console output
-"""
-
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-
-import coloredlogs
-
+from rich.console import Console
+from rich.logging import RichHandler
 from config import LOG_LEVEL, LOG_FILE, LOG_FORMAT, LOGS_DIR
+
+# Shared with cli.py — see module docstring above.
+console = Console(force_terminal=True, width=100)
 
 
 def setup_logging() -> None:
     """Initialize logging with file and console handlers."""
-    
+
     # Create logs directory if it doesn't exist
     LOGS_DIR.mkdir(exist_ok=True)
-    
+
     # Root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
-    
-    # Console handler with colored output
-    console_handler = logging.StreamHandler(sys.stdout)
+
     console_level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
-    console_handler.setLevel(console_level)
-    
-    # Use coloredlogs for pretty console output
-    formatter = coloredlogs.ColoredFormatter(
-        fmt='[%(levelname)s] %(name)s - %(message)s',
-        level_styles={
-            'DEBUG': {'color': 'white', 'faint': True},
-            'INFO': {'color': 'cyan'},
-            'WARNING': {'color': 'yellow'},
-            'ERROR': {'color': 'red'},
-            'CRITICAL': {'color': 'red', 'bold': True}
-        },
-        field_styles={
-            'levelname': {'bold': True}
-        }
+
+    # Rich-aware console handler — see module docstring for why this
+    # replaced a plain StreamHandler(sys.stdout). markup is left off
+    # (default) since arbitrary log text (exception messages, tool
+    # output, etc.) can contain literal square brackets that would
+    # otherwise get misread as Rich markup and either error or render
+    # wrong.
+    console_handler = RichHandler(
+        console=console,
+        level=console_level,
+        show_time=False,
+        show_path=False,
+        rich_tracebacks=True,
     )
-    console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
-    
-    # File handler with rotation
+
+    # File handler with rotation — unchanged, this side was never the problem.
     file_handler = RotatingFileHandler(
         LOG_FILE,
         maxBytes=10 * 1024 * 1024,  # 10 MB
@@ -55,16 +47,15 @@ def setup_logging() -> None:
     file_formatter = logging.Formatter(LOG_FORMAT)
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
-    
-    # Module loggers
-    agent_logger = logging.getLogger("agent")
-    agent_logger.setLevel(console_level)
-    
-    tools_logger = logging.getLogger("tools")
-    tools_logger.setLevel(console_level)
-    
-    cli_logger = logging.getLogger("cli")
-    cli_logger.setLevel(console_level)
+
+    # Module loggers — top-level namespaces only; cli.py additionally
+    # suppresses specific noisy children (tools.executor, agent.penzermodule,
+    # etc.) after import. Both layers matter: this sets a sane default for
+    # anything not explicitly named, cli.py's list quiets known-noisy ones
+    # further. The RichHandler fix above means even an unsuppressed logger
+    # won't corrupt the terminal anymore — it'll just be visible output.
+    for _name in ("agent", "tools", "cli"):
+        logging.getLogger(_name).setLevel(console_level)
 
 
 def get_logger(name: str) -> logging.Logger:
