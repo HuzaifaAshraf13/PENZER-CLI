@@ -15,18 +15,11 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from logger import get_logger, console as console
 from version import get_version, check_for_update, perform_update
-from tools.executor import format_execution_state
+from tools.executor import format_execution_state, kill_all_running
 from config import DEFAULT_PROFILE, PROFILE_OPTIONS, get_profile_settings
 logger = get_logger("cli")
 from agent.agent import PenzerAgent
 from agent.server import start_server
-# Moved here (after all imports) rather than right after `logger = get_logger("cli")`:
-# anything imported above gets a chance to touch its own logger's level at
-# import time, so suppressing before those imports run could get silently
-# overridden by whatever runs later. This is defense-in-depth — the real
-# fix is RichHandler in logger.py, which means even an unsuppressed logger
-# renders cleanly instead of corrupting the terminal, but there's no reason
-# to be noisier than necessary either.
 for _log in [
     "agent.agent", "agent.penzermodule", "penzer.core", "penzer.server",
     "agent.skills.search", "agent.skills.loader",
@@ -53,11 +46,11 @@ class LiveStatusView:
         self.events: list[str] = []
         self._lock = threading.Lock()
         self.current_skill = ""
-        
+
     def update_skill(self, skill_name: str) -> None:
         with self._lock:
             self.current_skill = f"[bold green]Using:[/] [cyan]{skill_name}[/]"
-            
+
     def update(self, message: str) -> None:
         if not message:
             return
@@ -86,7 +79,7 @@ def clean_response(text: str) -> str:
     """Clean and parse CLI response text with robust error handling."""
     if not text:
         return ""
-    
+
     text = text.strip()
     try:
         data = json.loads(text)
@@ -98,7 +91,7 @@ def clean_response(text: str) -> str:
         logger.debug(f"Failed to parse response JSON: {e}")
     except Exception as e:
         logger.warning(f"Unexpected error parsing response: {e}")
-        
+
     # Fallback to basic cleaning if JSON parsing fails
     if text and text[0] in "⏳🔑🔐⚠️🔌⏱️🌐❌":
         return text
@@ -144,10 +137,10 @@ def build_help_text() -> str:
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
 PENZER_LOGO = r"""
- ____   _____   _   _   _____   _____   ____  
-|  _ \ | ____| | \ | | |__  / | ____| |  _ \ 
+ ____   _____   _   _   _____   _____   ____
+|  _ \ | ____| | \ | | |__  / | ____| |  _ \
 | |_) ||  _|   |  \| |   / /  |  _|   | |_) |
-|  __/ | |___  | |\  |  / /_  | |___  |  _ < 
+|  __/ | |___  | |\  |  / /_  | |___  |  _ <
 |_|    |_____| |_| \_| /____| |_____| |_| \_\
 """.strip("\n")
 def display_banner():
@@ -246,26 +239,26 @@ class ShutdownHandler:
     def __init__(self):
         self._should_exit = threading.Event()
         self._cleanup_handlers: list[Callable] = []
-        
+
     def register_cleanup(self, handler: Callable):
         """Register a cleanup function to be called on shutdown."""
         self._cleanup_handlers.append(handler)
-        
+
     def shutdown(self, signum=None, frame=None):
         """Initiate graceful shutdown."""
         if self._should_exit.is_set():
             return
-            
+
         logger.info("Initiating graceful shutdown...")
         self._should_exit.set()
-        
+
         # Run cleanup handlers in reverse order
         for handler in reversed(self._cleanup_handlers):
             try:
                 handler()
             except Exception as e:
                 logger.error(f"Cleanup handler failed: {e}")
-        
+
     def should_exit(self) -> bool:
         """Check if shutdown was requested."""
         return self._should_exit.is_set()
@@ -420,12 +413,39 @@ async def main():
             calls_before  = getattr(agent.llm, "call_count", 0)
             tokens_before = getattr(agent.llm, "token_estimate", 0)
             status_view = LiveStatusView()
-            with console.status("[cyan]Working…[/cyan]", spinner="dots") as status:
-                def _on_status(msg: str) -> None:
-                    status_view.update(msg)
-                    status.update(f"[cyan]{status_view.current}[/cyan]")
-                agent.on_status = _on_status
-                response = await agent.run(user_input)
+            # FIX: console.status() hides the cursor and takes over
+            # terminal rendering while active. On long-running tool calls
+            # (e.g. an nmap network scan run via asyncio.to_thread), the
+            # cursor/render state was not reliably restored once the
+            # block exited — the next console.input() prompt still
+            # accepted keystrokes underneath, but nothing visibly drew on
+            # screen. The try/finally guarantees the cursor is shown and
+            # the stream flushed regardless of how the block exits.
+            try:
+                with console.status("[cyan]Working…[/cyan]", spinner="dots") as status:
+                    def _on_status(msg: str) -> None:
+                        status_view.update(msg)
+                        status.update(f"[cyan]{status_view.current}[/cyan]")
+                    agent.on_status = _on_status
+                    response = await agent.run(user_input)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # Ctrl+C always fully exits Penzer, whether idle or mid-task
+                # (matching the idle-prompt Ctrl+C behavior above). Before
+                # exiting we still kill_all_running() — otherwise a
+                # scan like nmap keeps running as an orphaned OS process
+                # even after Penzer itself has quit, since
+                # asyncio.to_thread cannot cancel the thread it runs in.
+                killed = kill_all_running()
+                note = f" ({killed} process{'es' if killed != 1 else ''} stopped)" if killed else ""
+                console.show_cursor(True)
+                console.file.flush()
+                console.print(f"\n[yellow]Interrupted.[/yellow]{note}")
+                agent.clear_session()
+                console.print("[dim]Session cleared. Memory retained.[/dim]")
+                return
+            finally:
+                console.show_cursor(True)
+                console.file.flush()
             calls_used  = getattr(agent.llm, "call_count", 0) - calls_before
             tokens_used = getattr(agent.llm, "token_estimate", 0) - tokens_before
             response = clean_response(response or "No response.")
@@ -449,14 +469,8 @@ async def main():
         console.print(f"\n[red bold]ERROR: {str(e)}[/red bold]")
         import traceback
         traceback.print_exc()
-def main_entrypoint() -> None:
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Aborted[/yellow]")
-        sys.exit(0)
-    except Exception as e:
-        console.print(f"[red]Fatal: {e}[/red]")
-        sys.exit(1)
+def main_entrypoint():
+    asyncio.run(main())
+
 if __name__ == "__main__":
     main_entrypoint()

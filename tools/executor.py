@@ -5,9 +5,11 @@ All terminal, bash, and python calls route through here.
 """
 
 import os
+import signal
 import subprocess
 import logging
 import resource
+import threading
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 
@@ -43,6 +45,64 @@ _change_log: list = []
 _exec_count: int = 0
 _exec_budget: int = 100  # max executions per session
 _execution_state: dict = {}
+
+# ─────────────────────────────────────────
+# RUNNING PROCESS REGISTRY
+# ─────────────────────────────────────────
+# Every Popen launched by execute() is registered here for the duration
+# of its run. This is what makes Ctrl+C actually able to kill a running
+# nmap scan (or anything else) instead of just abandoning it in the
+# background — asyncio.to_thread cannot cancel the thread it's running
+# in, so cancellation has to reach the OS process directly, from outside
+# the blocked thread. cli.py calls kill_all_running() from its
+# KeyboardInterrupt handler to do exactly that.
+_running_lock = threading.Lock()
+_running_procs: dict[int, subprocess.Popen] = {}
+_proc_id_counter = 0
+
+
+def _register_proc(proc: subprocess.Popen) -> int:
+    global _proc_id_counter
+    with _running_lock:
+        _proc_id_counter += 1
+        pid_key = _proc_id_counter
+        _running_procs[pid_key] = proc
+    return pid_key
+
+
+def _unregister_proc(pid_key: int) -> None:
+    with _running_lock:
+        _running_procs.pop(pid_key, None)
+
+
+def kill_all_running() -> int:
+    """
+    Forcibly terminate every command currently in flight. Kills the whole
+    process group (not just the direct child) so tools that spawn their
+    own subprocesses — nmap included — don't leave orphans behind.
+    Returns the number of processes killed.
+    """
+    with _running_lock:
+        procs = list(_running_procs.items())
+    killed = 0
+    for pid_key, proc in procs:
+        try:
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                killed += 1
+        except Exception as e:
+            logger.debug("kill_all_running: failed to kill pid %s: %s", pid_key, e)
+        finally:
+            _unregister_proc(pid_key)
+    return killed
+
+
+def has_running() -> bool:
+    with _running_lock:
+        return len(_running_procs) > 0
 
 
 @dataclass
@@ -90,7 +150,9 @@ def is_sensitive(command: str) -> bool:
 
 
 def _set_limits():
-    """Apply resource limits to subprocess."""
+    """Apply resource limits to subprocess. Also puts the child in its
+    own process group (via start_new_session in Popen) so a kill can
+    target the whole group, not just this one PID."""
     try:
         mem = MAX_MEMORY_MB * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
@@ -184,15 +246,32 @@ def execute(
 
     logger.info(f"executor[{mode}][{cwd}]: {command[:150]}")
 
+    proc = None
+    pid_key = None
     try:
-        proc = subprocess.run(
+        # Popen (not subprocess.run) so the process object exists and is
+        # registered *before* we block waiting on it — this is what lets
+        # kill_all_running() reach it from another thread while
+        # communicate() is still blocking here. start_new_session=True
+        # puts it in its own process group so nmap (or anything it
+        # spawns) dies with it, not just the immediate child.
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             cwd=cwd,
             preexec_fn=_set_limits,
+            start_new_session=True,
         )
+        pid_key = _register_proc(proc)
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_proc_group(proc)
+            proc.wait(timeout=5)
+            return _error(f"Timed out after {timeout}s")
 
         _exec_count += 1
         _change_log.append({
@@ -216,8 +295,8 @@ def execute(
                 pass
 
         data = {
-            "stdout":    proc.stdout[:MAX_OUTPUT],
-            "stderr":    proc.stderr[:10_000],
+            "stdout":    stdout[:MAX_OUTPUT],
+            "stderr":    stderr[:10_000],
             "exit_code": proc.returncode,
             "cwd":       _cwd,
             "mode":      mode,
@@ -231,10 +310,31 @@ def execute(
 
         return _success(data) if proc.returncode == 0 else _warn_data(data, f"Exit code {proc.returncode}")
 
-    except subprocess.TimeoutExpired:
-        return _error(f"Timed out after {timeout}s")
     except Exception as e:
+        if proc is not None:
+            _kill_proc_group(proc)
         return _error(str(e))
+    finally:
+        if pid_key is not None:
+            _unregister_proc(pid_key)
+
+
+def _kill_proc_group(proc: subprocess.Popen) -> None:
+    """Best-effort kill of the whole process group, falling back to a
+    plain kill() if the group is already gone or we lack permission."""
+    try:
+        if proc.poll() is None:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────
