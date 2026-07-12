@@ -22,7 +22,7 @@ def add(a: int, b: int) -> int:
 # ---------------- LOAD EXTERNAL TOOLS ----------------
 try:
     import tools.tools
-    logger.info("✓ Loaded tools.tools")
+
 except Exception as e:
     logger.warning(f"Failed to load tools.tools: {e}")
 
