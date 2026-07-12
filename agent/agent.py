@@ -45,6 +45,7 @@ from session.memory import (
     append_steps as _append_steps_to_disk,
     get_steps as _get_persisted_steps,
     clear_steps as _clear_persisted_steps,
+    estimate_iterations_needed,
 )
 from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
@@ -70,8 +71,9 @@ KEEP_LAST            = 8
 STUCK_MIN            = 2
 MAX_FAILURES         = 3
 ITER_EXTENSION_SIZE  = 8
-MAX_RUNTIME_SECONDS  = 900
-ABSOLUTE_MAX_ITER    = 500
+MAX_RUNTIME_SECONDS  = 21600  # 6 hours
+ABSOLUTE_MAX_ITER    = 5000
+MAX_TOKENS_PER_RUN   = 2000000
 TOOL_TIMEOUT         = 30
 CHECKPOINT_EVERY     = 10
 MEMORY_CRITICAL      = 85
@@ -152,6 +154,7 @@ class PenzerAgent:
         self._complexity_score:    float = 0.0
         self._max_iter:            int   = 10
         self._run_start_time:      float = time.time()
+        self._tokens_before_run:   int   = 0
         self._resume_boundary_trace_len: int = 0
         self._task_insights:       list  = []
         self._past_trajectories:   list  = []
@@ -234,6 +237,7 @@ class PenzerAgent:
         self._restore_snapshot(snapshot)
         self._max_iter = self._max_iter_for_complexity(self._complexity_score)
         self._run_start_time = time.time()
+        self._tokens_before_run = getattr(self.llm, "token_estimate", 0)
         # Restored `_trace`/`history` are the pre-crash record. Without
         # this boundary, the stuck-detector's window includes those stale
         # entries and can trip on the very first turn of the resumed
@@ -255,6 +259,16 @@ class PenzerAgent:
         self._complexity_score = score_complexity(user_input)
         self._is_complex_task  = self._complexity_score >= 0.4
         self._max_iter         = self._max_iter_for_complexity(self._complexity_score)
+        self._tokens_before_run = getattr(self.llm, "token_estimate", 0)
+        # score_complexity() is purely lexical — "check open ports" scores
+        # as simple by word-pattern alone even though it took 7 real tool
+        # calls last time. If similar past tasks needed more than the
+        # lexical guess, use that instead (never less — this only raises
+        # the floor, so a bad historical sample can't under-budget a task
+        # the lexical heuristic already sized correctly).
+        historical_estimate = estimate_iterations_needed(user_input[:40])
+        if historical_estimate and historical_estimate > self._max_iter:
+            self._max_iter = historical_estimate
 
         self.history.append({"role": "user", "content": user_input})
         remember_user_facts(user_input)
@@ -377,6 +391,7 @@ class PenzerAgent:
                 outcome=outcome,
                 importance=min(1.0, len(self._trace) * 0.15),
                 task_type=user_input[:40],
+                iterations_used=self._iteration + 1,
             )
 
         if self._belief["goal_progress"] == "complete":
@@ -466,6 +481,16 @@ class PenzerAgent:
             if not ok:
                 save_history(self.history)
                 return f"Resource limit: {msg}"
+            tokens_used = getattr(self.llm, "token_estimate", 0) - self._tokens_before_run
+            if tokens_used > MAX_TOKENS_PER_RUN:
+                self._record_step(
+                    "give_up",
+                    f"Stopping: token budget exceeded ({tokens_used}/{MAX_TOKENS_PER_RUN} tokens).",
+                )
+                set_execution_state({"state": self._resume_state})
+                self._persist_resume_snapshot()
+                self._flush_steps()
+                return f"Stopped: token budget exceeded ({tokens_used} tokens)"
             if len(self.history) > TRIM_AT and not self._trimming:
                 asyncio.ensure_future(self._trim())
 

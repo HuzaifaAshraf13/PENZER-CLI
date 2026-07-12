@@ -62,6 +62,8 @@ import math
 import logging
 import re
 import copy
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -173,6 +175,70 @@ def _save_section(section: str, value: any) -> None:
 
 
 _cache_state: dict = {"data": None, "mtime": None}
+# threading.RLock protects _cache_state AND the file read/modify/write
+# cycle in _load()/_save() — covers races between threads in the SAME
+# process (e.g. cli.py's background MCP server thread vs the
+# interactive loop).
+_memory_lock = threading.RLock()
+
+# fcntl-based file lock adds cross-PROCESS protection on top — if the
+# MCP server (or a second CLI instance) ever runs as a separate OS
+# process against the same storage dir, the threading lock alone does
+# nothing for that, since each process has its own independent lock
+# object. stdlib only (no new dependency); POSIX-only, with a safe
+# no-op fallback elsewhere so this is never a hard requirement.
+try:
+    import fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
+
+_LOCK_FILE_PATH = STORAGE_DIR / ".memory.lock"
+
+
+_lock_depth = 0
+_lock_fh = None
+
+
+@contextmanager
+def _lock():
+    """
+    Combined in-process + cross-process lock. Every read/modify/write
+    cycle in this module goes through this, not the raw threading.RLock
+    directly.
+
+    FIX: this previously opened a fresh file handle and called
+    flock(LOCK_EX) on every single entry, with no reentrancy guard. Since
+    nearly every write function calls _load() and/or _save() from
+    *within* its own `with _lock():` scope (e.g. kv_store() -> _load()),
+    the inner call would try to flock() a brand new file handle while the
+    outer call's handle was still holding the lock — a guaranteed
+    self-deadlock on the very first write, not a rare race. Now tracks
+    nesting depth: only the OUTERMOST entry actually opens the file and
+    takes the flock; nested entries just increment/decrement the depth
+    counter (already safe to do without their own thread-lock, since
+    `with _memory_lock:` below already serializes access — only one
+    thread is ever "inside" this function's critical section at a time,
+    nested or not).
+    """
+    global _lock_depth, _lock_fh
+    with _memory_lock:
+        _lock_depth += 1
+        try:
+            if not _HAS_FCNTL:
+                yield
+                return
+            if _lock_depth == 1:
+                STORAGE_DIR.mkdir(exist_ok=True)
+                _lock_fh = open(_LOCK_FILE_PATH, "w")
+                fcntl.flock(_lock_fh, fcntl.LOCK_EX)
+            yield
+        finally:
+            _lock_depth -= 1
+            if _lock_depth == 0 and _lock_fh is not None:
+                fcntl.flock(_lock_fh, fcntl.LOCK_UN)
+                _lock_fh.close()
+                _lock_fh = None
 
 
 def _newest_mtime() -> float | None:
@@ -193,49 +259,51 @@ def _newest_mtime() -> float | None:
 
 def _load() -> dict:
     global _cache_state
-    mtime = _newest_mtime()
-    if (
-        _cache_state["data"] is not None
-        and mtime is not None
-        and _cache_state["mtime"] == mtime
-    ):
-        return copy.deepcopy(_cache_state["data"])
+    with _lock():
+        mtime = _newest_mtime()
+        if (
+            _cache_state["data"] is not None
+            and mtime is not None
+            and _cache_state["mtime"] == mtime
+        ):
+            return copy.deepcopy(_cache_state["data"])
 
-    data = _fresh()
-    try:
-        for key in data:
-            loaded = _load_section(key)
-            if loaded is not None:
-                data[key] = loaded
-        if STORAGE_FILE.exists():
-            with open(STORAGE_FILE) as f:
-                legacy = json.load(f)
-            if isinstance(legacy, dict):
-                for k, v in legacy.items():
-                    data.setdefault(k, v)
-    except Exception as e:
-        logger.debug("Storage load: %s", e)
+        data = _fresh()
+        try:
+            for key in data:
+                loaded = _load_section(key)
+                if loaded is not None:
+                    data[key] = loaded
+            if STORAGE_FILE.exists():
+                with open(STORAGE_FILE) as f:
+                    legacy = json.load(f)
+                if isinstance(legacy, dict):
+                    for k, v in legacy.items():
+                        data.setdefault(k, v)
+        except Exception as e:
+            logger.debug("Storage load: %s", e)
 
-    _cache_state = {"data": data, "mtime": mtime}
-    return copy.deepcopy(data)
+        _cache_state = {"data": data, "mtime": mtime}
+        return copy.deepcopy(data)
 
 
 def _save(data: dict) -> None:
     global _cache_state
-    try:
-        for key in ["episodic", "semantic", "insights", "post_mortem", "kv",
-                    "history", "skill_metrics", "checkpoints", "consolidation",
-                    "graph_nodes", "graph_edges", "steps"]:
-            _save_section(key, data.get(key, _fresh().get(key)))
-        with open(STORAGE_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-        _cache_state = {"data": copy.deepcopy(data), "mtime": _newest_mtime()}
-    except Exception as e:
-        logger.error("Storage save: %s", e)
-        # A failed save may have left disk and cache disagreeing about
-        # what's true — force the next _load() to re-read from disk
-        # rather than serve a cache that might now be wrong.
-        _cache_state = {"data": None, "mtime": None}
+    with _lock():
+        try:
+            for key in ["episodic", "semantic", "insights", "post_mortem", "kv",
+                        "history", "skill_metrics", "checkpoints", "consolidation",
+                        "graph_nodes", "graph_edges", "steps"]:
+                _save_section(key, data.get(key, _fresh().get(key)))
+            with open(STORAGE_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+            _cache_state = {"data": copy.deepcopy(data), "mtime": _newest_mtime()}
+        except Exception as e:
+            logger.error("Storage save: %s", e)
+            # A failed save may have left disk and cache disagreeing about
+            # what's true — force the next _load() to re-read from disk
+            # rather than serve a cache that might now be wrong.
+            _cache_state = {"data": None, "mtime": None}
 
 
 def remember_user_facts(text: str) -> list[dict]:
@@ -287,15 +355,17 @@ def load_history() -> list:
 
 
 def save_history(history: list) -> None:
-    data = _load()
-    data["history"] = history[-MAX_HISTORY:]
-    _save(data)
+    with _lock():
+        data = _load()
+        data["history"] = history[-MAX_HISTORY:]
+        _save(data)
 
 
 def clear_history() -> None:
-    data = _load()
-    data["history"] = []
-    _save(data)
+    with _lock():
+        data = _load()
+        data["history"] = []
+        _save(data)
 
 
 # -- Decay --------------------------------------------------------------
@@ -338,31 +408,63 @@ def _score_and_rank(items: list, score_fn, n: int = 5, min_score: float = 0.0) -
 # -- Episodic Memory ------------------------------------------------------
 def remember_episodic(
     event: str, outcome: str,
-    importance: float = 0.5, task_type: str = ""
+    importance: float = 0.5, task_type: str = "",
+    iterations_used: int | None = None,
 ) -> None:
+    with _lock():
+        data = _load()
+        entry = {
+            "event":       event,
+            "outcome":     outcome,
+            "importance":  min(1.0, max(0.0, importance)),
+            "task_type":   task_type,
+            "timestamp":   datetime.now().isoformat(),
+            "strength":    1.0,
+            "access_count": 0,
+        }
+        if iterations_used is not None:
+            entry["iterations_used"] = iterations_used
+        data["episodic"].append(entry)
+        # Prune decayed entries
+        data["episodic"] = [
+            e for e in data["episodic"]
+            if _decay(e["timestamp"], e.get("strength", 1.0), "episodic") > 0.05
+        ]
+        if len(data["episodic"]) > MAX_EPISODIC:
+            data["episodic"] = sorted(
+                data["episodic"],
+                key=lambda x: _decay(x["timestamp"], x.get("strength", 1.0), "episodic") * x["importance"]
+            )[-MAX_EPISODIC:]
+        # Track consolidation schedule
+        data["consolidation"]["count"] = data["consolidation"].get("count", 0) + 1
+        _save(data)
+
+
+def estimate_iterations_needed(task_type_hint: str, min_samples: int = 2) -> int | None:
+    """
+    Look at past successful episodes with an overlapping task_type and
+    return a suggested iteration budget, or None if there isn't enough
+    data yet. Complements score_complexity()'s purely lexical guess —
+    "check open ports" scores as simple by word-pattern alone even
+    though it took 7 real tool calls last time; this lets a repeat of
+    that kind of task start with a realistic budget instead of relying
+    on the iteration-extension mechanism to bail it out again each time.
+    Uses the max observed (not average) plus a small margin, since
+    under-budgeting costs a full re-run/extension while over-budgeting
+    just means an unused ceiling.
+    """
+    if not task_type_hint:
+        return None
     data = _load()
-    data["episodic"].append({
-        "event":       event,
-        "outcome":     outcome,
-        "importance":  min(1.0, max(0.0, importance)),
-        "task_type":   task_type,
-        "timestamp":   datetime.now().isoformat(),
-        "strength":    1.0,
-        "access_count": 0,
-    })
-    # Prune decayed entries
-    data["episodic"] = [
-        e for e in data["episodic"]
-        if _decay(e["timestamp"], e.get("strength", 1.0), "episodic") > 0.05
+    samples = [
+        e["iterations_used"] for e in data["episodic"]
+        if e.get("iterations_used")
+        and e.get("outcome") == "success"
+        and _relevance(e.get("task_type", ""), task_type_hint) > 0.3
     ]
-    if len(data["episodic"]) > MAX_EPISODIC:
-        data["episodic"] = sorted(
-            data["episodic"],
-            key=lambda x: _decay(x["timestamp"], x.get("strength", 1.0), "episodic") * x["importance"]
-        )[-MAX_EPISODIC:]
-    # Track consolidation schedule
-    data["consolidation"]["count"] = data["consolidation"].get("count", 0) + 1
-    _save(data)
+    if len(samples) < min_samples:
+        return None
+    return max(samples) + 2
 
 
 def _reinforce_episodic_in_data(data: dict, event_text: str) -> None:
@@ -382,9 +484,10 @@ def _reinforce_episodic_in_data(data: dict, event_text: str) -> None:
 
 def reinforce_episodic(event_text: str) -> None:
     """Spaced repetition — each access extends the half-life."""
-    data = _load()
-    _reinforce_episodic_in_data(data, event_text)
-    _save(data)
+    with _lock():
+        data = _load()
+        _reinforce_episodic_in_data(data, event_text)
+        _save(data)
 
 
 # -- Associative Retrieval -------------------------------------------------
@@ -435,30 +538,31 @@ def get_episode_replay(query: str, n: int = 3) -> str:
 # -- Semantic Memory --------------------------------------------------------
 def remember_semantic(pattern: str, confidence: float = 0.6) -> None:
     """Store + run conflict detection before saving."""
-    data = _load()
-    conflict = detect_conflict(pattern, data["semantic"])
-    if conflict:
-        if conflict["confidence"] >= confidence:
-            logger.debug("Conflict: keeping existing '%s'", conflict["pattern"][:60])
-            return
+    with _lock():
+        data = _load()
+        conflict = detect_conflict(pattern, data["semantic"])
+        if conflict:
+            if conflict["confidence"] >= confidence:
+                logger.debug("Conflict: keeping existing '%s'", conflict["pattern"][:60])
+                return
+            else:
+                data["semantic"].remove(conflict)
+                logger.debug("Conflict: replacing lower-confidence pattern")
+        existing = [s for s in data["semantic"] if s["pattern"] == pattern]
+        if existing:
+            existing[0]["confidence"]      = min(1.0, existing[0]["confidence"] + 0.05)
+            existing[0]["times_validated"] += 1
+            existing[0]["timestamp"]       = datetime.now().isoformat()
         else:
-            data["semantic"].remove(conflict)
-            logger.debug("Conflict: replacing lower-confidence pattern")
-    existing = [s for s in data["semantic"] if s["pattern"] == pattern]
-    if existing:
-        existing[0]["confidence"]      = min(1.0, existing[0]["confidence"] + 0.05)
-        existing[0]["times_validated"] += 1
-        existing[0]["timestamp"]       = datetime.now().isoformat()
-    else:
-        data["semantic"].append({
-            "pattern":         pattern,
-            "confidence":      confidence,
-            "times_validated": 1,
-            "timestamp":       datetime.now().isoformat(),
-        })
-    if len(data["semantic"]) > MAX_SEMANTIC:
-        data["semantic"] = sorted(data["semantic"], key=lambda x: x["confidence"])[-MAX_SEMANTIC:]
-    _save(data)
+            data["semantic"].append({
+                "pattern":         pattern,
+                "confidence":      confidence,
+                "times_validated": 1,
+                "timestamp":       datetime.now().isoformat(),
+            })
+        if len(data["semantic"]) > MAX_SEMANTIC:
+            data["semantic"] = sorted(data["semantic"], key=lambda x: x["confidence"])[-MAX_SEMANTIC:]
+        _save(data)
 
 
 # -- Conflict Detection -----------------------------------------------------
@@ -496,22 +600,23 @@ def detect_conflict(new_pattern: str, existing: list[dict]) -> dict | None:
 
 # -- Insight Extraction (ExpeL) ---------------------------------------------
 def store_insight(insight: str, source_tasks: list[str], confidence: float = 0.7) -> None:
-    data = _load()
-    existing = [i for i in data["insights"] if i["insight"] == insight]
-    if existing:
-        existing[0]["confidence"]   = min(1.0, existing[0]["confidence"] + 0.1)
-        existing[0]["source_tasks"] = list(set(existing[0]["source_tasks"] + source_tasks))
-        existing[0]["timestamp"]    = datetime.now().isoformat()
-    else:
-        data["insights"].append({
-            "insight":      insight,
-            "source_tasks": source_tasks,
-            "confidence":   confidence,
-            "timestamp":    datetime.now().isoformat(),
-        })
-    if len(data["insights"]) > MAX_INSIGHTS:
-        data["insights"] = sorted(data["insights"], key=lambda x: x["confidence"])[-MAX_INSIGHTS:]
-    _save(data)
+    with _lock():
+        data = _load()
+        existing = [i for i in data["insights"] if i["insight"] == insight]
+        if existing:
+            existing[0]["confidence"]   = min(1.0, existing[0]["confidence"] + 0.1)
+            existing[0]["source_tasks"] = list(set(existing[0]["source_tasks"] + source_tasks))
+            existing[0]["timestamp"]    = datetime.now().isoformat()
+        else:
+            data["insights"].append({
+                "insight":      insight,
+                "source_tasks": source_tasks,
+                "confidence":   confidence,
+                "timestamp":    datetime.now().isoformat(),
+            })
+        if len(data["insights"]) > MAX_INSIGHTS:
+            data["insights"] = sorted(data["insights"], key=lambda x: x["confidence"])[-MAX_INSIGHTS:]
+        _save(data)
 
 
 def get_insights(query: str, n: int = 3) -> list[dict]:
@@ -539,17 +644,18 @@ def get_similar_trajectories(query: str, n: int = 3) -> list[dict]:
 
 # -- Post-Mortem (Reflexion) -------------------------------------------------
 def store_post_mortem(task_type: str, what_worked: str, what_failed: str, next_time: str) -> None:
-    data = _load()
-    data["post_mortem"].append({
-        "task_type":   task_type,
-        "what_worked": what_worked,
-        "what_failed": what_failed,
-        "next_time":   next_time,
-        "timestamp":   datetime.now().isoformat(),
-    })
-    if len(data["post_mortem"]) > MAX_POST_MORTEM:
-        data["post_mortem"] = data["post_mortem"][-MAX_POST_MORTEM:]
-    _save(data)
+    with _lock():
+        data = _load()
+        data["post_mortem"].append({
+            "task_type":   task_type,
+            "what_worked": what_worked,
+            "what_failed": what_failed,
+            "next_time":   next_time,
+            "timestamp":   datetime.now().isoformat(),
+        })
+        if len(data["post_mortem"]) > MAX_POST_MORTEM:
+            data["post_mortem"] = data["post_mortem"][-MAX_POST_MORTEM:]
+        _save(data)
 
 
 def get_post_mortems(query: str, n: int = 2) -> list[dict]:
@@ -580,68 +686,69 @@ def semantic_search(query: str, n: int = 5) -> list[dict]:
 
 
 def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
-    data = _load()
-    if not deep:
-        lines = ["## Memory"]
-        for sem in sorted(data["semantic"], key=lambda x: x["confidence"], reverse=True)[:2]:
-            if _relevance(sem["pattern"], query) > 0.2:
-                lines.append(f"- [learned] {sem['pattern']}")
-        for ins in get_insights(query, n=2):
-            lines.append(f"- [insight] {ins['insight']}")
-        return "\n".join(lines) if len(lines) > 1 else ""
+    with _lock():
+        data = _load()
+        if not deep:
+            lines = ["## Memory"]
+            for sem in sorted(data["semantic"], key=lambda x: x["confidence"], reverse=True)[:2]:
+                if _relevance(sem["pattern"], query) > 0.2:
+                    lines.append(f"- [learned] {sem['pattern']}")
+            for ins in get_insights(query, n=2):
+                lines.append(f"- [insight] {ins['insight']}")
+            return "\n".join(lines) if len(lines) > 1 else ""
 
-    def score(entry) -> float:
-        kind, item = entry
-        if kind == "episodic":
-            text = f"{item['event']} {item['outcome']}"
+        def score(entry) -> float:
+            kind, item = entry
+            if kind == "episodic":
+                text = f"{item['event']} {item['outcome']}"
+                return (
+                    _recency(item["timestamp"]) * 0.20
+                    + _relevance(text, query) * 0.40
+                    + item["importance"] * 0.15
+                    + _decay(item["timestamp"], item.get("strength", 1.0), "episodic") * 0.25
+                )
+            if kind == "semantic":
+                return (
+                    _recency(item["timestamp"]) * 0.15
+                    + _relevance(item["pattern"], query) * 0.50
+                    + item["confidence"] * 0.25
+                    + _decay(item["timestamp"], 1.0, "semantic") * 0.10
+                )
+            # insight
             return (
-                _recency(item["timestamp"]) * 0.20
-                + _relevance(text, query) * 0.40
-                + item["importance"] * 0.15
-                + _decay(item["timestamp"], item.get("strength", 1.0), "episodic") * 0.25
-            )
-        if kind == "semantic":
-            return (
-                _recency(item["timestamp"]) * 0.15
-                + _relevance(item["pattern"], query) * 0.50
+                _relevance(item["insight"], query) * 0.65
                 + item["confidence"] * 0.25
-                + _decay(item["timestamp"], 1.0, "semantic") * 0.10
+                + _decay(item["timestamp"], 1.0, "insights") * 0.10
             )
-        # insight
-        return (
-            _relevance(item["insight"], query) * 0.65
-            + item["confidence"] * 0.25
-            + _decay(item["timestamp"], 1.0, "insights") * 0.10
+
+        pool = (
+            [("episodic", ep) for ep in data["episodic"]]
+            + [("semantic", sem) for sem in data["semantic"]]
+            + [("insight", ins) for ins in data["insights"]]
         )
+        top = _score_and_rank(pool, score, n=n, min_score=0.0)
+        if not top:
+            return ""
 
-    pool = (
-        [("episodic", ep) for ep in data["episodic"]]
-        + [("semantic", sem) for sem in data["semantic"]]
-        + [("insight", ins) for ins in data["insights"]]
-    )
-    top = _score_and_rank(pool, score, n=n, min_score=0.0)
-    if not top:
-        return ""
-
-    lines = ["## Relevant Memory"]
-    reinforced_any = False
-    for kind, item in top:
-        if kind == "episodic":
-            lines.append(f"- [event] {item['event']} -> {item['outcome']}")
-            for assoc in get_associated(item, n=1):
-                lines.append(f"    -> related: {assoc['event'][:60]} -> {assoc['outcome']}")
-            # Batched into this function's own `data` instead of a
-            # separate full load/save per item (was up to n extra full
-            # read/write cycles per call).
-            _reinforce_episodic_in_data(data, item["event"])
-            reinforced_any = True
-        elif kind == "semantic":
-            lines.append(f"- [learned] {item['pattern']} ({item['confidence']:.0%})")
-        else:
-            lines.append(f"- [insight] {item['insight']}")
-    if reinforced_any:
-        _save(data)
-    return "\n".join(lines)
+        lines = ["## Relevant Memory"]
+        reinforced_any = False
+        for kind, item in top:
+            if kind == "episodic":
+                lines.append(f"- [event] {item['event']} -> {item['outcome']}")
+                for assoc in get_associated(item, n=1):
+                    lines.append(f"    -> related: {assoc['event'][:60]} -> {assoc['outcome']}")
+                # Batched into this function's own `data` instead of a
+                # separate full load/save per item (was up to n extra full
+                # read/write cycles per call).
+                _reinforce_episodic_in_data(data, item["event"])
+                reinforced_any = True
+            elif kind == "semantic":
+                lines.append(f"- [learned] {item['pattern']} ({item['confidence']:.0%})")
+            else:
+                lines.append(f"- [insight] {item['insight']}")
+        if reinforced_any:
+            _save(data)
+        return "\n".join(lines)
 
 
 # -- KV Store (explicit user facts) ------------------------------------------
@@ -661,10 +768,11 @@ def _normalize_kv_entry(entry) -> dict:
 def kv_store(key: str, value) -> str:
     """Returns a confirmation string, not None — agent.py's memory tool
     passes this return value straight back to the LLM as tool output."""
-    data = _load()
-    data["kv"][key] = {"value": value, "timestamp": datetime.now().isoformat()}
-    _save(data)
-    return f"Stored {key} = {value}"
+    with _lock():
+        data = _load()
+        data["kv"][key] = {"value": value, "timestamp": datetime.now().isoformat()}
+        _save(data)
+        return f"Stored {key} = {value}"
 
 
 def kv_get(key: str, default=None):
@@ -686,12 +794,13 @@ def kv_list() -> dict:
 
 
 def kv_delete(key: str) -> str:
-    data = _load()
-    if key in data["kv"]:
-        del data["kv"][key]
-        _save(data)
-        return f"Deleted {key}"
-    return f"No value stored for '{key}'"
+    with _lock():
+        data = _load()
+        if key in data["kv"]:
+            del data["kv"][key]
+            _save(data)
+            return f"Deleted {key}"
+        return f"No value stored for '{key}'"
 
 
 def get_relevant_kv_facts(query: str, n: int = 3) -> list[dict]:
@@ -752,22 +861,23 @@ def _norm_name(name: str) -> str:
 
 def get_or_create_node(name: str, node_type: str = "entity") -> str:
     """Dedupe by normalized name; returns the node id."""
-    norm = _norm_name(name)
-    if not norm:
-        return ""
-    data = _load()
-    for node_id, node in data["graph_nodes"].items():
-        if _norm_name(node["name"]) == norm:
-            return node_id
-    node_id = f"n{len(data['graph_nodes']) + 1}_{abs(hash(norm)) % 100000}"
-    data["graph_nodes"][node_id] = {
-        "name": name.strip(),
-        "type": node_type,
-        "attrs": {},
-        "created_at": _now(),
-    }
-    _save(data)
-    return node_id
+    with _lock():
+        norm = _norm_name(name)
+        if not norm:
+            return ""
+        data = _load()
+        for node_id, node in data["graph_nodes"].items():
+            if _norm_name(node["name"]) == norm:
+                return node_id
+        node_id = f"n{len(data['graph_nodes']) + 1}_{abs(hash(norm)) % 100000}"
+        data["graph_nodes"][node_id] = {
+            "name": name.strip(),
+            "type": node_type,
+            "attrs": {},
+            "created_at": _now(),
+        }
+        _save(data)
+        return node_id
 
 
 def remember_triple(
@@ -780,48 +890,50 @@ def remember_triple(
     pointing at a DIFFERENT object, that old edge is invalidated
     (valid_until set to now) rather than deleted or overwritten.
     """
-    subj_id = get_or_create_node(subject)
-    obj_id  = get_or_create_node(obj)
-    if not subj_id or not obj_id:
-        return
-    data = _load()
-    now  = _now()
-    for edge in data["graph_edges"]:
-        if (edge["subject_id"] == subj_id and edge["relation"] == relation
-                and edge["valid_until"] is None):
-            if edge["object_id"] == obj_id:
-                # Same fact restated — just bump confidence, no new edge needed.
-                edge["confidence"] = min(1.0, edge["confidence"] + 0.05)
-                _save(data)
-                return
-            # Contradiction: invalidate the old edge, don't delete it.
-            edge["valid_until"] = now
-    data["graph_edges"].append({
-        "id": f"e{len(data['graph_edges']) + 1}",
-        "subject_id": subj_id,
-        "relation": relation,
-        "object_id": obj_id,
-        "confidence": confidence,
-        "valid_from": now,
-        "valid_until": None,
-        "source_event": source_event[:100],
-    })
-    _save(data)
+    with _lock():
+        subj_id = get_or_create_node(subject)
+        obj_id  = get_or_create_node(obj)
+        if not subj_id or not obj_id:
+            return
+        data = _load()
+        now  = _now()
+        for edge in data["graph_edges"]:
+            if (edge["subject_id"] == subj_id and edge["relation"] == relation
+                    and edge["valid_until"] is None):
+                if edge["object_id"] == obj_id:
+                    # Same fact restated — just bump confidence, no new edge needed.
+                    edge["confidence"] = min(1.0, edge["confidence"] + 0.05)
+                    _save(data)
+                    return
+                # Contradiction: invalidate the old edge, don't delete it.
+                edge["valid_until"] = now
+        data["graph_edges"].append({
+            "id": f"e{len(data['graph_edges']) + 1}",
+            "subject_id": subj_id,
+            "relation": relation,
+            "object_id": obj_id,
+            "confidence": confidence,
+            "valid_from": now,
+            "valid_until": None,
+            "source_event": source_event[:100],
+        })
+        _save(data)
 
 
 def invalidate_triple(subject: str, relation: str) -> bool:
     """Explicitly mark all currently-valid edges for (subject, relation) as no longer true."""
-    subj_id = get_or_create_node(subject)
-    data = _load()
-    changed = False
-    for edge in data["graph_edges"]:
-        if (edge["subject_id"] == subj_id and edge["relation"] == relation
-                and edge["valid_until"] is None):
-            edge["valid_until"] = _now()
-            changed = True
-    if changed:
-        _save(data)
-    return changed
+    with _lock():
+        subj_id = get_or_create_node(subject)
+        data = _load()
+        changed = False
+        for edge in data["graph_edges"]:
+            if (edge["subject_id"] == subj_id and edge["relation"] == relation
+                    and edge["valid_until"] is None):
+                edge["valid_until"] = _now()
+                changed = True
+        if changed:
+            _save(data)
+        return changed
 
 
 def extract_triples_heuristic(text: str) -> list[tuple[str, str, str]]:
@@ -963,24 +1075,25 @@ def prune_invalidated_edges(older_than_days: int = 90) -> int:
     stays inspectable, then pruned. Currently-valid edges (valid_until
     is None) are never pruned by this. Returns count removed.
     """
-    data = _load()
-    cutoff_hours = older_than_days * 24
-    before = len(data["graph_edges"])
+    with _lock():
+        data = _load()
+        cutoff_hours = older_than_days * 24
+        before = len(data["graph_edges"])
 
-    def keep(edge: dict) -> bool:
-        if edge["valid_until"] is None:
-            return True
-        try:
-            hours = (datetime.now() - datetime.fromisoformat(edge["valid_until"])).total_seconds() / 3600
-            return hours < cutoff_hours
-        except Exception:
-            return True
+        def keep(edge: dict) -> bool:
+            if edge["valid_until"] is None:
+                return True
+            try:
+                hours = (datetime.now() - datetime.fromisoformat(edge["valid_until"])).total_seconds() / 3600
+                return hours < cutoff_hours
+            except Exception:
+                return True
 
-    data["graph_edges"] = [e for e in data["graph_edges"] if keep(e)]
-    removed = before - len(data["graph_edges"])
-    if removed:
-        _save(data)
-    return removed
+        data["graph_edges"] = [e for e in data["graph_edges"] if keep(e)]
+        removed = before - len(data["graph_edges"])
+        if removed:
+            _save(data)
+        return removed
 
 
 # -- Step Log (structured, retrievable "what is the agent doing") -----------
@@ -994,19 +1107,20 @@ def prune_invalidated_edges(older_than_days: int = 90) -> int:
 # reinforcement writes — avoiding an extra full load/save cycle per item.
 def append_steps(run_id: str, new_steps: list[dict]) -> None:
     """Append a batch of steps for one run in a single load/save cycle."""
-    if not new_steps:
-        return
-    data = _load()
-    next_id = len(data["steps"]) + 1
-    for i, s in enumerate(new_steps):
-        entry = dict(s)
-        entry["run_id"] = run_id
-        entry.setdefault("timestamp", datetime.now().isoformat())
-        entry["id"] = next_id + i
-        data["steps"].append(entry)
-    if len(data["steps"]) > MAX_STEPS:
-        data["steps"] = data["steps"][-MAX_STEPS:]
-    _save(data)
+    with _lock():
+        if not new_steps:
+            return
+        data = _load()
+        next_id = len(data["steps"]) + 1
+        for i, s in enumerate(new_steps):
+            entry = dict(s)
+            entry["run_id"] = run_id
+            entry.setdefault("timestamp", datetime.now().isoformat())
+            entry["id"] = next_id + i
+            data["steps"].append(entry)
+        if len(data["steps"]) > MAX_STEPS:
+            data["steps"] = data["steps"][-MAX_STEPS:]
+        _save(data)
 
 
 def get_steps(run_id: str | None = None, n: int = 100) -> list[dict]:
@@ -1022,16 +1136,17 @@ def get_steps(run_id: str | None = None, n: int = 100) -> list[dict]:
 
 def clear_steps(run_id: str | None = None) -> int:
     """Clear steps, optionally only for one run. Returns count removed."""
-    data = _load()
-    before = len(data["steps"])
-    if run_id:
-        data["steps"] = [s for s in data["steps"] if s.get("run_id") != run_id]
-    else:
-        data["steps"] = []
-    removed = before - len(data["steps"])
-    if removed:
-        _save(data)
-    return removed
+    with _lock():
+        data = _load()
+        before = len(data["steps"])
+        if run_id:
+            data["steps"] = [s for s in data["steps"] if s.get("run_id") != run_id]
+        else:
+            data["steps"] = []
+        removed = before - len(data["steps"])
+        if removed:
+            _save(data)
+        return removed
 
 
 # -- Complexity scoring -------------------------------------------------------
@@ -1071,13 +1186,14 @@ def _normalize_skill_metric(m) -> dict:
 
 
 def update_skill_metric(skill_name: str, success: bool) -> None:
-    data = _load()
-    m = _normalize_skill_metric(data["skill_metrics"].get(skill_name))
-    m["uses"] += 1
-    if success:
-        m["successes"] += 1
-    data["skill_metrics"][skill_name] = m
-    _save(data)
+    with _lock():
+        data = _load()
+        m = _normalize_skill_metric(data["skill_metrics"].get(skill_name))
+        m["uses"] += 1
+        if success:
+            m["successes"] += 1
+        data["skill_metrics"][skill_name] = m
+        _save(data)
 
 
 def get_skill_metric(skill_name: str) -> dict:
@@ -1093,13 +1209,14 @@ def get_skill_metric(skill_name: str) -> dict:
 
 
 def add_checkpoint(checkpoint: dict) -> None:
-    data = _load()
-    checkpoint = dict(checkpoint)
-    checkpoint.setdefault("timestamp", datetime.now().isoformat())
-    data["checkpoints"].append(checkpoint)
-    if len(data["checkpoints"]) > MAX_CHECKPOINTS:
-        data["checkpoints"] = data["checkpoints"][-MAX_CHECKPOINTS:]
-    _save(data)
+    with _lock():
+        data = _load()
+        checkpoint = dict(checkpoint)
+        checkpoint.setdefault("timestamp", datetime.now().isoformat())
+        data["checkpoints"].append(checkpoint)
+        if len(data["checkpoints"]) > MAX_CHECKPOINTS:
+            data["checkpoints"] = data["checkpoints"][-MAX_CHECKPOINTS:]
+        _save(data)
 
 
 def get_storage_summary() -> dict:

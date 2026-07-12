@@ -104,6 +104,18 @@ its own when it notices you've run the exact same terminal command
 twice; you don't need to do that yourself, but you can still hand-write
 one for anything more structured than a shell command.
 
+Multiple INDEPENDENT calls in one turn — only when the calls have NO
+data dependency on each other (e.g. checking whether ss, netstat, and
+lsof are installed — three unrelated checks, none needs another's
+result):
+  {"tools": [{"tool": "terminal", "args": {"command": "which ss"}},
+             {"tool": "terminal", "args": {"command": "which netstat"}},
+             {"tool": "terminal", "args": {"command": "which lsof"}}]}
+Do NOT use this when one call's result determines the next call's
+arguments (e.g. "read a file, then edit based on its contents") — that's
+a sequence, not independent work, and belongs in separate turns. When in
+doubt, use a single {"tool": ..., "args": ...} call instead.
+
 {{PLUGIN_TOOLS_BLOCK}}
 
 Note: the "memory" tool is a simple key-value store (built-in, not MCP).
@@ -214,6 +226,20 @@ OUTPUT STYLE — actions not dumps
 ════════════════════════════════════════════════════════
 Show:  Running: ls -la | Reading: config.py | Search: "python docs"
 Never: dump full file contents, long stdout, raw HTML
+
+════════════════════════════════════════════════════════
+SHELL EFFICIENCY — one tool call per turn, spend it well
+════════════════════════════════════════════════════════
+Only ONE tool call happens per turn. Checking tool availability with
+separate "which X" calls one at a time burns a full turn PER check for
+zero task progress.
+  Wrong (3 turns wasted): which ss / which netstat / which lsof
+  Right (1 turn):         command -v ss netstat lsof 2>&1
+Better yet, skip the availability check — just run the real command with
+inline fallbacks in ONE call:
+  ss -ltnp 2>/dev/null || netstat -tlnp 2>/dev/null || lsof -i -P -n
+Same rule for any multi-step shell investigation: chain with && / || /
+; into one command instead of probing step by step across turns.
 
 ════════════════════════════════════════════════════════
 GENERATING NEW SKILLS — trajectory-informed

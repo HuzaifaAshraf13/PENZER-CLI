@@ -280,6 +280,37 @@ class LLM:
         assumptions = _as_list(data.get("assumptions"))
         unknowns    = _as_list(data.get("unknowns"))
 
+        # Multiple INDEPENDENT calls in one turn — e.g. `which ss`,
+        # `which netstat`, `which lsof` are unrelated checks with no
+        # data dependency between them. Previously this parser could
+        # only ever extract a single {"tool", "args"} pair, so
+        # agent.py's own parallel/race execution machinery
+        # (_run_parallel, _run_race) — built to handle exactly this
+        # case — could never actually receive more than one call per
+        # turn and was effectively dead code. Optional and additive:
+        # a model that never uses "tools" behaves exactly as before.
+        tools_array = data.get("tools")
+        if isinstance(tools_array, list) and tools_array:
+            tool_calls = []
+            for idx, t in enumerate(tools_array):
+                if not isinstance(t, dict):
+                    continue
+                tname = str(t.get("tool", "")).strip()
+                targs = t.get("args", {})
+                if tname:
+                    tool_calls.append({
+                        "id": f"tool_call_{idx + 1}",
+                        "name": tname,
+                        "arguments": targs if isinstance(targs, dict) else {},
+                    })
+            if tool_calls:
+                return {
+                    "content": answer,
+                    "tool_calls": tool_calls,
+                    "assumptions": assumptions,
+                    "unknowns": unknowns,
+                }
+
         # If tool is specified, return tool call
         if tool_name:
             return {

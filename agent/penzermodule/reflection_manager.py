@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 STUCK_MIN = 2
 MAX_FAILURES = 3
-ABSOLUTE_MAX_ITER = 500
-MAX_RUNTIME_SECONDS = 900
+ABSOLUTE_MAX_ITER = 5000
+MAX_RUNTIME_SECONDS = 21600
+MAX_TOKENS_PER_RUN = 2000000
 
 from agent.penzermodule.belief_manager import Phase, PHASE_TRANSITIONS, PHASE_TO_GOAL_PROGRESS
 
@@ -120,14 +121,24 @@ class ReflectionManager:
             return False
         if len({str(m.get("content", ""))[:80] for m in msgs}) == 1:
             return True
-        names = []
+        # Fixed: was checking tool NAME repetition only, so calling
+        # "terminal" 3x with 3 different commands (e.g. `which ss`,
+        # `which netstat`, `which lsof` — genuinely varied progress,
+        # not repetition) falsely tripped this. Now checks the full
+        # name+arguments signature, matching the same cache-key shape
+        # used elsewhere (_tool_confidence) — only the exact same call
+        # repeated counts as being stuck.
+        signatures = []
         for m in w:
             if m.get("role") == "assistant":
                 try:
-                    names.extend(tc["name"] for tc in json.loads(m["content"]).get("tool_calls", []))
+                    for tc in json.loads(m["content"]).get("tool_calls", []):
+                        signatures.append(
+                            f"{tc.get('name')}:{json.dumps(tc.get('arguments', {}), sort_keys=True)}"
+                        )
                 except Exception:
                     pass
-        if len(names) >= 3 and len(set(names)) == 1:
+        if len(signatures) >= 3 and len(set(signatures)) == 1:
             return True
         recent = agent._trace[-STUCK_MIN:]
         return len(recent) >= STUCK_MIN and all(not s["success"] for s in recent)
@@ -162,6 +173,8 @@ class ReflectionManager:
         if agent._iteration >= ABSOLUTE_MAX_ITER:
             return False
         if time.time() - agent._run_start_time > MAX_RUNTIME_SECONDS:
+            return False
+        if getattr(agent.llm, "token_estimate", 0) - agent._tokens_before_run > MAX_TOKENS_PER_RUN:
             return False
         resource_ok, _ = agent._monitor.check()
         if not resource_ok:
