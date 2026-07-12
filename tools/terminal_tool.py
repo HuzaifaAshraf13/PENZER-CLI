@@ -4,6 +4,7 @@ Handles bash commands, Python code, multi-line scripts, and background processes
 """
 
 import os
+import asyncio
 import subprocess
 from agent.core import mcp
 from tools.executor import execute, get_change_log
@@ -35,7 +36,7 @@ def _set_session_workdir(session_id: str | None, target: str) -> None:
         _cwd = target
 
 
-def _terminal_impl(
+async def _terminal_impl(
     command: str = None,
     code: str = None,
     script: str = None,
@@ -106,19 +107,31 @@ def _terminal_impl(
         except Exception as e:
             return error(str(e))
 
-    return execute(
-        payload,
-        mode=mode,
-        timeout=timeout,
-        workdir=effective_workdir,
-        force=force,
-        approval_required=get_profile_settings().get("approval_required", True),
-        confirmation_reason="This action may be destructive or sensitive.",
-    )
+    # FIX: execute() is a blocking sandbox call. Running it directly inside
+    # this async tool handler stalls the whole agent event loop for the
+    # entire command duration — the CLI stops rendering output (though
+    # stdin keeps buffering keystrokes, which is why input felt "accepted"
+    # but nothing appeared on screen, e.g. during long nmap scans).
+    # asyncio.to_thread offloads it to a worker thread so the event loop
+    # — and therefore your CLI's render/input loop — stays responsive.
+    try:
+        result = await asyncio.to_thread(
+            execute,
+            payload,
+            mode=mode,
+            timeout=timeout,
+            workdir=effective_workdir,
+            force=force,
+            approval_required=get_profile_settings().get("approval_required", True),
+            confirmation_reason="This action may be destructive or sensitive.",
+        )
+        return result
+    except Exception as e:
+        return error(str(e))
 
 
 @mcp.tool()
-def terminal(
+async def terminal(
     command: str = None,
     code: str = None,
     script: str = None,
@@ -129,7 +142,7 @@ def terminal(
     background: bool = False,
     session_id: str = None,
 ) -> dict:
-    return _terminal_impl(
+    return await _terminal_impl(
         command=command,
         code=code,
         script=script,
