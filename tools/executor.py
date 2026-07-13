@@ -18,6 +18,28 @@ from config import get_profile_settings
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
+# LIVE-DISPLAY PAUSE HOOKS
+# ─────────────────────────────────────────
+# confirm_action() below calls input() to ask for approval. Since
+# execute() is always invoked via asyncio.to_thread from the terminal
+# tool, that input() call runs on a worker thread — while cli.py's
+# Rich console.status() spinner keeps repainting the terminal from its
+# own internal refresh thread. Without pausing it, the approval prompt
+# is written but immediately overwritten by the next spinner frame, so
+# it's genuinely invisible: the user can't see what they're being asked
+# to approve, and Penzer appears to hang. cli.py registers status.stop
+# / status.start here (Rich's own documented pattern for prompting
+# during a Live display) for the duration of each turn.
+_pause_live = None
+_resume_live = None
+
+
+def set_live_hooks(pause, resume) -> None:
+    global _pause_live, _resume_live
+    _pause_live = pause
+    _resume_live = resume
+
+# ─────────────────────────────────────────
 # LIMITS
 # ─────────────────────────────────────────
 DEFAULT_TIMEOUT   = 60       # seconds
@@ -135,10 +157,21 @@ def confirm_action(command: str, reason: str = "") -> bool:
     prompt = "Approve this command? [y/N]: "
     if reason:
         prompt = f"{reason}\n{prompt}"
+    if _pause_live is not None:
+        try:
+            _pause_live()
+        except Exception:
+            pass
     try:
         response = input(prompt).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
+    finally:
+        if _resume_live is not None:
+            try:
+                _resume_live()
+            except Exception:
+                pass
     return response in {"y", "yes"}
 
 

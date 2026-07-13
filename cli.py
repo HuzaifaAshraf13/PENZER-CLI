@@ -2,7 +2,6 @@
 """PENZER-CLI: Autonomous Terminal Agent"""
 import threading
 import asyncio
-import sys
 import re
 import json
 import logging
@@ -10,13 +9,13 @@ import subprocess
 import os
 import signal
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Callable
 from rich.markdown import Markdown
 from rich.panel import Panel
 from logger import get_logger, console as console
 from version import get_version, check_for_update, perform_update
-from tools.executor import format_execution_state, kill_all_running
-from config import DEFAULT_PROFILE, PROFILE_OPTIONS, get_profile_settings
+from tools.executor import format_execution_state, kill_all_running, set_live_hooks
+from config import PROFILE_OPTIONS, get_profile_settings
 logger = get_logger("cli")
 from agent.agent import PenzerAgent
 from agent.server import start_server
@@ -273,7 +272,54 @@ def safe_subprocess_run(*args, **kwargs) -> subprocess.CompletedProcess:
     except Exception as e:
         logger.error(f"Unexpected subprocess error: {e}")
         raise
+
+
+# ─────────────────────────────────────────
+# INTERRUPT HANDLING
+# ─────────────────────────────────────────
+# A real Ctrl+C (SIGINT) needs to reach two different places depending on
+# what Penzer is doing at that instant:
+#
+#   1. A tool call is running (e.g. agent.run() -> terminal -> nmap via
+#      asyncio.to_thread): the blocking subprocess is running in a worker
+#      thread that asyncio cannot cancel on its own, so the signal has to
+#      reach tools/executor.py's process registry directly and kill it,
+#      then cancel the asyncio task waiting on it.
+#
+#   2. Penzer is idle at the "▸ " prompt: console.input() is a plain
+#      blocking call, already handled by the existing
+#      `except (EOFError, KeyboardInterrupt)` below — but only if a
+#      KeyboardInterrupt actually gets raised. Installing a custom
+#      signal.signal(SIGINT, ...) handler replaces Python's default
+#      handler, and per PEP 475 an interrupted blocking call is
+#      automatically retried unless the handler itself raises — so this
+#      handler must explicitly re-raise KeyboardInterrupt for the idle
+#      case, or Ctrl+C at the prompt would silently do nothing.
+#
+# One more wrinkle: when case 2's raise happens while asyncio's own
+# scheduler is between coroutines (not inside any particular await), the
+# exception can't be caught by any try/except written inside main() —
+# only by wrapping the asyncio.run(main()) call itself, in
+# main_entrypoint() below. Both catches are needed; neither alone is
+# sufficient.
+_current_task: "asyncio.Task | None" = None
+
+
+def _sigint_handler(signum, frame):
+    killed = kill_all_running()
+    if killed:
+        logger.info("SIGINT: killed %d running process(es)", killed)
+    if _current_task is not None and not _current_task.done():
+        _current_task.cancel()
+    else:
+        raise KeyboardInterrupt()
+
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
+
 async def main():
+    global _current_task
     try:
         display_banner()
         logging.getLogger("penzer.server").setLevel(logging.CRITICAL)
@@ -368,10 +414,32 @@ async def main():
                     title="Resume Preview",
                     border_style="green",
                 ))
-                if console.input("Resume this task? [y/N]: ").strip().lower() not in {"y", "yes"}:
+                try:
+                    proceed = console.input("Resume this task? [y/N]: ").strip().lower() in {"y", "yes"}
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[dim]Resume cancelled.[/dim]")
+                    continue
+                if not proceed:
                     console.print("[dim]Resume cancelled.[/dim]")
                     continue
-                response = await agent.resume_last_task()
+                try:
+                    _current_task = asyncio.ensure_future(agent.resume_last_task())
+                    response = await _current_task
+                except asyncio.CancelledError:
+                    console.show_cursor(True)
+                    console.file.flush()
+                    console.print("\n[yellow]Interrupted.[/yellow]")
+                    agent.clear_session()
+                    console.print("[dim]Session cleared. Memory retained.[/dim]")
+                    return
+                except Exception as e:
+                    console.show_cursor(True)
+                    console.file.flush()
+                    console.print(f"\n[red]Error: {e}[/red]")
+                    console.print("[dim]You can try another command.[/dim]")
+                    continue
+                finally:
+                    _current_task = None
                 console.print()
                 console.print(Markdown(clean_response(response or "No response.")))
                 continue
@@ -413,7 +481,7 @@ async def main():
             calls_before  = getattr(agent.llm, "call_count", 0)
             tokens_before = getattr(agent.llm, "token_estimate", 0)
             status_view = LiveStatusView()
-            # FIX: console.status() hides the cursor and takes over
+            # FIX 1: console.status() hides the cursor and takes over
             # terminal rendering while active. On long-running tool calls
             # (e.g. an nmap network scan run via asyncio.to_thread), the
             # cursor/render state was not reliably restored once the
@@ -421,29 +489,48 @@ async def main():
             # accepted keystrokes underneath, but nothing visibly drew on
             # screen. The try/finally guarantees the cursor is shown and
             # the stream flushed regardless of how the block exits.
+            #
+            # FIX 2: `_current_task` (module-level, see _sigint_handler
+            # above) must point at this specific task while it runs, so a
+            # real Ctrl+C can find and cancel it — and must be cleared
+            # from the `finally` so a Ctrl+C arriving after this turn
+            # finishes (the gap before the next prompt) takes the idle
+            # path instead of trying to cancel a task that's already done.
             try:
                 with console.status("[cyan]Working…[/cyan]", spinner="dots") as status:
                     def _on_status(msg: str) -> None:
                         status_view.update(msg)
                         status.update(f"[cyan]{status_view.current}[/cyan]")
                     agent.on_status = _on_status
-                    response = await agent.run(user_input)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                # Ctrl+C always fully exits Penzer, whether idle or mid-task
-                # (matching the idle-prompt Ctrl+C behavior above). Before
-                # exiting we still kill_all_running() — otherwise a
-                # scan like nmap keeps running as an orphaned OS process
-                # even after Penzer itself has quit, since
-                # asyncio.to_thread cannot cancel the thread it runs in.
-                killed = kill_all_running()
-                note = f" ({killed} process{'es' if killed != 1 else ''} stopped)" if killed else ""
+                    set_live_hooks(status.stop, status.start)
+                    _current_task = asyncio.ensure_future(agent.run(user_input))
+                    response = await _current_task
+            except asyncio.CancelledError:
+                # Reached when _sigint_handler cancelled _current_task
+                # above. The handler already called kill_all_running()
+                # before cancelling, so the subprocess is already dead —
+                # this branch is just cleanup and messaging.
                 console.show_cursor(True)
                 console.file.flush()
-                console.print(f"\n[yellow]Interrupted.[/yellow]{note}")
+                console.print("\n[yellow]Interrupted.[/yellow]")
                 agent.clear_session()
                 console.print("[dim]Session cleared. Memory retained.[/dim]")
                 return
+            except Exception as e:
+                # Without this, any error from agent.run() — a flaky LLM
+                # call, a tool bug, a malformed response — was uncaught
+                # here and fell through to the outer `except Exception`
+                # around the whole while loop, which ends main() entirely.
+                # One bad command would silently end the whole session
+                # instead of just failing that one turn.
+                console.show_cursor(True)
+                console.file.flush()
+                console.print(f"\n[red]Error: {e}[/red]")
+                console.print("[dim]You can try another command.[/dim]")
+                continue
             finally:
+                _current_task = None
+                set_live_hooks(None, None)
                 console.show_cursor(True)
                 console.file.flush()
             calls_used  = getattr(agent.llm, "call_count", 0) - calls_before
@@ -470,7 +557,17 @@ async def main():
         import traceback
         traceback.print_exc()
 def main_entrypoint():
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Reached when Ctrl+C fires while idle (no task running for
+        # _sigint_handler to cancel, so it re-raised KeyboardInterrupt
+        # directly). That raise happens inside asyncio's own scheduler,
+        # not inside any coroutine's stack, so no try/except inside
+        # main() can ever catch it — only wrapping asyncio.run() itself,
+        # here, can. Without this, Penzer would exit via an unhandled
+        # traceback instead of a clean message.
+        console.print("\n[dim]Interrupted. Goodbye.[/dim]")
 
 if __name__ == "__main__":
     main_entrypoint()
