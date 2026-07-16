@@ -1,5 +1,4 @@
 """PENZER — ReflectionManager
-
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -7,22 +6,12 @@ behavior lives. PenzerAgent keeps every original method name as a thin
 delegate (e.g. `agent._transition(...)` still works), so nothing calling
 the agent needs to change.
 """
-
 import asyncio, json, time, logging
 from typing import Any
 from session.memory import remember_semantic, store_insight, store_post_mortem
-
+from agent.config import STUCK_MIN, ABSOLUTE_MAX_ITER, MAX_RUNTIME_SECONDS, MAX_TOKENS_PER_RUN
 logger = logging.getLogger(__name__)
-
-STUCK_MIN = 2
-MAX_FAILURES = 3
-ABSOLUTE_MAX_ITER = 5000
-MAX_RUNTIME_SECONDS = 21600
-MAX_TOKENS_PER_RUN = 2000000
-
-from agent.penzermodule.belief_manager import Phase, PHASE_TRANSITIONS, PHASE_TO_GOAL_PROGRESS
-
-
+from agent.penzermodule.belief_manager import Phase
 class ReflectionManager:
     @staticmethod
     def _extract_json(text: str, default: str = "{}") -> Any:
@@ -34,7 +23,6 @@ class ReflectionManager:
             return json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             return json.loads(default)
-
     async def _evaluate_completion(self, agent, goal: str, result: str) -> tuple[bool, str]:
         try:
             r = await asyncio.wait_for(
@@ -54,7 +42,6 @@ class ReflectionManager:
             return bool(ev.get("completed", True)), ev.get("reason", "")
         except Exception:
             return True, ""
-
     async def _write_post_mortem_and_insights(self, agent, goal: str, result: str) -> None:
         worked = " -> ".join(
             f"{t['tool']}({agent._fmt_action(t['tool'], t['args'])})"
@@ -98,7 +85,6 @@ class ReflectionManager:
                 )
         except Exception as e:
             logger.debug("Post-mortem: %s", e)
-
     def _inject_meta_skill_reminder(self, agent):
         winning = " -> ".join(
             f"{t['tool']}({agent._fmt_action(t['tool'], t['args'])})"
@@ -113,9 +99,30 @@ class ReflectionManager:
             "3. Include: name, description, keywords, agent_behavior, failure_modes, mcp_tools.\n"
             "Then give your final answer."
         )})
-
     def _stuck(self, agent) -> bool:
-        w    = agent.history[-6:]
+        """
+        Detects two kinds of stuck-ness: (a) the same tool result content
+        repeating, or (b) the same tool+arguments signature repeating 3+
+        times, within a small trailing window — plus a fallback of "the
+        last STUCK_MIN trace entries all failed".
+
+        The window is bounded by agent._resume_boundary_history_len (set
+        alongside agent._resume_boundary_trace_len whenever a run is
+        resumed) so this can't be fooled by stale pre-crash history.
+        Without that bound, this used only `agent.history[-6:]`
+        unconditionally — the caller's own gate
+        (`len(trace) - resume_boundary_trace_len >= STUCK_MIN`) only
+        protects *whether* _stuck() gets called, not *what it looks at*
+        once called. Since one post-resume LLM turn can add several tool
+        calls at once, that gate can open after a single new iteration,
+        at which point history[-6:] could still contain 1-2 leftover
+        pre-crash messages mixed with the new ones — exactly the false
+        "stuck from a different context" scenario resume_last_task's own
+        comment describes, just reintroduced on the history side instead
+        of the trace side.
+        """
+        boundary = getattr(agent, "_resume_boundary_history_len", 0)
+        w    = agent.history[boundary:][-6:]
         msgs = [m for m in w if m.get("role") == "tool"]
         if len(msgs) < STUCK_MIN:
             return False
@@ -140,9 +147,12 @@ class ReflectionManager:
                     pass
         if len(signatures) >= 3 and len(set(signatures)) == 1:
             return True
+        # Already safe without a boundary check: the caller's gate
+        # (len(trace) - resume_boundary_trace_len >= STUCK_MIN) guarantees
+        # the trailing STUCK_MIN trace entries are entirely post-resume by
+        # construction, unlike the history-based checks above.
         recent = agent._trace[-STUCK_MIN:]
         return len(recent) >= STUCK_MIN and all(not s["success"] for s in recent)
-
     async def _reflect(self, agent) -> str:
         failed = "\n".join(
             f"  {s['tool']} -> {s.get('error_type','?')}: {s['result'][:80]}"
@@ -154,7 +164,6 @@ class ReflectionManager:
                 f"GOAL: {agent._goal}\n{agent._belief_summary()}\nFAILED:\n{failed}\n\nDIAGNOSIS:\nNEXT:"}],
         )
         return r.get("content", "Try completely different approach")
-
     def _can_extend_iterations(self, agent) -> bool:
         """
         Called only when about to hit the current iteration cap. Iteration

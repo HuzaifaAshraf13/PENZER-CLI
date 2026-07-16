@@ -1,5 +1,4 @@
 """PENZER — PersistenceManager
-
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -7,27 +6,28 @@ behavior lives. PenzerAgent keeps every original method name as a thin
 delegate (e.g. `agent._transition(...)` still works), so nothing calling
 the agent needs to change.
 """
-
 import time, logging
 from datetime import datetime
 from session.memory import (
     save_last_run, add_checkpoint,
 )
 from tools.executor import set_execution_state
-
 logger = logging.getLogger(__name__)
-
 TRIM_AT = 30
 KEEP_LAST = 8
 CHECKPOINT_EVERY = 10
-
 from agent.penzermodule.belief_manager import Phase, PHASE_TRANSITIONS, PHASE_TO_GOAL_PROGRESS
-
-
 class PersistenceManager:
     def _restore_snapshot(self, agent, snapshot: dict) -> None:
         agent._goal = snapshot.get("goal", agent._goal)
         agent._run_id = snapshot.get("run_id", agent._run_id)
+        # Restoring iteration count lets a resumed run continue counting
+        # from where it left off (see _loop's start-point logic in
+        # agent.py) instead of silently restarting the iteration budget
+        # at 0 — without this, ABSOLUTE_MAX_ITER and friends only ever
+        # measured "iterations since the most recent resume," not total
+        # iterations spent on the task, defeating the point of a ceiling.
+        agent._iteration = snapshot.get("iteration", agent._iteration)
         agent.history = snapshot.get("history", agent.history)
         agent._trace = snapshot.get("trace", agent._trace)
         agent._resume_state = snapshot.get("resume_state", agent._resume_state)
@@ -42,6 +42,13 @@ class PersistenceManager:
             agent._phase = Phase.PLANNING
         agent._complexity_score = snapshot.get("complexity_score", agent._complexity_score)
         agent._is_complex_task = snapshot.get("is_complex_task", agent._is_complex_task)
+        # NOTE: this is the single source of truth for max_iter on resume.
+        # agent.py's resume_last_task() must NOT recompute/overwrite this
+        # afterward — it used to, which silently discarded any iteration
+        # extensions the run had already earned before crashing/being
+        # interrupted, forcing it back down to the base complexity-based
+        # budget every time. If the snapshot has no max_iter (older
+        # snapshot format), the caller-supplied default here is used.
         agent._max_iter = snapshot.get("max_iter", agent._max_iter)
         agent._matched_skills = snapshot.get("matched_skills", agent._matched_skills)
         agent._last_matched_skills = snapshot.get("last_matched_skills", agent._last_matched_skills)
@@ -54,12 +61,12 @@ class PersistenceManager:
         agent._execution_complete = snapshot.get("execution_complete", agent._execution_complete)
         if agent._resume_state:
             set_execution_state({"state": agent._resume_state})
-
     def _persist_resume_snapshot(self, agent) -> None:
         try:
             save_last_run({
                 "goal": agent._goal,
                 "run_id": agent._run_id,
+                "iteration": agent._iteration,
                 "history": agent.history,
                 "trace": agent._trace,
                 "resume_state": agent._resume_state,
@@ -84,7 +91,6 @@ class PersistenceManager:
             })
         except Exception as e:
             logger.error("Persist snapshot: %s", e)
-
     async def _trim(self, agent) -> None:
         if agent._trimming or len(agent.history) <= TRIM_AT:
             return
@@ -110,7 +116,6 @@ class PersistenceManager:
             agent.history = first + tail
         finally:
             agent._trimming = False
-
     async def _checkpoint(self, agent, iteration: int):
         try:
             violations = agent._check_consistency()

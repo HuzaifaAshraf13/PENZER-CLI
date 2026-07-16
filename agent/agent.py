@@ -7,7 +7,6 @@ Research sources:
   HyMem      (Zhao 2026)      — dual-tier retrieval, complexity scoring
   MemoryBank (Zhong 2024)     — Ebbinghaus decay + spaced repetition
   Active CC  (Arxiv 2601)     — goal-aware context compression
-
 """
 import json, logging, inspect, asyncio, signal, time, psutil, random, re, itertools
 from typing import Any, Callable
@@ -106,6 +105,11 @@ class PenzerAgent:
         self._run_start_time:      float = time.time()
         self._tokens_before_run:   int   = 0
         self._resume_boundary_trace_len: int = 0
+        # Mirrors _resume_boundary_trace_len but for agent.history — see
+        # reflection_manager.py's _stuck() docstring for why history needs
+        # its own boundary (it isn't 1:1 with trace entries, so the trace
+        # boundary alone doesn't protect the history-based stuck checks).
+        self._resume_boundary_history_len: int = 0
         self._task_insights:       list  = []
         self._past_trajectories:   list  = []
         self._trimming:            bool  = False
@@ -222,7 +226,21 @@ class PenzerAgent:
         if snapshot.get("execution_queue") is None and snapshot.get("trace"):
             return "No resumable execution state found."
         self._restore_snapshot(snapshot)
-        self._max_iter = self._max_iter_for_complexity(self._complexity_score)
+        # _restore_snapshot brings back _matched_skills (just names — the
+        # snapshot is JSON, and skill objects aren't trivially
+        # serializable) but not _active_skills/_skill_plan/_skill_steps/
+        # _skill_done, which _orchestrate_skills builds from the actual
+        # skill objects. Without this, a resumed run kept telling the
+        # model "SKILLS MATCHED: X, Y" (baked into the restored
+        # _system_prompt) while the structures that track per-step skill
+        # progress and drive update_skill_metric were silently empty.
+        # Re-derive the objects from the restored names and rebuild the
+        # plan the same way run() does.
+        if self._matched_skills:
+            by_name = {s.name: s for s in list(self.core_skills) + list(self.gen_skills)}
+            self._active_skills = [by_name[n] for n in self._matched_skills if n in by_name]
+            if self._active_skills:
+                self._orchestrate_skills()
         self._run_start_time = time.time()
         self._tokens_before_run = getattr(self.llm, "token_estimate", 0)
         # Restored `_trace`/`history` are the pre-crash record. Without
@@ -232,6 +250,7 @@ class PenzerAgent:
         # different context before the crash, not from anything this
         # resumed attempt has actually done yet.
         self._resume_boundary_trace_len = len(self._trace)
+        self._resume_boundary_history_len = len(self.history)
         result = await self._loop()
         return await self._finalize(self._goal, result)
 
@@ -449,7 +468,15 @@ class PenzerAgent:
     # ------------------------------------------------------------------
     async def _loop(self) -> str:
         empty = 0
-        for i in itertools.count():
+        # A fresh run always starts with an empty _trace (set by _reset()
+        # right before _loop() is called), so this starts counting at 0
+        # as before. A resumed run restores a non-empty _trace along with
+        # the iteration count it had reached pre-crash/interruption — in
+        # that case counting continues from there instead of silently
+        # restarting at 0, so ABSOLUTE_MAX_ITER and the iteration budget
+        # reflect total work done on the task, not just this attempt.
+        start_at = self._iteration + 1 if self._trace else 0
+        for i in itertools.count(start_at):
             self._iteration = i
             stop = self._check_stop_conditions(i)
             if stop is not None:
@@ -647,6 +674,13 @@ class PenzerAgent:
                 ms.get("milestone", ""), self._belief["last_outcome"]
             )
             if new_steps:
+                # Actually wires the new steps into the live execution
+                # queue (see planner.py's _requeue_milestone_steps
+                # docstring) — previously only _subtasks/_subtask_idx
+                # were written here, which nothing in the claim path
+                # reads, so a replan had no effect on what tool actually
+                # got tried next.
+                self.planner._requeue_milestone_steps(self, self._milestone_idx, new_steps)
                 self._subtasks    = new_steps
                 self._subtask_idx = 0
                 self._transition(Phase.EXECUTING, reason="replanned milestone")
@@ -697,7 +731,10 @@ class PenzerAgent:
             fallback_results = []
             for call, (raw, elapsed) in zip(filtered_calls, results):
                 if self._is_error(raw):
-                    fb_raw, fb_elapsed = await self._run_with_fallback(call)
+                    # Pass the result we already have — _run_with_fallback
+                    # no longer re-executes an already-failed call from
+                    # scratch (see execution_manager.py).
+                    fb_raw, fb_elapsed = await self._run_with_fallback(call, prior_result=(raw, elapsed))
                     fallback_results.append((fb_raw, fb_elapsed))
                 else:
                     fallback_results.append((raw, elapsed))
@@ -813,8 +850,8 @@ class PenzerAgent:
     def _fallback_tool(self, tool_name: str) -> str | None:
         return self.execution._fallback_tool(self, tool_name)
 
-    async def _run_with_fallback(self, call: dict) -> tuple[str, float]:
-        return await self.execution._run_with_fallback(self, call)
+    async def _run_with_fallback(self, call: dict, prior_result: tuple[str, float] | None = None) -> tuple[str, float]:
+        return await self.execution._run_with_fallback(self, call, prior_result)
 
     async def _run_parallel(self, calls: list) -> list[tuple[str, float]]:
         return await self.execution._run_parallel(self, calls)

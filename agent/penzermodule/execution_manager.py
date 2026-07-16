@@ -1,5 +1,4 @@
 """PENZER — ExecutionManager
-
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -7,13 +6,10 @@ behavior lives. PenzerAgent keeps every original method name as a thin
 delegate (e.g. `agent._transition(...)` still works), so nothing calling
 the agent needs to change.
 """
-
-import time, asyncio, inspect, json, re, logging
+import time, asyncio, inspect, json, re, hashlib, logging
 from tools.plugins import create_plugin_tool, load_plugin_tools
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
-
 logger = logging.getLogger(__name__)
-
 TOOL_LABELS = {
     "browser": "\U0001F310", "terminal": "\u26A1", "run_python": "\U0001F40D",
     "run_bash": "\U0001F4DC", "file_editor": "\U0001F4C1", "memory": "\U0001F9E0", "planning": "\U0001F4CB",
@@ -23,10 +19,6 @@ FALLBACKS = {
     "run_python": "terminal", "file_editor": "terminal",
 }
 TOOL_TIMEOUT = 30
-
-from agent.penzermodule.belief_manager import Phase, PHASE_TRANSITIONS, PHASE_TO_GOAL_PROGRESS
-
-
 class ExecutionManager:
     def _tool_confidence(self, agent, tool_name: str, args: dict) -> float:
         """
@@ -45,7 +37,6 @@ class ExecutionManager:
             m = get_skill_metric(skill.name)
             score += m.get("success_rate", 0) * 0.1
         return round(min(1.0, max(0.0, score)), 6)
-
     async def _execute_single_tool(self, agent, call: dict) -> tuple[str, float]:
         """Runs exactly one tool call: memory short-circuit, availability
         check, status update, timeout wrapping. Shared by `_run_parallel`
@@ -72,7 +63,6 @@ class ExecutionManager:
         except asyncio.TimeoutError:
             raw = f"Timeout after {TOOL_TIMEOUT}s"
         return raw, round(time.time() - start, 2)
-
     async def _run_speculative(self, agent, calls: list) -> list[tuple[str, float]]:
         """
         For independent tool calls: race them and take the first success.
@@ -81,48 +71,74 @@ class ExecutionManager:
         """
         if len(calls) <= 1:
             return await agent._run_parallel(calls)
-
         def get_target(c):
             args = c.get("arguments", {})
             return args.get("filepath") or args.get("command", "")[:20]
-
         targets = [get_target(c) for c in calls]
         unique  = len(set(t for t in targets if t)) == len([t for t in targets if t])
         if unique and all(c["name"] in ("browser", "terminal", "run_bash") for c in calls):
             return await agent._run_race(calls)
         return await agent._run_parallel(calls)
-
     async def _run_race(self, agent, calls: list) -> list[tuple[str, float]]:
-        """Launch all calls, cancel losers when first succeeds."""
-        results = [("(cancelled)", 0.0)] * len(calls)
+        """Launch all calls; return as soon as one succeeds, or once every
+        call has finished — whichever comes first.
 
-        async def run_and_report(idx: int, c: dict, done_event: asyncio.Event):
+        Previously this only woke up on a success signal (`done_event`),
+        so when every call in the race failed — which typically happens
+        fast — the function still sat blocked until the full TOOL_TIMEOUT
+        elapsed, even though every result was already known. Now it waits
+        incrementally via asyncio.wait(FIRST_COMPLETED) and returns the
+        moment either a success lands or nothing is left pending.
+        """
+        results = [("(cancelled)", 0.0)] * len(calls)
+        async def run_and_report(idx: int, c: dict) -> bool:
             raw, elapsed = await agent._execute_single_tool(c)
             results[idx] = (raw, elapsed)
-            if not agent._is_error(raw):
-                done_event.set()
-
-        done  = asyncio.Event()
-        tasks = [asyncio.create_task(run_and_report(i, c, done)) for i, c in enumerate(calls)]
+            return not agent._is_error(raw)
+        pending  = {asyncio.create_task(run_and_report(i, c)) for i, c in enumerate(calls)}
+        deadline = time.time() + TOOL_TIMEOUT
         try:
-            await asyncio.wait_for(done.wait(), timeout=TOOL_TIMEOUT)
-        except asyncio.TimeoutError:
-            pass
+            while pending:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                done, pending = await asyncio.wait(
+                    pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                if any(t.result() for t in done):
+                    break
         finally:
-            for t in tasks:
+            for t in pending:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*pending, return_exceptions=True)
         return results
-
     def _fallback_tool(self, agent, tool_name: str) -> str | None:
         return FALLBACKS.get(tool_name)
+    async def _run_with_fallback(
+        self, agent, call: dict, prior_result: tuple[str, float] | None = None
+    ) -> tuple[str, float]:
+        """Tries a fallback tool for a call that already failed.
 
-    async def _run_with_fallback(self, agent, call: dict) -> tuple[str, float]:
+        `prior_result` should be the (raw, elapsed) the caller already
+        obtained for `call` — pass it whenever you have it, so this
+        doesn't re-execute an already-failed tool a second time. That
+        used to happen unconditionally: agent.py only calls this after
+        already confirming `call` errored, yet this method re-ran it from
+        scratch anyway. For a read-only tool that's wasted time; for
+        `terminal` — the exact tool this fallback path exists to protect
+        — it means re-running a shell command that already failed, which
+        is a real problem for anything with a side effect (partial file
+        write, network call, state mutation). If `prior_result` is
+        omitted, falls back to running it once here.
+        """
         name = call.get("name")
         if not name:
             return "No tool name provided", 0.0
-        results = await agent._run_parallel([call])
-        raw, elapsed = results[0] if results else ("", 0.0)
+        if prior_result is not None:
+            raw, elapsed = prior_result
+        else:
+            results = await agent._run_parallel([call])
+            raw, elapsed = results[0] if results else ("", 0.0)
         if raw and not agent._is_error(raw):
             return raw, elapsed
         fallback = agent._fallback_tool(name)
@@ -134,10 +150,8 @@ class ExecutionManager:
             fb_raw, fb_elapsed = fb_results[0] if fb_results else ("", 0.0)
             return fb_raw, fb_elapsed
         return raw, elapsed
-
     async def _run_parallel(self, agent, calls: list) -> list[tuple[str, float]]:
         return list(await asyncio.gather(*[agent._execute_single_tool(c) for c in calls]))
-
     async def _run(self, agent, name: str, args: dict) -> str:
         tools = getattr(agent, "tools", {}) or {}
         if name == "memory" or tools.get(name) == "builtin":
@@ -149,15 +163,12 @@ class ExecutionManager:
                 return str(agent._plugin_tools[name](**args))
             except Exception as e:
                 return f"Plugin error: {e}"
-
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
         if key in agent._cache:
             return agent._cache[key]
-
         tool = agent.tools.get(name)
         if not tool:
             return f"Tool '{name}' not available"
-
         for attempt in range(2):
             try:
                 fn = getattr(tool, "fn", tool)
@@ -179,7 +190,6 @@ class ExecutionManager:
                         return await agent._run(fb, {"command": cmd})
                     return f"Error: {e}"
         return ""
-
     def _run_memory_tool(self, agent, args: dict) -> str:
         """
         kv_store/kv_delete return confirmation strings (not None/bool),
@@ -199,7 +209,6 @@ class ExecutionManager:
         if handler:
             return handler()
         return f"Unknown memory action '{action}'. Use: get, store, list, delete"
-
     def _maybe_auto_create_plugin(self, agent) -> bool:
         """Reuse an existing plugin when possible; otherwise create one for a repeated terminal workflow."""
         if not getattr(agent, "_trace", None):
@@ -223,10 +232,19 @@ class ExecutionManager:
         # commands that share the same first 30ish characters would
         # collide, and the `if name in existing_tools: return True` below
         # would then silently report success for the WRONG command's
-        # plugin. The hash suffix guarantees distinct commands get
+        # plugin. The digest suffix guarantees distinct commands get
         # distinct names.
-        slug = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
-        name = f"{slug[:30]}_{abs(hash(command)) % 10000}"
+        #
+        # Uses a stable hash (md5), not Python's builtin hash(). str
+        # hashing is randomized per-process by default (PYTHONHASHSEED),
+        # so hash(command) produced a different suffix every restart —
+        # the same recurring command would never match an existing
+        # plugin name across process lifetimes, silently defeating the
+        # "reuse an existing plugin when possible" behavior this method
+        # claims and accumulating duplicate plugins for the same command.
+        slug   = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
+        digest = hashlib.md5(command.encode()).hexdigest()[:8]
+        name   = f"{slug[:30]}_{digest}"
         existing_tools = getattr(agent, "_plugin_tools", {}) or {}
         if name in existing_tools:
             return True
@@ -254,7 +272,6 @@ class ExecutionManager:
             return created
         except Exception:
             return False
-
     def get_plugin_tool_descriptions(self, agent) -> dict[str, str]:
         """
         name -> description for every currently loaded plugin tool, read
@@ -268,7 +285,6 @@ class ExecutionManager:
             doc = (getattr(fn, "__doc__", None) or "").strip()
             out[name] = doc or "(no description)"
         return out
-
     def _run_plugin_tool(self, agent, args: dict) -> str:
         action = (args.get("action") or "").strip().lower()
         if action == "create":
@@ -292,7 +308,6 @@ class ExecutionManager:
                 return f"Plugin created successfully: {tool_name}. It's now callable directly by name."
             return f"Plugin created but not yet available: {tool_name}"
         return "Unknown plugin action"
-
     def list_plugin_tools(self, agent) -> list[str]:
         """Return sorted available plugin tool names."""
         return sorted((getattr(agent, "_plugin_tools", {}) or {}).keys())
