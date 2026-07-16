@@ -7,6 +7,7 @@ Research sources:
   HyMem      (Zhao 2026)      — dual-tier retrieval, complexity scoring
   MemoryBank (Zhong 2024)     — Ebbinghaus decay + spaced repetition
   Active CC  (Arxiv 2601)     — goal-aware context compression
+
 """
 import json, logging, inspect, asyncio, signal, time, psutil, random, re, itertools
 from typing import Any, Callable
@@ -45,7 +46,7 @@ from agent.config import (
     MAX_TOKENS_PER_RUN, TOOL_TIMEOUT, CHECKPOINT_EVERY, MEMORY_CRITICAL,
     COMPLEX_THRESHOLD, RATE_LIMIT_BASE, RATE_LIMIT_MAX, RATE_LIMIT_JITTER,
     WORKING_MEMORY_SIZE, TOOL_LABELS, FALLBACKS, ERROR_PATTERNS,
-    ACTION_FORMATTERS,
+    ACTION_FORMATTERS, MAX_CONSISTENCY_VIOLATIONS,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,12 @@ class PenzerAgent:
         self._rate_attempts = 0
         self._resume_state  = {}
         self._plugin_tools  = load_plugin_tools()
+        # Guards plugin creation (auto- and explicit) so two concurrent
+        # creation flows can't race on writing the same generated plugin
+        # file/name — e.g. two parallel terminal calls in the same batch
+        # both qualifying for auto-plugin creation, or an explicit
+        # plugin_tool create landing mid-way through an auto-create.
+        self._plugin_lock   = asyncio.Lock()
         # Managers hold no state of their own — they take `self` (this
         # agent) explicitly in every method and operate on its state
         # directly. See MANAGER_REGISTRY above and penzermodule/__init__.py.
@@ -157,9 +164,26 @@ class PenzerAgent:
         # unexpected exception (both of which should end the run, but
         # with an accurate message). See _llm_with_retry / _loop.
         self._last_llm_error:      str   = ""
+        # Circuit breaker for _check_consistency() violations — see
+        # persistence_manager.py's _checkpoint() and
+        # _check_stop_conditions() below.
+        self._consistency_violation_streak: int = 0
+        self._force_stop_reason:   str | None = None
 
     def _handle_shutdown(self, signum, frame):
         self._shutdown = True
+
+    def _safe_status(self, message: str) -> None:
+        """Wraps the user-supplied on_status callback. Now that
+        _run_loop_safely exists, a bug in the callback (a broken UI hook,
+        a logging error) wouldn't kill the whole run — but unguarded it
+        would still abort whatever step was mid-flight for no reason
+        related to the actual task. Isolates the blast radius to "this
+        one status update got dropped and logged" instead."""
+        try:
+            self.on_status(message)
+        except Exception:
+            logger.exception("on_status callback raised")
 
     async def async_init(self) -> "PenzerAgent":
         try:
@@ -251,7 +275,7 @@ class PenzerAgent:
         # resumed attempt has actually done yet.
         self._resume_boundary_trace_len = len(self._trace)
         self._resume_boundary_history_len = len(self.history)
-        result = await self._loop()
+        result = await self._run_loop_safely()
         return await self._finalize(self._goal, result)
 
     def list_plugin_tools(self) -> list[str]:
@@ -262,6 +286,35 @@ class PenzerAgent:
 
     def _match_core_skills(self, user_input: str) -> list:
         return self.planner._match_core_skills(self, user_input)
+
+    async def _run_loop_safely(self) -> str:
+        """Runs _loop() behind a top-level exception guard.
+
+        Every known failure mode inside _loop already returns a clean
+        string (timeouts, resource limits, rate limits, stuck-after-max-
+        attempts, ...). This catches anything NOT already anticipated — a
+        bug surfacing from a manager, an unexpected exception from a tool
+        that slipped past execution_manager's own guards, a serialization
+        error — so the run degrades to a reported error instead of an
+        unhandled traceback. Without this, such a crash would propagate
+        out of run()/resume_last_task() entirely, skipping _finalize()
+        and losing episodic memory, post-mortem writing, and even
+        save_history() for a run that may have made real progress before
+        the crash.
+        """
+        try:
+            return await self._loop()
+        except Exception as e:
+            logger.exception("Unhandled exception in _loop")
+            try:
+                self._record_step("give_up", f"Stopped: unexpected internal error — {e}")
+            except Exception:
+                logger.exception("Failed to record give_up step after unhandled loop exception")
+            try:
+                self._persist_all()
+            except Exception:
+                logger.exception("Failed to persist state after unhandled loop exception")
+            return f"Stopped: internal error ({type(e).__name__}: {e})"
 
     async def run(self, user_input: str) -> str:
         self._reset()
@@ -356,7 +409,7 @@ class PenzerAgent:
             self._record_step("planning", "Simple task — no milestone breakdown needed.")
         self._transition(Phase.EXECUTING, reason="initial planning complete")
         self._flush_steps()
-        result = await self._loop()
+        result = await self._run_loop_safely()
         return await self._finalize(user_input, result)
 
     async def _finalize(self, user_input: str, result: str) -> str:
@@ -378,29 +431,37 @@ class PenzerAgent:
         # own per-iteration flush point (e.g. an immediate final answer on
         # iteration 0 never reaches the tool-execution block at all).
         self._flush_steps()
-        if self._skills_dirty:
-            data = load_all_skills()
-            self.core_skills, self.gen_skills = data["core"], data["generated"]
-        if self._trace:
-            tool_seq = " -> ".join(t["tool"] for t in self._trace)
-            outcome  = "success" if any(t["success"] for t in self._trace) else "failure"
-            remember_episodic(
-                event=f"Goal: {user_input[:60]} | Tools: {tool_seq}",
-                outcome=outcome,
-                importance=min(1.0, len(self._trace) * 0.15),
-                task_type=user_input[:40],
-                iterations_used=self._iteration + 1,
-            )
-        if self._belief["goal_progress"] == "complete":
-            clear_last_run()
-        if len(self._trace) >= COMPLEX_THRESHOLD:
-            completed, eval_reason = await self._evaluate_completion(user_input, result)
-            if not completed:
-                result = f"{result} [Note: incomplete — {eval_reason}]"
-            await self._write_post_mortem_and_insights(user_input, result)
-        if should_consolidate():
-            asyncio.ensure_future(consolidate_memory(self.llm))
-        save_history(self.history)
+        try:
+            if self._skills_dirty:
+                data = load_all_skills()
+                self.core_skills, self.gen_skills = data["core"], data["generated"]
+            if self._trace:
+                tool_seq = " -> ".join(t["tool"] for t in self._trace)
+                outcome  = "success" if any(t["success"] for t in self._trace) else "failure"
+                remember_episodic(
+                    event=f"Goal: {user_input[:60]} | Tools: {tool_seq}",
+                    outcome=outcome,
+                    importance=min(1.0, len(self._trace) * 0.15),
+                    task_type=user_input[:40],
+                    iterations_used=self._iteration + 1,
+                )
+            if self._belief["goal_progress"] == "complete":
+                clear_last_run()
+            if len(self._trace) >= COMPLEX_THRESHOLD:
+                completed, eval_reason = await self._evaluate_completion(user_input, result)
+                if not completed:
+                    result = f"{result} [Note: incomplete — {eval_reason}]"
+                await self._write_post_mortem_and_insights(user_input, result)
+            if should_consolidate():
+                asyncio.ensure_future(consolidate_memory(self.llm))
+            save_history(self.history)
+        except Exception:
+            # Bookkeeping (episodic memory, post-mortem, history save)
+            # failing shouldn't cost the caller a real result the loop
+            # already produced — log it and still return what _loop()
+            # actually accomplished rather than letting an unrelated
+            # persistence error mask a successful run.
+            logger.exception("Error during _finalize bookkeeping")
         return result
 
     def _orchestrate_skills(self) -> None:
@@ -534,6 +595,17 @@ class PenzerAgent:
         stop now, otherwise None. May mutate self._max_iter when
         extending the budget (in which case it still returns None — the
         iteration continues normally, it just gets more room)."""
+        if self._force_stop_reason is not None:
+            # Tripped by persistence_manager.py's _checkpoint() after
+            # MAX_CONSISTENCY_VIOLATIONS consecutive checkpoints found
+            # _check_consistency() violations — a coordination bug
+            # somewhere is making the phase/queue/belief structures
+            # disagree, and letting the run keep going only compounds it.
+            if self._phase not in (Phase.DONE, Phase.FAILED):
+                self._transition(Phase.FAILED, reason=self._force_stop_reason)
+            self._record_step("give_up", f"Stopping: {self._force_stop_reason}.")
+            self._persist_all()
+            return f"Stopped: {self._force_stop_reason}"
         if i >= self._max_iter:
             if self._can_extend_iterations():
                 self._max_iter += ITER_EXTENSION_SIZE
@@ -581,7 +653,7 @@ class PenzerAgent:
         periodic checkpointing."""
         if len(self.history) > TRIM_AT and not self._trimming:
             asyncio.ensure_future(self._trim())
-        self.on_status("Reasoning about next step…" if i == 0 else "Continuing…")
+        self._safe_status("Reasoning about next step…" if i == 0 else "Continuing…")
         if self._active_execution_item is None:
             item = self._claim_next_execution_item()
             if item is not None:
@@ -766,7 +838,7 @@ class PenzerAgent:
             self._update_working_memory(name, str(raw), ok)
             if ok and self._skill_plan:
                 self._mark_skill_step_done(name)
-            if ok and name == "terminal" and self._maybe_auto_create_plugin():
+            if ok and name == "terminal" and await self._maybe_auto_create_plugin():
                 self.history.append({"role": "user", "content": "[Auto-plugin] Repeated terminal workflow detected; created a reusable plugin tool."})
             self.history.append({
                 "role": "tool",
@@ -799,6 +871,26 @@ class PenzerAgent:
     # ------------------------------------------------------------------
     # LLM call wrapper
     # ------------------------------------------------------------------
+    def _validate_llm_response(self, r: Any) -> dict:
+        """Normalizes/validates the raw LLM response shape. _loop does
+        `r.get("tool_calls") or []` and `r.get("content", "").strip()`
+        right after _llm_with_retry returns — if a provider ever returns
+        something malformed (not a dict, or content/tool_calls of the
+        wrong type), those calls raise AttributeError/TypeError deep
+        inside _loop, past the point _llm_with_retry's own try/except can
+        catch it. Raising here instead, from inside that try block, means
+        it's treated as a normal LLM-call failure (retried or reported)
+        rather than an unhandled crash."""
+        if not isinstance(r, dict):
+            raise ValueError(f"LLM response was {type(r).__name__}, expected dict")
+        tool_calls = r.get("tool_calls")
+        if tool_calls is not None and not isinstance(tool_calls, list):
+            raise ValueError(f"LLM response 'tool_calls' was {type(tool_calls).__name__}, expected list")
+        content = r.get("content")
+        if content is not None and not isinstance(content, str):
+            raise ValueError(f"LLM response 'content' was {type(content).__name__}, expected str")
+        return r
+
     async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
         delay = RATE_LIMIT_BASE
         for attempt in range(max_attempts):
@@ -807,6 +899,7 @@ class PenzerAgent:
                     self.llm.chat(system=self._system_prompt, messages=self._msgs(step)),
                     timeout=45,
                 )
+                r = self._validate_llm_response(r)
                 self._backoff        = max(1.0, self._backoff * 0.9)
                 self._rate_attempts  = 0
                 self._last_llm_error = ""
@@ -893,14 +986,14 @@ class PenzerAgent:
     def _run_memory_tool(self, args: dict) -> str:
         return self.execution._run_memory_tool(self, args)
 
-    def _maybe_auto_create_plugin(self) -> bool:
-        return self.execution._maybe_auto_create_plugin(self)
+    async def _maybe_auto_create_plugin(self) -> bool:
+        return await self.execution._maybe_auto_create_plugin(self)
 
     def get_plugin_tool_descriptions(self) -> dict[str, str]:
         return self.execution.get_plugin_tool_descriptions(self)
 
-    def _run_plugin_tool(self, args: dict) -> str:
-        return self.execution._run_plugin_tool(self, args)
+    async def _run_plugin_tool(self, args: dict) -> str:
+        return await self.execution._run_plugin_tool(self, args)
 
     # ------------------------------------------------------------------
     # Small pure formatting / classification helpers
@@ -941,15 +1034,51 @@ class PenzerAgent:
         return s[:250] + f" … [{len(s)-250} more]" if len(s) > 250 else s
 
     def _is_error(self, r: Any) -> bool:
-        return any(t in str(r).lower() for t in (
+        """
+        Prefers a structured signal when the tool returned one: if `r`
+        parses as JSON with a "status" key, that field is authoritative
+        (matching _brief()'s own convention) instead of falling back to
+        naive substring matching against the whole string. Substring
+        matching alone misclassifies perfectly successful results as
+        errors whenever a word like "error"/"failed" appears anywhere in
+        the payload as DATA — e.g. {"status": "ok", "output": "3 passed,
+        0 failed"}. That's not just a cosmetic mislabel: it drives real
+        control flow — it triggers _run_with_fallback (re-running or
+        fallback-routing a tool that actually succeeded), marks the trace
+        entry failed (feeding _tool_confidence's penalty and
+        _update_belief's transition to BLOCKED), and counts toward
+        _stuck()'s failure-streak detection. A structured tool opts into
+        this by returning {"status": "ok"|"error", ...}; anything else
+        (plain text, or JSON without a "status" key) still falls back to
+        substring matching exactly as before.
+        """
+        s = str(r)
+        try:
+            d = json.loads(s.strip())
+            if isinstance(d, dict) and "status" in d:
+                return d.get("status") == "error"
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return any(t in s.lower() for t in (
             "error", "failed", "exception", "traceback",
             "not found", "unknown tool", "permission denied", "timeout",
         ))
 
     def _categorize_error(self, result: Any) -> str:
-        s = str(result).lower()
+        """Prefers an explicit "error_type" from a structured {"status":
+        "error", ...} envelope — a tool can be specific about its own
+        failure mode — over the generic keyword-pattern guess used as a
+        fallback for unstructured output."""
+        s = str(result)
+        try:
+            d = json.loads(s.strip())
+            if isinstance(d, dict) and d.get("status") == "error" and d.get("error_type"):
+                return str(d["error_type"])
+        except (json.JSONDecodeError, ValueError):
+            pass
+        sl = s.lower()
         for pattern, label in ERROR_PATTERNS:
-            if pattern in s:
+            if pattern in sl:
                 return label
         return "ERROR"
 

@@ -12,11 +12,9 @@ from session.memory import (
     save_last_run, add_checkpoint,
 )
 from tools.executor import set_execution_state
+from agent.config import TRIM_AT, KEEP_LAST, MAX_CONSISTENCY_VIOLATIONS
 logger = logging.getLogger(__name__)
-TRIM_AT = 30
-KEEP_LAST = 8
-CHECKPOINT_EVERY = 10
-from agent.penzermodule.belief_manager import Phase, PHASE_TRANSITIONS, PHASE_TO_GOAL_PROGRESS
+from agent.penzermodule.belief_manager import Phase
 class PersistenceManager:
     def _restore_snapshot(self, agent, snapshot: dict) -> None:
         agent._goal = snapshot.get("goal", agent._goal)
@@ -121,6 +119,23 @@ class PersistenceManager:
             violations = agent._check_consistency()
             if violations:
                 logger.warning("State consistency violations at iter %d: %s", iteration, violations)
+                agent._consistency_violation_streak = getattr(agent, "_consistency_violation_streak", 0) + 1
+                if (
+                    agent._consistency_violation_streak >= MAX_CONSISTENCY_VIOLATIONS
+                    and agent._force_stop_reason is None
+                ):
+                    agent._force_stop_reason = (
+                        f"internal state consistency violated "
+                        f"{agent._consistency_violation_streak} checkpoints in a row — "
+                        "stopping to avoid compounding a coordination bug"
+                    )
+                    logger.error(
+                        "Circuit breaker tripped at iter %d after %d consecutive "
+                        "consistency-violation checkpoints: %s",
+                        iteration, agent._consistency_violation_streak, violations,
+                    )
+            else:
+                agent._consistency_violation_streak = 0
             add_checkpoint({
                 "timestamp":   datetime.now().isoformat(),
                 "iteration":   iteration,

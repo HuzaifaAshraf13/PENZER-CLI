@@ -88,7 +88,7 @@ class Planner:
         Level 2: each milestone -> 2-3 executable steps
         Returns: [{milestone, steps: [str]}]
         """
-        agent.on_status("Planning…")
+        agent._safe_status("Planning…")
         try:
             r = await asyncio.wait_for(
                 agent.llm.chat(

@@ -27,6 +27,11 @@ RATE_LIMIT_BASE      = 5.0
 RATE_LIMIT_MAX       = 60.0
 RATE_LIMIT_JITTER    = 2.0
 WORKING_MEMORY_SIZE  = 7
+# Circuit breaker: if _check_consistency() reports violations on this
+# many consecutive checkpoints, the run force-stops rather than let a
+# coordination bug (phase/queue/belief structures disagreeing) keep
+# compounding silently for the rest of a long-running task.
+MAX_CONSISTENCY_VIOLATIONS = 3
 
 # DEPRECATED — kept only so any external code still importing this name
 # doesn't break. The live values used at runtime come from

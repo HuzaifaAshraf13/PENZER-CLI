@@ -33,7 +33,7 @@ class MemoryManager:
         }
         agent._steps.append(step)
         agent._pending_steps.append(step)
-        agent.on_status(description)
+        agent._safe_status(description)
         return step
     def _flush_steps(self, agent) -> None:
         """Write any not-yet-persisted steps to disk in one batch. Called

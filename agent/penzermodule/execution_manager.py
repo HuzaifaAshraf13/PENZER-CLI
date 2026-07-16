@@ -40,13 +40,26 @@ class ExecutionManager:
     async def _execute_single_tool(self, agent, call: dict) -> tuple[str, float]:
         """Runs exactly one tool call: memory short-circuit, availability
         check, status update, timeout wrapping. Shared by `_run_parallel`
-        and `_run_race` so both stay in sync automatically."""
+        and `_run_race` so both stay in sync automatically.
+
+        Catches unexpected exceptions (not just asyncio.TimeoutError) from
+        the actual tool invocation and turns them into a reported error
+        string instead of letting them propagate. Previously only timeouts
+        were caught here — any other exception (a bug in a manager, a
+        malformed argument causing a TypeError deep in an MCP tool, a disk
+        error in a memory action) propagated straight up through
+        asyncio.gather and could crash the entire run before it ever
+        reached _finalize()."""
         name  = call["name"]
         args  = call.get("arguments", {})
         start = time.time()
         if name == "memory":
-            agent.on_status(f"🧠 {agent._fmt_action(name, args)}")
-            raw = agent._run_memory_tool(args)
+            agent._safe_status(f"🧠 {agent._fmt_action(name, args)}")
+            try:
+                raw = agent._run_memory_tool(args)
+            except Exception as e:
+                logger.exception("Memory tool error")
+                raw = f"Error: {e}"
             return raw, round(time.time() - start, 2)
         # A call is valid if it's a registered MCP tool, the plugin_tool
         # creation action, or a dynamically created plugin (auto- or
@@ -57,11 +70,14 @@ class ExecutionManager:
         # branch (`if name in agent._plugin_tools`) was never reached.
         if name != "plugin_tool" and name not in agent._plugin_tools and name not in agent.tools:
             return f"Unknown tool '{name}'.", 0.0
-        agent.on_status(f"{TOOL_LABELS.get(name, name)} {agent._fmt_action(name, args)}")
+        agent._safe_status(f"{TOOL_LABELS.get(name, name)} {agent._fmt_action(name, args)}")
         try:
             raw = await asyncio.wait_for(agent._run(name, args), timeout=TOOL_TIMEOUT)
         except asyncio.TimeoutError:
             raw = f"Timeout after {TOOL_TIMEOUT}s"
+        except Exception as e:
+            logger.exception("Unhandled tool execution error: %s", name)
+            raw = f"Error: {e}"
         return raw, round(time.time() - start, 2)
     async def _run_speculative(self, agent, calls: list) -> list[tuple[str, float]]:
         """
@@ -92,7 +108,17 @@ class ExecutionManager:
         """
         results = [("(cancelled)", 0.0)] * len(calls)
         async def run_and_report(idx: int, c: dict) -> bool:
-            raw, elapsed = await agent._execute_single_tool(c)
+            # _execute_single_tool already catches everything it
+            # reasonably can, but this is defense-in-depth: if anything
+            # still slips through, catching it here means t.result() in
+            # the wait loop below never re-raises it — a raised exception
+            # in one raced call previously could propagate straight out
+            # of _run_race and crash the whole run.
+            try:
+                raw, elapsed = await agent._execute_single_tool(c)
+            except Exception as e:
+                logger.exception("Tool call raised inside _run_race: %s", c.get("name"))
+                raw, elapsed = f"Error: {e}", 0.0
             results[idx] = (raw, elapsed)
             return not agent._is_error(raw)
         pending  = {asyncio.create_task(run_and_report(i, c)) for i, c in enumerate(calls)}
@@ -151,13 +177,31 @@ class ExecutionManager:
             return fb_raw, fb_elapsed
         return raw, elapsed
     async def _run_parallel(self, agent, calls: list) -> list[tuple[str, float]]:
-        return list(await asyncio.gather(*[agent._execute_single_tool(c) for c in calls]))
+        """asyncio.gather(..., return_exceptions=True) so one tool call
+        raising doesn't crash its siblings or propagate past this
+        boundary. _execute_single_tool already catches everything it
+        reasonably can, but this is the last line of defense for
+        anything that still slips through (e.g. `call["name"]` itself
+        raising KeyError on a malformed call dict, before
+        _execute_single_tool's own try/except even starts)."""
+        results = await asyncio.gather(
+            *[agent._execute_single_tool(c) for c in calls],
+            return_exceptions=True,
+        )
+        out = []
+        for c, r in zip(calls, results):
+            if isinstance(r, Exception):
+                logger.exception("Tool call raised outside _execute_single_tool's own guard: %s", c.get("name"))
+                out.append((f"Error: {r}", 0.0))
+            else:
+                out.append(r)
+        return out
     async def _run(self, agent, name: str, args: dict) -> str:
         tools = getattr(agent, "tools", {}) or {}
         if name == "memory" or tools.get(name) == "builtin":
             return agent._run_memory_tool(args)
         if name == "plugin_tool":
-            return agent._run_plugin_tool(args)
+            return await agent._run_plugin_tool(args)
         if name in agent._plugin_tools:
             try:
                 return str(agent._plugin_tools[name](**args))
@@ -207,71 +251,88 @@ class ExecutionManager:
         }
         handler = handlers.get(action)
         if handler:
-            return handler()
+            try:
+                return handler()
+            except Exception as e:
+                logger.exception("Memory action '%s' failed", action)
+                return f"Error: {e}"
         return f"Unknown memory action '{action}'. Use: get, store, list, delete"
-    def _maybe_auto_create_plugin(self, agent) -> bool:
-        """Reuse an existing plugin when possible; otherwise create one for a repeated terminal workflow."""
-        if not getattr(agent, "_trace", None):
-            return False
-        repeated = [
-            str((item.get("args") or {}).get("command", "")).strip()
-            for item in agent._trace
-            if item.get("tool") == "terminal" and item.get("success")
-        ]
-        repeated = [c for c in repeated if c]
-        if len(repeated) < 2:
-            return False
-        counts = {}
-        for command in repeated:
-            counts[command] = counts.get(command, 0) + 1
-        recurring = [cmd for cmd, count in counts.items() if count >= 2]
-        if not recurring:
-            return False
-        command = recurring[0]
-        # A truncated 40-char slug alone isn't unique — two different
-        # commands that share the same first 30ish characters would
-        # collide, and the `if name in existing_tools: return True` below
-        # would then silently report success for the WRONG command's
-        # plugin. The digest suffix guarantees distinct commands get
-        # distinct names.
-        #
-        # Uses a stable hash (md5), not Python's builtin hash(). str
-        # hashing is randomized per-process by default (PYTHONHASHSEED),
-        # so hash(command) produced a different suffix every restart —
-        # the same recurring command would never match an existing
-        # plugin name across process lifetimes, silently defeating the
-        # "reuse an existing plugin when possible" behavior this method
-        # claims and accumulating duplicate plugins for the same command.
-        slug   = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
-        digest = hashlib.md5(command.encode()).hexdigest()[:8]
-        name   = f"{slug[:30]}_{digest}"
-        existing_tools = getattr(agent, "_plugin_tools", {}) or {}
-        if name in existing_tools:
-            return True
-        description = f"Reusable helper for: {command[:80]}"
-        # `command` is a default arg, not hardcoded into the call, so the
-        # LLM can override it later with a similar-but-different command
-        # via `command=...` instead of getting a frozen one-off replay of
-        # the exact string that happened to succeed twice.
-        code = (
-            "import subprocess\n\n"
-            f"def {name}(command: str = {command!r}, **kwargs):\n"
-            f"    {description!r}\n"
-            f"    return subprocess.check_output(command, shell=True, text=True)"
-        )
-        try:
-            create_plugin_tool(name=name, description=description, code=code)
-            agent._plugin_tools = load_plugin_tools()
-            created = name in agent._plugin_tools
-            if created:
-                agent._record_step(
-                    "plugin_created",
-                    f"Created reusable tool '{name}' from a repeated command: {command[:80]}",
-                    tool=name,
-                )
-            return created
-        except Exception:
-            return False
+    async def _maybe_auto_create_plugin(self, agent) -> bool:
+        """Reuse an existing plugin when possible; otherwise create one
+        for a repeated terminal workflow.
+
+        Runs under agent._plugin_lock: without it, two qualifying
+        terminal calls executed concurrently (e.g. in the same
+        _run_speculative/_run_parallel batch) could both pass the
+        "recurring command, not yet in existing_tools" check before
+        either has finished creating the plugin, and both attempt to
+        write the same generated plugin file — a race with no defined
+        winner. Holding the lock for the whole check-and-create section
+        (not just the write) makes the second caller see the first
+        caller's result and short-circuit on the existing-tools check.
+        """
+        async with agent._plugin_lock:
+            if not getattr(agent, "_trace", None):
+                return False
+            repeated = [
+                str((item.get("args") or {}).get("command", "")).strip()
+                for item in agent._trace
+                if item.get("tool") == "terminal" and item.get("success")
+            ]
+            repeated = [c for c in repeated if c]
+            if len(repeated) < 2:
+                return False
+            counts = {}
+            for command in repeated:
+                counts[command] = counts.get(command, 0) + 1
+            recurring = [cmd for cmd, count in counts.items() if count >= 2]
+            if not recurring:
+                return False
+            command = recurring[0]
+            # A truncated 40-char slug alone isn't unique — two different
+            # commands that share the same first 30ish characters would
+            # collide, and the `if name in existing_tools: return True` below
+            # would then silently report success for the WRONG command's
+            # plugin. The digest suffix guarantees distinct commands get
+            # distinct names.
+            #
+            # Uses a stable hash (md5), not Python's builtin hash(). str
+            # hashing is randomized per-process by default (PYTHONHASHSEED),
+            # so hash(command) produced a different suffix every restart —
+            # the same recurring command would never match an existing
+            # plugin name across process lifetimes, silently defeating the
+            # "reuse an existing plugin when possible" behavior this method
+            # claims and accumulating duplicate plugins for the same command.
+            slug   = re.sub(r"[^a-z0-9]+", "_", command.lower()).strip("_") or "terminal_command"
+            digest = hashlib.md5(command.encode()).hexdigest()[:8]
+            name   = f"{slug[:30]}_{digest}"
+            existing_tools = getattr(agent, "_plugin_tools", {}) or {}
+            if name in existing_tools:
+                return True
+            description = f"Reusable helper for: {command[:80]}"
+            # `command` is a default arg, not hardcoded into the call, so the
+            # LLM can override it later with a similar-but-different command
+            # via `command=...` instead of getting a frozen one-off replay of
+            # the exact string that happened to succeed twice.
+            code = (
+                "import subprocess\n\n"
+                f"def {name}(command: str = {command!r}, **kwargs):\n"
+                f"    {description!r}\n"
+                f"    return subprocess.check_output(command, shell=True, text=True)"
+            )
+            try:
+                create_plugin_tool(name=name, description=description, code=code)
+                agent._plugin_tools = load_plugin_tools()
+                created = name in agent._plugin_tools
+                if created:
+                    agent._record_step(
+                        "plugin_created",
+                        f"Created reusable tool '{name}' from a repeated command: {command[:80]}",
+                        tool=name,
+                    )
+                return created
+            except Exception:
+                return False
     def get_plugin_tool_descriptions(self, agent) -> dict[str, str]:
         """
         name -> description for every currently loaded plugin tool, read
@@ -285,7 +346,7 @@ class ExecutionManager:
             doc = (getattr(fn, "__doc__", None) or "").strip()
             out[name] = doc or "(no description)"
         return out
-    def _run_plugin_tool(self, agent, args: dict) -> str:
+    async def _run_plugin_tool(self, agent, args: dict) -> str:
         action = (args.get("action") or "").strip().lower()
         if action == "create":
             name = str(args.get("name", "")).strip()
@@ -293,20 +354,21 @@ class ExecutionManager:
             code = str(args.get("code", "")).strip()
             if not name or not code:
                 return "Plugin creation requires a name and code"
-            try:
-                result = create_plugin_tool(name=name, description=description or "Generated plugin", code=code)
-            except Exception as exc:
-                return f"Plugin creation failed: {exc}"
-            agent._plugin_tools = load_plugin_tools()
-            tool_name = result.get("name", name)
-            if tool_name in agent._plugin_tools:
-                agent._record_step(
-                    "plugin_created",
-                    f"Created reusable tool '{tool_name}': {description or 'Generated plugin'}",
-                    tool=tool_name,
-                )
-                return f"Plugin created successfully: {tool_name}. It's now callable directly by name."
-            return f"Plugin created but not yet available: {tool_name}"
+            async with agent._plugin_lock:
+                try:
+                    result = create_plugin_tool(name=name, description=description or "Generated plugin", code=code)
+                except Exception as exc:
+                    return f"Plugin creation failed: {exc}"
+                agent._plugin_tools = load_plugin_tools()
+                tool_name = result.get("name", name)
+                if tool_name in agent._plugin_tools:
+                    agent._record_step(
+                        "plugin_created",
+                        f"Created reusable tool '{tool_name}': {description or 'Generated plugin'}",
+                        tool=tool_name,
+                    )
+                    return f"Plugin created successfully: {tool_name}. It's now callable directly by name."
+                return f"Plugin created but not yet available: {tool_name}"
         return "Unknown plugin action"
     def list_plugin_tools(self, agent) -> list[str]:
         """Return sorted available plugin tool names."""
