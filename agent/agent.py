@@ -169,6 +169,14 @@ class PenzerAgent:
         # _check_stop_conditions() below.
         self._consistency_violation_streak: int = 0
         self._force_stop_reason:   str | None = None
+        # ResourceMonitor is created once in __init__ and can outlive
+        # many run() calls on the same agent instance — reset its elapsed
+        # timer each run so stats()["elapsed_sec"] in checkpoints reflects
+        # this task, not cumulative time since the agent object was
+        # constructed. Guarded because _reset() also runs once during
+        # __init__, before self._monitor exists yet.
+        if hasattr(self, "_monitor"):
+            self._monitor.reset_timer()
 
     def _handle_shutdown(self, signum, frame):
         self._shutdown = True

@@ -32,6 +32,11 @@ WORKING_MEMORY_SIZE  = 7
 # coordination bug (phase/queue/belief structures disagreeing) keep
 # compounding silently for the rest of a long-running task.
 MAX_CONSISTENCY_VIOLATIONS = 3
+# If ResourceMonitor.check() itself fails this many times in a row, the
+# monitor is treated as broken (unhealthy) rather than reporting "fine"
+# forever — a monitoring system that silently no-ops on its own errors
+# provides zero actual protection.
+MAX_RESOURCE_CHECK_FAILURES = 5
 
 # DEPRECATED — kept only so any external code still importing this name
 # doesn't break. The live values used at runtime come from
