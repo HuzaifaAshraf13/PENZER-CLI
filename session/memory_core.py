@@ -415,22 +415,31 @@ def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
             kind, item = entry
             if kind == "episodic":
                 text = f"{item['event']} {item['outcome']}"
+                rel = _relevance(text, query)
+                if rel <= 0.1:
+                    return 0.0
                 return (
                     _recency(item["timestamp"]) * 0.20
-                    + _relevance(text, query) * 0.40
+                    + rel * 0.40
                     + item["importance"] * 0.15
                     + _decay(item["timestamp"], item.get("strength", 1.0), "episodic") * 0.25
                 )
             if kind == "semantic":
+                rel = _relevance(item["pattern"], query)
+                if rel <= 0.1:
+                    return 0.0
                 return (
                     _recency(item["timestamp"]) * 0.15
-                    + _relevance(item["pattern"], query) * 0.50
+                    + rel * 0.50
                     + item["confidence"] * 0.25
                     + _decay(item["timestamp"], 1.0, "semantic") * 0.10
                 )
             # insight
+            rel = _relevance(item["insight"], query)
+            if rel <= 0.1:
+                return 0.0
             return (
-                _relevance(item["insight"], query) * 0.65
+                rel * 0.65
                 + item["confidence"] * 0.25
                 + _decay(item["timestamp"], 1.0, "insights") * 0.10
             )
