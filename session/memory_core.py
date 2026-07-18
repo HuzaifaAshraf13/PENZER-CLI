@@ -14,6 +14,21 @@ All public functions here take care of their own locking via
 `memory_storage._lock()` and go through `memory_storage._load()` /
 `_save()` — there is no separate cache or file handling in this
 module.
+
+GRAPH WIRING (this pass): the knowledge-graph layer (memory_graph.py)
+existed but nothing called it. Now:
+  - `remember_user_facts()` also runs `extract_triples_heuristic()` on
+    the text and stores any triples found via `remember_triple()`, so a
+    line like "I live in Lahore" produces both the existing flat KV fact
+    AND a graph edge (user --[lives_in]--> lahore). Heuristic-only (not
+    the LLM extractor) — this runs on every user turn, so it stays cheap
+    and conservative, consistent with the "precision over recall"
+    design note in memory_graph.py.
+  - `get_relevant_memories()` also pulls `get_graph_context(query)` and
+    folds it into the returned block (both the shallow and deep paths),
+    so a "## Knowledge Graph" section with currently-valid facts about
+    matched entities shows up alongside episodic/semantic/insight
+    recall instead of graph facts being invisible to the agent.
 """
 import math
 import logging
@@ -21,6 +36,7 @@ import re
 from datetime import datetime
 
 from .memory_storage import _lock, _load, _save
+from .memory_graph import extract_triples_heuristic, remember_triple, get_graph_context
 
 logger = logging.getLogger(__name__)
 
@@ -390,6 +406,9 @@ def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
                     lines.append(f"- [learned] {sem['pattern']}")
             for ins in get_insights(query, n=2):
                 lines.append(f"- [insight] {ins['insight']}")
+            graph_ctx = get_graph_context(query, n=3)
+            if graph_ctx:
+                lines.append(graph_ctx)
             return "\n".join(lines) if len(lines) > 1 else ""
 
         def score(entry) -> float:
@@ -422,9 +441,10 @@ def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
             + [("insight", ins) for ins in data["insights"]]
         )
         top = _score_and_rank(pool, score, n=n, min_score=0.0)
-        if not top:
+        graph_ctx = get_graph_context(query, n=5)
+        if not top and not graph_ctx:
             return ""
-        lines = ["## Relevant Memory"]
+        lines = ["## Relevant Memory"] if top else []
         reinforced_any = False
         for kind, item in top:
             if kind == "episodic":
@@ -442,6 +462,8 @@ def get_relevant_memories(query: str, n: int = 5, deep: bool = False) -> str:
                 lines.append(f"- [insight] {item['insight']}")
         if reinforced_any:
             _save(data)
+        if graph_ctx:
+            lines.append(graph_ctx)
         return "\n".join(lines)
 
 
@@ -516,7 +538,15 @@ def get_relevant_kv_facts(query: str, n: int = 3) -> list[dict]:
 
 
 def remember_user_facts(text: str) -> list[dict]:
-    """Extract simple user facts from natural language and store them in KV memory."""
+    """Extract simple user facts from natural language and store them in
+    KV memory, AND extract (subject, relation, object) triples into the
+    knowledge graph. The two are complementary, not redundant: KV is
+    flat "key -> latest value" (fast, simple, what the agent's memory
+    tool reads/writes directly); the graph keeps relations between named
+    entities with history (old edges are invalidated, not overwritten),
+    which KV can't represent. A triple-extraction failure never blocks
+    the KV path — it's wrapped separately so a bad or partial graph
+    write can't cost the reliable KV fact."""
     if not text:
         return []
     stored = []
@@ -527,6 +557,11 @@ def remember_user_facts(text: str) -> list[dict]:
                 continue
             kv_store(key, value)
             stored.append({"key": key, "value": value})
+    try:
+        for subject, relation, obj in extract_triples_heuristic(text):
+            remember_triple(subject, relation, obj, source_event=text[:100])
+    except Exception as e:
+        logger.debug("Triple extraction in remember_user_facts: %s", e)
     return stored
 
 
