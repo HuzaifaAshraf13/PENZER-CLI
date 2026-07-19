@@ -1,57 +1,27 @@
 """
-Minimal LLM interface - supports local servers and any cloud API
-
-Fixes (this pass):
-  1. `_call_with_backoff` only retried on HTTP 429. Transient server-side
-     errors (500, 502, 503, 504) raised immediately on the first attempt
-     instead of getting the same backoff-and-retry treatment — despite
-     `chat()` having dedicated friendly messages for exactly those codes
-     ("LLM server error. Try again in a moment.", "LLM service
-     unavailable. Server is down.") which implied they were expected to
-     be retried. Confirmed with a mocked transport: a 500-then-200
-     sequence returned the friendly error message after a single
-     attempt instead of succeeding on retry. `RETRYABLE_STATUS` now
-     covers 429 plus the common transient 5xx codes; 401/403 (auth
-     failures, where retrying the same credentials is pointless) are
-     correctly left out and still fail immediately, unchanged from
-     before.
-  Everything else in this file — the JSON-in-text tool-call/answer
-  parsing in `_extract_json`/`chat()`, markdown-fenced JSON extraction,
-  provider dispatch, and the 429 retry path — was verified working
-  against a mocked HTTP transport and left as-is.
-
-Known limitation, not changed here: `_call_gemini` flattens the entire
-message list (including the system prompt and all prior turns) into one
-text blob sent as a single `parts` entry, rather than using Gemini's
-structured `contents` array with proper user/model roles and a separate
-`system_instruction` field. It works — instruction-tuned models can
-generally follow "ROLE: content" formatted text — but it doesn't use the
-provider's actual multi-turn API and loses the role distinction Gemini's
-own API would preserve. Flagging rather than rewriting since I can't
-verify a rewrite against a live Gemini endpoint from here (no network
-access to googleapis.com in this environment) — happy to do it if you
-can confirm the exact response shape you're seeing, or test it yourself
-against the real API first.
+Universal LLM interface – supports local servers and any cloud API.
+Handles JSON and XML tool calls, retries, multiple providers, and robust error handling.
 """
 import os
 import json
+import re
 import asyncio
 import httpx
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
+
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).parent.parent
 RETRY_DELAYS = [0, 2, 4, 8, 16]
 
-# 429 (rate limited) and the common transient 5xx server errors all
-# benefit from backoff-and-retry. 401/403 (auth failures) deliberately
-# are NOT here — retrying with the same bad credentials just wastes the
-# whole retry budget for a request that can never succeed.
+# HTTP status codes that we retry with backoff (rate limiting + transient server errors)
+# 401/403 are NOT retried – they indicate authentication issues.
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 def _detect_provider(url: str) -> str:
+    """Determine the API provider from the URL."""
     url = url.lower()
     if "googleapis" in url or "generativelanguage" in url:
         return "gemini"
@@ -59,19 +29,21 @@ def _detect_provider(url: str) -> str:
         return "openai"
     if "anthropic.com" in url:
         return "anthropic"
+    if "openrouter.ai" in url:
+        return "openrouter"   # uses OpenAI-compatible API
     if "localhost" in url or "127.0.0.1" in url or "0.0.0.0" in url:
         return "local"
     return "openai_compatible"
 
 
 class LLMModel:
-    """Universal async LLM model — handles any provider."""
+    """Universal async LLM model – handles any provider."""
 
     def __init__(self, api_key: str, url: str):
         self.api_key = api_key
         self.url = url.rstrip("/")
         self.provider = _detect_provider(url)
-        self.model_name = self.provider
+        self.model_name = os.getenv("MODEL_NAME", self.provider)
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -85,38 +57,46 @@ class LLMModel:
             await self._client.aclose()
 
     async def create_chat_completion(
-        self, messages: list, max_tokens: int = 2048, temperature: float = 0.7
+        self, messages: List[Dict[str, str]], max_tokens: int = 2048, temperature: float = 0.7
     ) -> str:
         if self.provider == "gemini":
             return await self._call_gemini(messages, max_tokens, temperature)
         elif self.provider == "anthropic":
             return await self._call_anthropic(messages, max_tokens, temperature)
         else:
+            # OpenAI, OpenRouter, local, and any OpenAI-compatible
             return await self._call_openai_compatible(messages, max_tokens, temperature)
 
     async def _call_openai_compatible(
-        self, messages: list, max_tokens: int, temperature: float
+        self, messages: List[Dict[str, str]], max_tokens: int, temperature: float
     ) -> str:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        # If the URL already ends with /v1, don't add another one
         base = self.url if "/v1" in self.url else f"{self.url}/v1"
+
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        # For OpenRouter, we may want to include extra headers, but it works with the standard format.
         r = await self.client.post(
             f"{base}/chat/completions",
             headers=headers,
-            json={
-                "model": os.getenv("MODEL_NAME", "local-model"),
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
+            json=payload,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
 
     async def _call_gemini(
-        self, messages: list, max_tokens: int, temperature: float
+        self, messages: List[Dict[str, str]], max_tokens: int, temperature: float
     ) -> str:
+        # Gemini uses a different structure; we flatten all messages into a single text prompt
+        # with role labels. This is not perfect but works for instruction-tuned models.
         prompt = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
         url = self.url if "?" in self.url else f"{self.url}?key={self.api_key}"
         r = await self.client.post(
@@ -133,8 +113,9 @@ class LLMModel:
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
     async def _call_anthropic(
-        self, messages: list, max_tokens: int, temperature: float
+        self, messages: List[Dict[str, str]], max_tokens: int, temperature: float
     ) -> str:
+        # Anthropic separates system prompt from conversation
         system = next((m["content"] for m in messages if m["role"] == "system"), "")
         msgs = [m for m in messages if m["role"] != "system"]
         r = await self.client.post(
@@ -145,7 +126,7 @@ class LLMModel:
                 "Content-Type": "application/json",
             },
             json={
-                "model": os.getenv("MODEL_NAME", "claude-3-5-haiku-20241022"),
+                "model": self.model_name,
                 "max_tokens": max_tokens,
                 "system": system,
                 "messages": msgs,
@@ -157,6 +138,8 @@ class LLMModel:
 
 
 class LLM:
+    """Main interface for the application – loads config, parses responses, handles retries."""
+
     def __init__(self):
         self.model = self._init_model()
         self.model_name = getattr(self.model, "model_name", "unknown")
@@ -165,6 +148,7 @@ class LLM:
 
     def _init_model(self) -> LLMModel:
         load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
+
         local_url = os.getenv("LOCAL_SERVER_URL", "").strip().strip("\"'")
         api_key   = os.getenv("API_KEY", "").strip().strip("\"'")
         api_url   = os.getenv("URL", "").strip().strip("\"'")
@@ -177,9 +161,14 @@ class LLM:
             print(f"[LLM] Auto-detected: {provider} API")
             return LLMModel(api_key, api_url)
         else:
-            raise FileNotFoundError("No LOCAL_SERVER_URL or API credentials in .env")
+            raise FileNotFoundError(
+                "No LOCAL_SERVER_URL or API credentials (API_KEY + URL) found in .env"
+            )
 
-    def _extract_json(self, text: str) -> Optional[dict]:
+    # ---------- JSON extraction ----------
+    def _extract_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """Extract the first JSON object from text (supports markdown fences)."""
+        # Remove markdown code fences
         for fence in ("```json", "```"):
             if fence in text:
                 start = text.find(fence) + len(fence)
@@ -190,12 +179,13 @@ class LLM:
                     break
 
         text = text.strip()
-
+        # Try direct parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
+        # Try to find a JSON object anywhere in the text
         start = text.find("{")
         if start == -1:
             return None
@@ -206,7 +196,59 @@ class LLM:
         except json.JSONDecodeError:
             return None
 
-    async def _call_with_backoff(self, messages: list) -> str:
+    # ---------- XML tool‑call extraction ----------
+    def _parse_xml_tool_calls(self, text: str) -> tuple[List[Dict[str, Any]], str]:
+        """
+        Extract tool calls from XML‑style tags:
+          <tool_call> <function=NAME> <parameter=KEY> VALUE </tool_call>
+        Returns (tool_calls_list, cleaned_text_without_blocks)
+        """
+        tool_calls = []
+        pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
+        matches = list(pattern.finditer(text))
+
+        if not matches:
+            return [], text
+
+        # Remove all <tool_call> blocks from the original text
+        cleaned = pattern.sub('', text).strip()
+
+        for idx, match in enumerate(matches):
+            inner = match.group(1).strip()
+
+            # Extract function name: <function=NAME> or <function>NAME</function>
+            func_match = re.search(r'<function[=>]\s*(\w+)', inner)
+            if not func_match:
+                continue
+            func_name = func_match.group(1)
+
+            # Extract parameters: <parameter=KEY> VALUE
+            args = {}
+            param_matches = re.finditer(
+                r'<parameter=(\w+)>\s*(.*?)\s*(?=<|$)', inner, re.DOTALL
+            )
+            for pm in param_matches:
+                key = pm.group(1)
+                value = pm.group(2).strip()
+                args[key] = value
+
+            # If no parameter tags, use the inner text after the function tag as "command"
+            if not args:
+                inner_without_func = re.sub(r'<function[=>]\s*\w+\s*>', '', inner).strip()
+                if inner_without_func:
+                    args = {"command": inner_without_func}
+
+            if func_name:
+                tool_calls.append({
+                    "id": f"tool_call_{idx + 1}",
+                    "name": func_name,
+                    "arguments": args
+                })
+
+        return tool_calls, cleaned
+
+    # ---------- Retry logic ----------
+    async def _call_with_backoff(self, messages: List[Dict[str, str]]) -> str:
         last_error = None
         for attempt, wait in enumerate(RETRY_DELAYS):
             if wait:
@@ -224,7 +266,15 @@ class LLM:
                     raise
         raise RuntimeError(f"LLM failed after retries: {last_error}")
 
-    async def chat(self, system: str, messages: list) -> dict:
+    # ---------- Main chat entry point ----------
+    async def chat(self, system: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        Send a chat request and return a dict with:
+          - content (str): the answer text
+          - tool_calls (list): each with id, name, arguments
+          - assumptions (list): optional belief-state fields
+          - unknowns (list): optional belief-state fields
+        """
         prompt = [{"role": "system", "content": system}] + messages
 
         try:
@@ -235,7 +285,7 @@ class LLM:
                 for m in prompt
             )
         except httpx.HTTPStatusError as e:
-            # User-friendly error messages
+            # User‑friendly error messages for common HTTP errors
             if e.response.status_code == 429:
                 return {"content": "⏳ Rate limit reached. Please wait and try again.", "tool_calls": []}
             if e.response.status_code == 401:
@@ -257,76 +307,80 @@ class LLM:
             error_msg = str(e)[:50]
             return {"content": f"❌ Error: {error_msg}", "tool_calls": []}
 
+        # --- Structured parsing (JSON first, then XML) ---
         data = self._extract_json(raw)
-        if not data:
-            return {"content": raw.strip(), "tool_calls": [], "assumptions": [], "unknowns": []}
+        if data:
+            # JSON parsing succeeded
+            answer = data.get("answer") or data.get("thought", "")
+            tool_name = str(data.get("tool", "")).strip()
+            tool_args = data.get("args", {})
 
-        # Support both new format (answer) and old format (thought)
-        answer    = data.get("answer") or data.get("thought", "")
-        tool_name = str(data.get("tool", "")).strip()
-        tool_args = data.get("args", {})
+            def _as_list(v) -> list:
+                if not v:
+                    return []
+                return v if isinstance(v, list) else [str(v)]
 
-        # Belief-state fields (ReflAct): optional — the model isn't
-        # required to include these, but if it does, they're captured
-        # here rather than silently dropped. Previously not read at all,
-        # so even a model that dutifully reasoned about its assumptions
-        # and unknowns in valid JSON had that discarded before agent.py
-        # ever saw it.
-        def _as_list(v) -> list:
-            if not v:
-                return []
-            return v if isinstance(v, list) else [str(v)]
+            assumptions = _as_list(data.get("assumptions"))
+            unknowns = _as_list(data.get("unknowns"))
 
-        assumptions = _as_list(data.get("assumptions"))
-        unknowns    = _as_list(data.get("unknowns"))
+            # Multiple independent tool calls (new format)
+            tools_array = data.get("tools")
+            if isinstance(tools_array, list) and tools_array:
+                tool_calls = []
+                for idx, t in enumerate(tools_array):
+                    if not isinstance(t, dict):
+                        continue
+                    tname = str(t.get("tool", "")).strip()
+                    targs = t.get("args", {})
+                    if tname:
+                        tool_calls.append({
+                            "id": f"tool_call_{idx + 1}",
+                            "name": tname,
+                            "arguments": targs if isinstance(targs, dict) else {},
+                        })
+                if tool_calls:
+                    return {
+                        "content": answer,
+                        "tool_calls": tool_calls,
+                        "assumptions": assumptions,
+                        "unknowns": unknowns,
+                    }
 
-        # Multiple INDEPENDENT calls in one turn — e.g. `which ss`,
-        # `which netstat`, `which lsof` are unrelated checks with no
-        # data dependency between them. Previously this parser could
-        # only ever extract a single {"tool", "args"} pair, so
-        # agent.py's own parallel/race execution machinery
-        # (_run_parallel, _run_race) — built to handle exactly this
-        # case — could never actually receive more than one call per
-        # turn and was effectively dead code. Optional and additive:
-        # a model that never uses "tools" behaves exactly as before.
-        tools_array = data.get("tools")
-        if isinstance(tools_array, list) and tools_array:
-            tool_calls = []
-            for idx, t in enumerate(tools_array):
-                if not isinstance(t, dict):
-                    continue
-                tname = str(t.get("tool", "")).strip()
-                targs = t.get("args", {})
-                if tname:
-                    tool_calls.append({
-                        "id": f"tool_call_{idx + 1}",
-                        "name": tname,
-                        "arguments": targs if isinstance(targs, dict) else {},
-                    })
-            if tool_calls:
+            # Single tool call (old format)
+            if tool_name:
                 return {
                     "content": answer,
-                    "tool_calls": tool_calls,
+                    "tool_calls": [{
+                        "id": "tool_call_1",
+                        "name": tool_name,
+                        "arguments": tool_args if isinstance(tool_args, dict) else {},
+                    }],
                     "assumptions": assumptions,
                     "unknowns": unknowns,
                 }
 
-        # If tool is specified, return tool call
-        if tool_name:
+            # Final answer (no tool call)
             return {
-                "content": answer,
-                "tool_calls": [{
-                    "id": "tool_call_1",
-                    "name": tool_name,
-                    "arguments": tool_args if isinstance(tool_args, dict) else {},
-                }],
+                "content": answer or raw.strip(),
+                "tool_calls": [],
                 "assumptions": assumptions,
                 "unknowns": unknowns,
             }
 
-        # Otherwise, return as final answer
-        return {"content": answer or raw.strip(), "tool_calls": [], "assumptions": assumptions, "unknowns": unknowns}
+        # --- XML tool calls (fallback) ---
+        tool_calls, cleaned = self._parse_xml_tool_calls(raw)
+        if tool_calls:
+            return {
+                "content": cleaned or "",
+                "tool_calls": tool_calls,
+                "assumptions": [],
+                "unknowns": [],
+            }
+
+        # --- No structured tool call found – return raw text ---
+        return {"content": raw.strip(), "tool_calls": [], "assumptions": [], "unknowns": []}
 
 
 def get_model_choice() -> LLM:
+    """Factory function to create an LLM instance (for compatibility)."""
     return LLM()
