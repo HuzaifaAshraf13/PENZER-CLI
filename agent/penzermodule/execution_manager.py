@@ -8,8 +8,11 @@ the agent needs to change.
 """
 import time, asyncio, inspect, json, re, hashlib, logging
 from tools.plugins import create_plugin_tool, load_plugin_tools
+from tools.executor import requires_privilege_escalation, SUDO_INTERACTIVE_TIMEOUT
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
+
 logger = logging.getLogger(__name__)
+
 TOOL_LABELS = {
     "browser": "\U0001F310", "terminal": "\u26A1", "run_python": "\U0001F40D",
     "run_bash": "\U0001F4DC", "file_editor": "\U0001F4C1", "memory": "\U0001F9E0", "planning": "\U0001F4CB",
@@ -19,6 +22,39 @@ FALLBACKS = {
     "run_python": "terminal", "file_editor": "terminal",
 }
 TOOL_TIMEOUT = 30
+
+
+def _call_timeout(name: str, args: dict) -> int:
+    """
+    Per-call timeout for _execute_single_tool's asyncio.wait_for. Almost
+    always TOOL_TIMEOUT — except a `terminal` call whose command needs
+    sudo/su/pkexec/doas, which gets a much longer allowance.
+
+    Why: tools/executor.py's execute() runs a confirmed privilege-
+    escalation command interactively (real password prompt, real
+    terminal, see _run_privileged_interactive there) with its own
+    SUDO_INTERACTIVE_TIMEOUT (300s) — sized for "a human has to notice
+    the prompt and type a password", not for a normal command. But that
+    inner wait happens on a worker thread underneath THIS function's own
+    asyncio.wait_for(..., timeout=TOOL_TIMEOUT). Without matching the
+    outer timeout to the inner one, the outer wait_for would fire first
+    at 30s, report a false "Timeout after 30s" back to the agent loop,
+    and move on — while the worker thread is still genuinely blocked
+    waiting on the user's password entry underneath (asyncio.to_thread
+    threads can't be cancelled once started, so it isn't actually
+    abandoned, just orphaned from the agent's point of view). Matching
+    the two timeouts means the outer wait actually reflects how long the
+    inner call is allowed to take.
+    """
+    if name != "terminal":
+        return TOOL_TIMEOUT
+    cmd_text = str(
+        args.get("command") or args.get("script") or args.get("code") or ""
+    )
+    escalates, _ = requires_privilege_escalation(cmd_text)
+    return SUDO_INTERACTIVE_TIMEOUT + 15 if escalates else TOOL_TIMEOUT
+
+
 class ExecutionManager:
     def _tool_confidence(self, agent, tool_name: str, args: dict) -> float:
         """
@@ -37,11 +73,11 @@ class ExecutionManager:
             m = get_skill_metric(skill.name)
             score += m.get("success_rate", 0) * 0.1
         return round(min(1.0, max(0.0, score)), 6)
+
     async def _execute_single_tool(self, agent, call: dict) -> tuple[str, float]:
         """Runs exactly one tool call: memory short-circuit, availability
         check, status update, timeout wrapping. Shared by `_run_parallel`
         and `_run_race` so both stay in sync automatically.
-
         Catches unexpected exceptions (not just asyncio.TimeoutError) from
         the actual tool invocation and turns them into a reported error
         string instead of letting them propagate. Previously only timeouts
@@ -71,21 +107,43 @@ class ExecutionManager:
         if name != "plugin_tool" and name not in agent._plugin_tools and name not in agent.tools:
             return f"Unknown tool '{name}'.", 0.0
         agent._safe_status(f"{TOOL_LABELS.get(name, name)} {agent._fmt_action(name, args)}")
+        timeout = _call_timeout(name, args)
         try:
-            raw = await asyncio.wait_for(agent._run(name, args), timeout=TOOL_TIMEOUT)
+            raw = await asyncio.wait_for(agent._run(name, args), timeout=timeout)
         except asyncio.TimeoutError:
-            raw = f"Timeout after {TOOL_TIMEOUT}s"
+            raw = f"Timeout after {timeout}s"
         except Exception as e:
             logger.exception("Unhandled tool execution error: %s", name)
             raw = f"Error: {e}"
         return raw, round(time.time() - start, 2)
+
     async def _run_speculative(self, agent, calls: list) -> list[tuple[str, float]]:
         """
         For independent tool calls: race them and take the first success.
         For dependent calls (share file/env): run sequentially.
         Otherwise: run in parallel.
+
+        A batch containing a privilege-escalation terminal call (sudo/su/
+        pkexec/doas) never races, regardless of the checks below — it
+        always goes through _run_parallel instead. _run_race cancels
+        every still-pending task the instant any call in the batch
+        succeeds; a sudo call sitting on a live human password prompt
+        (or the interactive command itself, mid-execution) is exactly the
+        kind of in-flight work that must never get cancelled out from
+        under it just because an unrelated sibling call finished first.
         """
         if len(calls) <= 1:
+            return await agent._run_parallel(calls)
+        if any(
+            c.get("name") == "terminal"
+            and requires_privilege_escalation(str(
+                (c.get("arguments") or {}).get("command")
+                or (c.get("arguments") or {}).get("script")
+                or (c.get("arguments") or {}).get("code")
+                or ""
+            ))[0]
+            for c in calls
+        ):
             return await agent._run_parallel(calls)
         def get_target(c):
             args = c.get("arguments", {})
@@ -95,10 +153,10 @@ class ExecutionManager:
         if unique and all(c["name"] in ("browser", "terminal", "run_bash") for c in calls):
             return await agent._run_race(calls)
         return await agent._run_parallel(calls)
+
     async def _run_race(self, agent, calls: list) -> list[tuple[str, float]]:
         """Launch all calls; return as soon as one succeeds, or once every
         call has finished — whichever comes first.
-
         Previously this only woke up on a success signal (`done_event`),
         so when every call in the race failed — which typically happens
         fast — the function still sat blocked until the full TOOL_TIMEOUT
@@ -122,7 +180,7 @@ class ExecutionManager:
             results[idx] = (raw, elapsed)
             return not agent._is_error(raw)
         pending  = {asyncio.create_task(run_and_report(i, c)) for i, c in enumerate(calls)}
-        deadline = time.time() + TOOL_TIMEOUT
+        deadline = time.time() + max(_call_timeout(c["name"], c.get("arguments", {})) for c in calls)
         try:
             while pending:
                 remaining = deadline - time.time()
@@ -138,13 +196,14 @@ class ExecutionManager:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         return results
+
     def _fallback_tool(self, agent, tool_name: str) -> str | None:
         return FALLBACKS.get(tool_name)
+
     async def _run_with_fallback(
         self, agent, call: dict, prior_result: tuple[str, float] | None = None
     ) -> tuple[str, float]:
         """Tries a fallback tool for a call that already failed.
-
         `prior_result` should be the (raw, elapsed) the caller already
         obtained for `call` — pass it whenever you have it, so this
         doesn't re-execute an already-failed tool a second time. That
@@ -176,6 +235,7 @@ class ExecutionManager:
             fb_raw, fb_elapsed = fb_results[0] if fb_results else ("", 0.0)
             return fb_raw, fb_elapsed
         return raw, elapsed
+
     async def _run_parallel(self, agent, calls: list) -> list[tuple[str, float]]:
         """asyncio.gather(..., return_exceptions=True) so one tool call
         raising doesn't crash its siblings or propagate past this
@@ -196,6 +256,7 @@ class ExecutionManager:
             else:
                 out.append(r)
         return out
+
     async def _run(self, agent, name: str, args: dict) -> str:
         tools = getattr(agent, "tools", {}) or {}
         if name == "memory" or tools.get(name) == "builtin":
@@ -234,6 +295,7 @@ class ExecutionManager:
                         return await agent._run(fb, {"command": cmd})
                     return f"Error: {e}"
         return ""
+
     def _run_memory_tool(self, agent, args: dict) -> str:
         """
         kv_store/kv_delete return confirmation strings (not None/bool),
@@ -257,10 +319,10 @@ class ExecutionManager:
                 logger.exception("Memory action '%s' failed", action)
                 return f"Error: {e}"
         return f"Unknown memory action '{action}'. Use: get, store, list, delete"
+
     async def _maybe_auto_create_plugin(self, agent) -> bool:
         """Reuse an existing plugin when possible; otherwise create one
         for a repeated terminal workflow.
-
         Runs under agent._plugin_lock: without it, two qualifying
         terminal calls executed concurrently (e.g. in the same
         _run_speculative/_run_parallel batch) could both pass the
@@ -333,6 +395,7 @@ class ExecutionManager:
                 return created
             except Exception:
                 return False
+
     def get_plugin_tool_descriptions(self, agent) -> dict[str, str]:
         """
         name -> description for every currently loaded plugin tool, read
@@ -346,6 +409,7 @@ class ExecutionManager:
             doc = (getattr(fn, "__doc__", None) or "").strip()
             out[name] = doc or "(no description)"
         return out
+
     async def _run_plugin_tool(self, agent, args: dict) -> str:
         action = (args.get("action") or "").strip().lower()
         if action == "create":
@@ -370,6 +434,7 @@ class ExecutionManager:
                     return f"Plugin created successfully: {tool_name}. It's now callable directly by name."
                 return f"Plugin created but not yet available: {tool_name}"
         return "Unknown plugin action"
+
     def list_plugin_tools(self, agent) -> list[str]:
         """Return sorted available plugin tool names."""
         return sorted((getattr(agent, "_plugin_tools", {}) or {}).keys())
