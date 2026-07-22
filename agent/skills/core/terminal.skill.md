@@ -2,8 +2,8 @@
 skill_id: core.terminal
 name: Terminal Executor
 description: Run bash commands, scripts, and Python code safely and efficiently
-keywords: [terminal, bash, shell, command, execute, run, script, python]
-mcp_tools: [terminal, run_bash, run_python]
+keywords: [terminal, bash, shell, command, execute, run, script, python, timeout, background, job]
+mcp_tools: [terminal, terminal_check_job, run_bash, run_python]
 agent_behavior: |
   STEP 0 — SELF-ASSESS RISK (before picking anything)
     Before calling terminal, silently rate what you're about to run:
@@ -31,6 +31,43 @@ agent_behavior: |
     Multi-line bash script  → terminal(script=...)
     Inline Python code      → terminal(code=...)
     Reuse a working context → terminal(..., session_id="name")
+    Check a backgrounded job → terminal_check_job(job_id=...)
+
+    Tool call shapes:
+      {"tool": "terminal", "args": {"command": "ls -la"}}
+      {"tool": "terminal", "args": {"command": "...", "timeout": 600}}
+      {"tool": "terminal", "args": {"command": "...", "background": true}}
+      {"tool": "terminal", "args": {"command": "...", "session_id": "recon"}}
+      {"tool": "terminal_check_job", "args": {"job_id": "..."}}
+
+  STEP 1b — DURATION CHECK (long-running commands)
+    terminal defaults to a 60s timeout. Anything that legitimately runs
+    longer — nmap/masscan, package installs, git clone, docker build,
+    compiles, large downloads — needs ONE of these instead of the default:
+
+      1. Raise the timeout explicitly, when you'll wait for the result
+         before doing anything else:
+           {"tool": "terminal", "args": {"command": "nmap -A -T4 10.0.0.0/24",
+                                          "timeout": 600}}
+
+      2. Run it in the background and poll, when it could take several
+         minutes+ or there's other work to make progress on meanwhile:
+           {"tool": "terminal", "args": {"command": "nmap -A -T4 10.0.0.0/24 -oN scan.txt",
+                                          "background": true}}
+         This returns a job_id immediately. Continue other work, then check:
+           {"tool": "terminal_check_job", "args": {"job_id": "..."}}
+         Poll periodically rather than immediately looping on it — give
+         the job real time to progress between checks. Background jobs
+         capture output to a log file, so there's always something to
+         retrieve when you check back.
+
+    If a command times out, that means it needed more time, not that
+    something is broken. Re-running it with the SAME short timeout just
+    repeats the same failure — raise the timeout or move it to the
+    background instead. This is a distinct failure mode from STEP 6's
+    "never repeat a failed command" — here the fix is a different
+    timeout/background setting on the same command, not a different
+    command.
 
   STEP 2 — PRIVILEGE CHECK (sudo / root) — ALWAYS FIRST, before the safety check
     If the command requires sudo, root, or any privilege escalation:
@@ -77,6 +114,8 @@ agent_behavior: |
     Rule: never run the exact same failed command again
     Rule: a failed sudo attempt (e.g. wrong password) goes back through
     STEP 2 — re-confirm with the user rather than silently retrying.
+    Rule: a *timed-out* command is not "the same failed command" if you
+    resubmit it with a raised timeout or background=true — see STEP 1b.
 
   BUILT-IN CHEATSHEET (always prefer these — no install, no sudo needed):
     Network usage per app:   ss -tp | grep ESTAB
@@ -91,7 +130,7 @@ agent_behavior: |
     System info:             uname -a && uptime
 priority: 1.0
 core: true
-version: "3.2"
+version: "3.3"
 ---
 # Terminal Executor
-Self-assess risk → pick tool → privilege check (sudo → explicit approval, never handle the password) → safety check → ask before installing → run → handle failures.
+Self-assess risk → pick tool (raise timeout / background long jobs, poll via terminal_check_job) → privilege check (sudo → explicit approval, never handle the password) → safety check → ask before installing → run → handle failures (timeouts get a longer timeout/background, not a blind retry).
