@@ -11,12 +11,39 @@ logger = logging.getLogger(__name__)
 
 _WARN_INTERVAL_SEC = 60  # throttle the "memory high" log to once/minute
 
+# cgroup v2 first, then v1 — checked once at process start since a
+# container's memory cap doesn't change over its lifetime.
+_CGROUP_LIMIT_PATHS = ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+_CGROUP_USAGE_PATHS = ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+# cgroup v1's "no limit" sentinel is an absurdly large number
+# (LONG_MAX-ish, rounded down to a page boundary) rather than a missing
+# file — treat anything implausibly large as "no real limit set".
+_NO_LIMIT_SENTINEL = 1 << 62
+
+
+def _read_int(paths: tuple[str, ...]) -> int | None:
+    for path in paths:
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+            if raw == "max":
+                return None
+            val = int(raw)
+            return None if val >= _NO_LIMIT_SENTINEL else val
+        except (FileNotFoundError, ValueError, PermissionError, OSError):
+            continue
+    return None
+
+
 class ResourceMonitor:
     def __init__(self):
         self._proc = psutil.Process()
         self._start = time.time()
         self._consecutive_check_failures = 0
         self._last_warn_at = 0.0
+        # None means "not running under a cgroup memory limit we could
+        # read" — falls back to host-relative memory_percent() below.
+        self._cgroup_limit_bytes = _read_int(_CGROUP_LIMIT_PATHS)
 
     def reset_timer(self) -> None:
         """Resets the elapsed-time baseline used by stats(). A single
@@ -52,7 +79,11 @@ class ResourceMonitor:
         guard memory while doing nothing.
         """
         try:
-            mem = self._proc.memory_percent()
+            usage = _read_int(_CGROUP_USAGE_PATHS) if self._cgroup_limit_bytes else None
+            if self._cgroup_limit_bytes and usage is not None:
+                mem = usage / self._cgroup_limit_bytes * 100
+            else:
+                mem = self._proc.memory_percent()
         except Exception as e:
             self._consecutive_check_failures += 1
             logger.warning(
@@ -77,10 +108,20 @@ class ResourceMonitor:
 
     def stats(self) -> dict:
         try:
-            return {
+            out = {
                 "memory_mb":   round(self._proc.memory_info().rss / 1e6, 1),
                 "elapsed_sec": round(time.time() - self._start, 1),
             }
+            if self._cgroup_limit_bytes:
+                out["cgroup_memory_limit_mb"] = round(self._cgroup_limit_bytes / 1e6, 1)
+            try:
+                # interval=None is non-blocking but returns 0.0 on the very
+                # first call per process (no prior sample to diff against);
+                # informational only, not gated on.
+                out["cpu_percent"] = self._proc.cpu_percent(interval=None)
+            except Exception:
+                pass
+            return out
         except Exception as e:
             logger.debug("ResourceMonitor.stats() failed: %s", e)
             return {}

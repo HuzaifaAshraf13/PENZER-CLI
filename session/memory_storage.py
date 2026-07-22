@@ -35,6 +35,7 @@ import copy
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from json import JSONEncoder
 
 MEMORY_DIR = Path(".penzer") / "memory"
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,6 +64,14 @@ MEMORY_FILES = {
 LAST_RUN_PATH = STORAGE_DIR / "last_run.json"
 
 MAX_HISTORY = 500
+
+
+class SetEncoder(JSONEncoder):
+    """Custom JSON encoder that converts sets to lists."""
+    def default(self, obj):
+        if isinstance(obj, set):
+            return list(obj)
+        return super().default(obj)
 
 
 def _fresh() -> dict:
@@ -239,7 +248,7 @@ def save_last_run(snapshot: dict) -> None:
     try:
         LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(LAST_RUN_PATH, "w") as f:
-            json.dump(snapshot, f, indent=2)
+            json.dump(snapshot, f, indent=2, cls=SetEncoder)  # <-- FIXED: added cls=SetEncoder
     except Exception as e:
         logger.error("Save last run: %s", e)
 

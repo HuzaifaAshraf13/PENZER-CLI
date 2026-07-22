@@ -6,24 +6,54 @@ behavior lives. PenzerAgent keeps every original method name as a thin
 delegate (e.g. `agent._transition(...)` still works), so nothing calling
 the agent needs to change.
 """
-import asyncio, json, time, logging
+import asyncio, json, re, time, logging
 from typing import Any
 from session.memory import remember_semantic, store_insight, store_post_mortem
 from agent.config import STUCK_MIN, ABSOLUTE_MAX_ITER, MAX_RUNTIME_SECONDS, MAX_TOKENS_PER_RUN
 logger = logging.getLogger(__name__)
 from agent.penzermodule.belief_manager import Phase
+
+# Matches a leading/trailing ``` or ```json fence. Previously this used
+# `.strip("```").lstrip("json")`, which strips any of the *characters*
+# {`,j,s,o,n} from the string ends rather than the literal tokens —
+# harmless for the common "```json\n[...]\n```" case, but wrong in
+# principle (a differently-cased "```JSON" fence isn't stripped; real
+# content that happens to start with those letters after fence removal
+# gets silently eaten). A regex anchored to the actual fence syntax is
+# correct instead of coincidentally-usually-correct.
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+
 class ReflectionManager:
     @staticmethod
     def _extract_json(text: str, default: str = "{}") -> Any:
-        """Strip code-fence/`json` noise the LLM sometimes wraps JSON in, then parse.
+        """Strip code-fence noise the LLM sometimes wraps JSON in, then parse.
         Used by the planner, replanner, completion evaluator, and post-mortem writer,
         which previously each repeated this cleanup inline."""
-        raw = (text or default).strip().strip("```").lstrip("json").strip()
+        raw = _FENCE_RE.sub("", (text or default).strip()).strip()
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, ValueError):
-            return json.loads(default)
-    async def _evaluate_completion(self, agent, goal: str, result: str) -> tuple[bool, str]:
+            try:
+                return json.loads(default)
+            except (json.JSONDecodeError, ValueError):
+                # default itself was malformed — fall back to an empty
+                # value of the shape the default implied, rather than
+                # raising out of what every caller treats as a safe parse.
+                return {} if default.strip().startswith("{") else []
+    async def _evaluate_completion(self, agent, goal: str, result: str) -> tuple[bool | None, str]:
+        """
+        Returns (completed, reason). `completed` is a tri-state:
+          True  — evaluator explicitly confirmed the goal was met
+          False — evaluator explicitly confirmed it was not
+          None  — evaluator timed out / errored / returned junk; unknown
+
+        Previously any exception (including a timeout) returned `True`,
+        i.e. a hung or erroring evaluator silently asserted success —
+        exactly backwards for a check whose entire purpose is catching
+        incomplete work. Callers must treat None as "don't know", not
+        as either outcome; they should neither append an "incomplete"
+        note nor treat the run as confirmed-complete.
+        """
         try:
             r = await asyncio.wait_for(
                 agent.llm.chat(
@@ -39,9 +69,15 @@ class ReflectionManager:
                 timeout=10,
             )
             ev = agent._extract_json(r.get("content", ""), default="{}")
-            return bool(ev.get("completed", True)), ev.get("reason", "")
-        except Exception:
-            return True, ""
+            if "completed" not in ev:
+                return None, "evaluator response missing 'completed' field"
+            return bool(ev["completed"]), ev.get("reason", "")
+        except asyncio.TimeoutError:
+            logger.warning("Completion evaluator timed out")
+            return None, "evaluator timed out"
+        except Exception as e:
+            logger.debug("Evaluate completion: %s", e)
+            return None, "evaluator unavailable"
     async def _write_post_mortem_and_insights(self, agent, goal: str, result: str) -> None:
         worked = " -> ".join(
             f"{t['tool']}({agent._fmt_action(t['tool'], t['args'])})"
@@ -158,12 +194,22 @@ class ReflectionManager:
             f"  {s['tool']} -> {s.get('error_type','?')}: {s['result'][:80]}"
             for s in agent._trace[-3:] if not s["success"]
         ) or "  (none)"
-        r = await agent.llm.chat(
-            system="Debug agent failures. DIAGNOSIS then NEXT STEP.",
-            messages=[{"role": "user", "content":
-                f"GOAL: {agent._goal}\n{agent._belief_summary()}\nFAILED:\n{failed}\n\nDIAGNOSIS:\nNEXT:"}],
-        )
-        return r.get("content", "Try completely different approach")
+        try:
+            r = await asyncio.wait_for(
+                agent.llm.chat(
+                    system="Debug agent failures. DIAGNOSIS then NEXT STEP.",
+                    messages=[{"role": "user", "content":
+                        f"GOAL: {agent._goal}\n{agent._belief_summary()}\nFAILED:\n{failed}\n\nDIAGNOSIS:\nNEXT:"}],
+                ),
+                timeout=15,
+            )
+            return r.get("content", "Try completely different approach")
+        except asyncio.TimeoutError:
+            logger.warning("_reflect timed out after 15s")
+            return "Reflection timed out — try a completely different approach."
+        except Exception as e:
+            logger.debug("Reflect: %s", e)
+            return "Try a completely different approach."
     def _can_extend_iterations(self, agent) -> bool:
         """
         Called only when about to hit the current iteration cap. Iteration

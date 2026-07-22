@@ -13,6 +13,13 @@ from session.memory import (
     clear_steps as _clear_persisted_steps,
 )
 logger = logging.getLogger(__name__)
+
+# Bounds in-memory step-log growth for very long-running tasks. Unlike
+# `history` (bounded by _trim), `_steps` had no cap at all — the durable
+# copy already lives on disk via _flush_steps, so trimming the in-memory
+# tail here only affects get_steps()'s recency window, not durability.
+_MAX_IN_MEMORY_STEPS = 500
+
 class MemoryManager:
     def _record_step(self, agent, kind: str, description: str, **extra) -> dict:
         """
@@ -32,6 +39,8 @@ class MemoryManager:
             **extra,
         }
         agent._steps.append(step)
+        if len(agent._steps) > _MAX_IN_MEMORY_STEPS:
+            agent._steps = agent._steps[-_MAX_IN_MEMORY_STEPS:]
         agent._pending_steps.append(step)
         agent._safe_status(description)
         return step

@@ -17,42 +17,111 @@ TOOL_LABELS = {
     "browser": "\U0001F310", "terminal": "\u26A1", "run_python": "\U0001F40D",
     "run_bash": "\U0001F4DC", "file_editor": "\U0001F4C1", "memory": "\U0001F9E0", "planning": "\U0001F4CB",
 }
+# file_editor deliberately has no fallback entry: its args (action/
+# filepath/content) don't map onto any other tool's schema. The old
+# "file_editor": "terminal" entry silently ran `terminal` with an empty
+# command on every file_editor failure (see _run's fallback dispatch —
+# it only knows how to extract "command"/"query"/"code" keys), wasting a
+# tool call and polluting _trace/_consec_errors with a bogus result.
 FALLBACKS = {
     "terminal": "run_bash", "run_bash": "run_python",
-    "run_python": "terminal", "file_editor": "terminal",
+    "run_python": "terminal",
 }
 TOOL_TIMEOUT = 30
+# Mirrors tools/terminal.py's `timeout: int = 60` default. Used as the
+# fallback in _call_timeout when a terminal call omits `timeout` — using
+# the generic TOOL_TIMEOUT (30) here would silently disagree with what
+# the tool itself documents and actually passes to execute().
+TOOL_TERMINAL_DEFAULT_TIMEOUT = 60
+
+# Tools whose results depend on live, mutable state (filesystem, network,
+# running processes) and must never be served from the per-run result
+# cache in `_run` — a second identical call is very often intentional
+# ("did the exploit land yet") rather than a redundant retry.
+NON_IDEMPOTENT_TOOLS = {"terminal", "run_bash", "run_python", "browser"}
+
+# Hard denylist checked before any command is allowed to graduate into an
+# auto-created plugin (see _maybe_auto_create_plugin). This is a coarse
+# safety net, not a substitute for real sandboxing/approval — it exists
+# to stop the most obviously destructive/exfiltrating patterns from ever
+# being persisted as a reusable, auto-loaded tool.
+_DANGEROUS_PLUGIN_PATTERNS = re.compile(
+    r"rm\s+-rf\s+/|:\(\)\{.*\};\s*:|curl[^|\n]*\|\s*(sh|bash)|wget[^|\n]*\|\s*(sh|bash)"
+    r"|>\s*/dev/(sd|nvme|hd)|mkfs\.|dd\s+if=.*of=/dev/|chmod\s+-R\s+777\s+/"
+    r"|/etc/(passwd|shadow)|nc\s+-l|curl\s+[^\n]*-d\s+[^\n]*@",
+    re.IGNORECASE,
+)
+
+
+# Absolute ceiling on the terminal tool's own `timeout` argument, so a
+# bad/malicious value (e.g. an LLM asked to justify an arbitrarily long
+# wait) can't defeat the timeout mechanism entirely. Should stay well
+# under MAX_RUNTIME_SECONDS so one call can't eat the whole run's time
+# budget.
+MAX_EXPLICIT_TOOL_TIMEOUT = 600
+
+# Extra headroom given to the OUTER asyncio.wait_for beyond whatever
+# timeout tools/executor.py's execute() is using internally. execute()
+# needs a few seconds after ITS OWN timeout fires to run _kill_proc_group
+# + proc.wait(timeout=5) and return cleanly — if the outer wrapper's
+# deadline is identical to execute()'s, the outer one can win the race
+# and cancel the asyncio.to_thread wrapper before execute() finishes its
+# own cleanup, which is exactly the orphaned-process failure mode this
+# margin exists to avoid.
+TIMEOUT_MARGIN = 10
 
 
 def _call_timeout(name: str, args: dict) -> int:
     """
-    Per-call timeout for _execute_single_tool's asyncio.wait_for. Almost
-    always TOOL_TIMEOUT — except a `terminal` call whose command needs
-    sudo/su/pkexec/doas, which gets a much longer allowance.
+    Per-call timeout for _execute_single_tool's asyncio.wait_for.
 
-    Why: tools/executor.py's execute() runs a confirmed privilege-
-    escalation command interactively (real password prompt, real
-    terminal, see _run_privileged_interactive there) with its own
-    SUDO_INTERACTIVE_TIMEOUT (300s) — sized for "a human has to notice
-    the prompt and type a password", not for a normal command. But that
-    inner wait happens on a worker thread underneath THIS function's own
-    asyncio.wait_for(..., timeout=TOOL_TIMEOUT). Without matching the
-    outer timeout to the inner one, the outer wait_for would fire first
-    at 30s, report a false "Timeout after 30s" back to the agent loop,
-    and move on — while the worker thread is still genuinely blocked
-    waiting on the user's password entry underneath (asyncio.to_thread
-    threads can't be cancelled once started, so it isn't actually
-    abandoned, just orphaned from the agent's point of view). Matching
-    the two timeouts means the outer wait actually reflects how long the
-    inner call is allowed to take.
+    This used to independently guess how long a `terminal` call should
+    be allowed to run — first a flat 30s, then (briefly) a regex over
+    the command text trying to spot "probably slow" command families.
+    Both were wrong in the same way: they ignored the fact that
+    `terminal()`'s own `timeout` parameter (tools/terminal.py) is
+    already the authoritative value — it's what the caller explicitly
+    asked for, and it's what actually gets passed to
+    tools/executor.py's `execute(timeout=timeout, ...)`. Re-deriving a
+    second, independent guess here meant this OUTER wait_for could
+    (and did) fire before execute()'s own INNER timeout ever got a
+    chance to run — at which point execute()'s careful cleanup
+    (subprocess.TimeoutExpired handling, _kill_proc_group, process-group
+    kill) never happens, because asyncio.to_thread can't forcibly stop
+    the thread it's running in; the process is simply orphaned from the
+    agent's point of view while cancellation returns immediately with a
+    "Timeout after Ns" message that has nothing to do with the actual
+    command's progress.
+
+    Now: trust the caller's own `timeout` arg (clamped to a sane range),
+    and give it a small margin so execute()'s own timeout fires and
+    cleans up FIRST, with this outer wrapper only as a last-resort
+    backstop in case that inner cleanup itself somehow hangs.
+
+    Privilege escalation (sudo/su/pkexec/doas) still gets special
+    handling: tools/executor.py's execute() runs a confirmed
+    privilege-escalation command interactively (real password prompt,
+    real terminal — see _run_privileged_interactive there) with its own
+    SUDO_INTERACTIVE_TIMEOUT (300s), sized for "a human has to notice
+    the prompt and type a password," not for a normal command — and
+    that can be longer than whatever timeout the caller happened to
+    pass (the caller has no way to know a command will end up needing
+    sudo before it runs). The outer wait must be at least that long
+    regardless of the caller's own value.
     """
     if name != "terminal":
         return TOOL_TIMEOUT
-    cmd_text = str(
-        args.get("command") or args.get("script") or args.get("code") or ""
-    )
+    requested = args.get("timeout", TOOL_TERMINAL_DEFAULT_TIMEOUT)
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        requested = TOOL_TERMINAL_DEFAULT_TIMEOUT
+    requested = max(1, min(MAX_EXPLICIT_TOOL_TIMEOUT, requested))
+    cmd_text = str(args.get("command") or args.get("script") or args.get("code") or "")
     escalates, _ = requires_privilege_escalation(cmd_text)
-    return SUDO_INTERACTIVE_TIMEOUT + 15 if escalates else TOOL_TIMEOUT
+    if escalates:
+        return max(requested, SUDO_INTERACTIVE_TIMEOUT + 15) + TIMEOUT_MARGIN
+    return requested + TIMEOUT_MARGIN
 
 
 class ExecutionManager:
@@ -67,7 +136,7 @@ class ExecutionManager:
         if agent._belief["goal_progress"] != "blocked":
             score += 0.1
         key = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
-        if key in agent._cache:
+        if tool_name not in NON_IDEMPOTENT_TOOLS and key in agent._cache:
             score -= 0.3  # cached = already tried
         for skill in agent._skills_for_tool(tool_name):
             m = get_skill_metric(skill.name)
@@ -179,7 +248,8 @@ class ExecutionManager:
                 raw, elapsed = f"Error: {e}", 0.0
             results[idx] = (raw, elapsed)
             return not agent._is_error(raw)
-        pending  = {asyncio.create_task(run_and_report(i, c)) for i, c in enumerate(calls)}
+        tasks    = {asyncio.create_task(run_and_report(i, c)): (i, c) for i, c in enumerate(calls)}
+        pending  = set(tasks)
         deadline = time.time() + max(_call_timeout(c["name"], c.get("arguments", {})) for c in calls)
         try:
             while pending:
@@ -193,6 +263,15 @@ class ExecutionManager:
                     break
         finally:
             for t in pending:
+                idx, c = tasks[t]
+                if not t.done() and c.get("name") in ("terminal", "run_bash", "run_python"):
+                    logger.warning(
+                        "Race lost a still-pending %s call — cancelling the asyncio "
+                        "task, but the underlying subprocess (if already spawned) may "
+                        "keep running unobserved; treat any of its side effects as "
+                        "unverified. args=%s",
+                        c.get("name"), {k: str(v)[:80] for k, v in (c.get("arguments") or {}).items()},
+                    )
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         return results
@@ -265,11 +344,31 @@ class ExecutionManager:
             return await agent._run_plugin_tool(args)
         if name in agent._plugin_tools:
             try:
-                return str(agent._plugin_tools[name](**args))
+                fn = agent._plugin_tools[name]
+                # Plugin bodies (auto- or explicitly-created) are ordinary
+                # synchronous functions — commonly subprocess.check_output
+                # under the hood. Calling them directly here blocks the
+                # entire event loop for as long as they run: the
+                # asyncio.wait_for(timeout=...) wrapping this call in
+                # _execute_single_tool can only fire at an await point, and
+                # a synchronous call never yields one, so the "timeout"
+                # never actually cancels anything — it just delays firing
+                # until the blocking call finally returns on its own. Every
+                # other coroutine sharing this loop (resource monitor,
+                # checkpointing, sibling calls in the same race/parallel
+                # batch) stalls for the same duration. Running it in a
+                # worker thread doesn't make it truly cancellable, but it
+                # stops one blocking tool from freezing everything else.
+                if inspect.iscoroutinefunction(fn):
+                    out = await fn(**args)
+                else:
+                    out = await asyncio.to_thread(fn, **args)
+                return str(out)
             except Exception as e:
                 return f"Plugin error: {e}"
+        cacheable = name not in NON_IDEMPOTENT_TOOLS
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
-        if key in agent._cache:
+        if cacheable and key in agent._cache:
             return agent._cache[key]
         tool = agent.tools.get(name)
         if not tool:
@@ -281,17 +380,22 @@ class ExecutionManager:
                     agent._fn_cache[fn] = (inspect.signature(fn), inspect.iscoroutinefunction(fn))
                 sig, is_async = agent._fn_cache[fn]
                 kw  = {k: v for k, v in args.items() if k in sig.parameters}
-                out = await fn(**kw) if is_async else fn(**kw)
-                agent._cache[key] = s = str(out)
+                # Same event-loop-blocking concern as the plugin branch
+                # above applies to any registered MCP tool whose fn isn't
+                # a coroutine function.
+                out = await fn(**kw) if is_async else await asyncio.to_thread(fn, **kw)
+                s = str(out)
+                if cacheable:
+                    agent._cache[key] = s
                 return s
             except Exception as e:
                 logger.debug("%s attempt %d: %s", name, attempt + 1, e)
                 if attempt == 1:
                     fb = FALLBACKS.get(name)
-                    if fb and fb in agent.tools:
+                    cmd = args.get("command") or args.get("query") or args.get("code") or ""
+                    if fb and fb in agent.tools and cmd:
                         agent._record_step("tool_call", f"{name} errored — falling back to {fb}",
                                            tool=fb, fallback_from=name)
-                        cmd = args.get("command") or args.get("query") or args.get("code") or ""
                         return await agent._run(fb, {"command": cmd})
                     return f"Error: {e}"
         return ""
@@ -351,6 +455,25 @@ class ExecutionManager:
             if not recurring:
                 return False
             command = recurring[0]
+            # SECURITY: never let a command matching an obviously
+            # destructive/exfiltrating pattern graduate into a persisted,
+            # auto-loaded tool. This is a coarse net, not a substitute for
+            # real review — auto-created plugins are still a meaningful
+            # trust boundary (see the code-generation notes below) and
+            # should ideally require human approval before being wired
+            # into agent._plugin_tools at all. Flagging that as a
+            # follow-up outside what this module alone can guarantee.
+            if _DANGEROUS_PLUGIN_PATTERNS.search(command):
+                logger.warning(
+                    "Refusing to auto-create a plugin from a command matching "
+                    "a denylisted pattern: %s", command[:120],
+                )
+                agent._record_step(
+                    "plugin_blocked",
+                    f"Declined to auto-create a plugin — command matched a "
+                    f"denylisted pattern: {command[:80]}",
+                )
+                return False
             # A truncated 40-char slug alone isn't unique — two different
             # commands that share the same first 30ish characters would
             # collide, and the `if name in existing_tools: return True` below
@@ -372,15 +495,34 @@ class ExecutionManager:
             if name in existing_tools:
                 return True
             description = f"Reusable helper for: {command[:80]}"
-            # `command` is a default arg, not hardcoded into the call, so the
-            # LLM can override it later with a similar-but-different command
-            # via `command=...` instead of getting a frozen one-off replay of
-            # the exact string that happened to succeed twice.
+            # SECURITY FIX: previously generated `shell=True` with an
+            # overridable `command` kwarg — i.e. a permanent, auto-loaded
+            # tool that would shell-execute whatever string it was called
+            # with, seeded from a (possibly attacker-influenced) command
+            # that merely happened to run twice. Now: shell=False via
+            # shlex.split, and the exact recurring command is frozen —
+            # **kwargs is accepted for forward-compat call shape but
+            # deliberately ignored, so there is no channel to widen what
+            # this plugin actually executes after creation. If the
+            # command can't be tokenized (e.g. it uses shell features like
+            # pipes/redirects that genuinely require a shell), skip
+            # plugin creation entirely rather than falling back to
+            # shell=True.
+            try:
+                import shlex
+                shlex.split(command)
+            except ValueError:
+                logger.info(
+                    "Skipping plugin creation for a command that requires "
+                    "shell features (pipes/redirects/quoting) rather than "
+                    "widening to shell=True: %s", command[:120],
+                )
+                return False
             code = (
-                "import subprocess\n\n"
-                f"def {name}(command: str = {command!r}, **kwargs):\n"
+                "import shlex, subprocess\n\n"
+                f"def {name}(**_ignored_kwargs):\n"
                 f"    {description!r}\n"
-                f"    return subprocess.check_output(command, shell=True, text=True)"
+                f"    return subprocess.check_output(shlex.split({command!r}), text=True)"
             )
             try:
                 create_plugin_tool(name=name, description=description, code=code)
@@ -418,6 +560,9 @@ class ExecutionManager:
             code = str(args.get("code", "")).strip()
             if not name or not code:
                 return "Plugin creation requires a name and code"
+            if _DANGEROUS_PLUGIN_PATTERNS.search(code):
+                logger.warning("Refusing explicit plugin creation — code matched a denylisted pattern")
+                return "Plugin creation declined — code matched a denylisted dangerous pattern"
             async with agent._plugin_lock:
                 try:
                     result = create_plugin_tool(name=name, description=description or "Generated plugin", code=code)

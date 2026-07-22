@@ -7,10 +7,25 @@ delegate (e.g. `agent._transition(...)` still works), so nothing calling
 the agent needs to change.
 """
 import logging
-import asyncio, json
+import asyncio, re
 from session.memory import get_relevant_kv_facts
 from agent.config import ITER_BY_COMPLEXITY
 logger = logging.getLogger(__name__)
+
+# Fix #12: the old check was `cue in q` (plain substring), so "my " and
+# "me " matched inside completely unrelated words — "army", "academy",
+# "enemy", "summer" all contain one of those substrings, so e.g. "email
+# the army contact list" false-positived a memory-skill match. Word
+# boundaries fix that. Multi-word phrases ("last time", "as before") work
+# fine inside \b...\b since \b only anchors the very start/end of the
+# alternative that matched.
+_MEMORY_CUE_RE = re.compile(
+    r"\b(remember|memory|recall|stored|last time|as before|what do you know|"
+    r"what did you|my|me|preference|path|project|config|env|ip|address|"
+    r"name|email|phone)\b",
+    re.IGNORECASE,
+)
+
 class Planner:
     @staticmethod
     def _max_iter_for_complexity(score: float) -> int:
@@ -20,13 +35,7 @@ class Planner:
             return ITER_BY_COMPLEXITY["medium"]
         return ITER_BY_COMPLEXITY["complex"]
     def _looks_like_memory_query(self, agent, query: str) -> bool:
-        q = query.lower()
-        return any(cue in q for cue in (
-            "remember", "memory", "recall", "stored", "last time", "as before",
-            "what do you know", "what did you", "my ", "me ", "preference",
-            "path", "project", "config", "env", "ip", "address", "name",
-            "email", "phone",
-        ))
+        return bool(_MEMORY_CUE_RE.search(query))
     def _match_core_skills(self, agent, user_input: str) -> list:
         lowered = user_input.lower()
         matched = []
@@ -69,16 +78,28 @@ class Planner:
             lines.append(f"  [{s['skill']}] step {s['step']+1}: {s['instruction'][:80]}")
         return "\n".join(lines)
     def _mark_skill_step_done(self, agent, tool_name: str) -> None:
+        """Credits progress per-skill instead of stopping at the first
+        match in the merged, tool-sorted plan. The merged plan interleaves
+        steps from every active skill sorted by tool category, so "first
+        pending step matching tool_name" is not the same thing as "the
+        step this tool call actually satisfies" — two different skills can
+        each have a pending step keyed on the same tool, and the old code
+        credited whichever happened to sort first, silently starving the
+        other skill's progress tracking. Each active skill now gets at
+        most one of its own steps advanced per call, independently."""
+        touched_skills = set()
         for step in agent._skill_plan:
             if step["done"]:
                 continue
+            skill_name = step["skill"]
+            if skill_name in touched_skills:
+                continue
             if not step["tools"] or tool_name in step["tools"]:
                 step["done"] = True
-                skill_name   = step["skill"]
+                touched_skills.add(skill_name)
                 agent._skill_steps[skill_name] = step["step"] + 1
                 if all(s["done"] for s in agent._skill_plan if s["skill"] == skill_name):
                     agent._skill_done.add(skill_name)
-                break
     def _skills_for_tool(self, agent, tool_name: str) -> list:
         return [s for s in agent._active_skills
                 if not set(s.mcp_tools or []) or tool_name in set(s.mcp_tools or [])]
@@ -210,13 +231,30 @@ class Planner:
         else:
             agent._subtasks = getattr(agent, "_subtasks", [])
         return item
+    _MAX_ITEM_RETRIES = 1
+
     def _complete_current_execution_item(self, agent, success: bool = True) -> None:
         if agent._active_execution_item is None:
             return
+        item = agent._active_execution_item
         agent._active_execution_item = None
-        agent._execution_complete = agent._execution_index >= len(agent._execution_queue)
         if not success:
-            agent._execution_complete = False
+            retries = item.get("_retries", 0)
+            if retries < self._MAX_ITEM_RETRIES:
+                # Actually re-queue it at the current position so the next
+                # claim call serves it again — previously execution_complete
+                # was set False here with nothing behind it, so the retry
+                # never happened; the item was just gone and the queue
+                # reported "done" on the very next claim regardless.
+                requeued = {**item, "_retries": retries + 1}
+                agent._execution_queue.insert(agent._execution_index, requeued)
+                agent._execution_complete = False
+                return
+            # Retries exhausted for this item — let the queue finish
+            # draining normally. _handle_stuck's milestone-replan / general
+            # reflection path is the real recovery mechanism; this cap just
+            # stops a permanently-broken step from looping forever.
+        agent._execution_complete = agent._execution_index >= len(agent._execution_queue)
         if agent._execution_complete:
             # Previously this only happened at the top of the *next*
             # iteration's loop body — so a task that gave its final
