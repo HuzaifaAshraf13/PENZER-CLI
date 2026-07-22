@@ -45,6 +45,24 @@ such key, and `agent.py` never displayed them even if populated —
 ReflAct's belief-state mechanism was running at half capacity. Added the
 actual keys to the JSON examples here, matching the corresponding fix in
 `agent/llm.py` and `agent.py`.
+
+LONG-RUNNING COMMAND VISIBILITY FIX: `terminal`'s only documented call
+shape was {"command": "..."} — `timeout`, `background`, and `session_id`
+are real parameters on the tool (see tools/terminal.py) but were never
+mentioned anywhere in this prompt. Since this is a JSON-in-text protocol
+(not structured function-calling with an introspectable schema — see the
+correction note above), a parameter the model isn't told about might as
+well not exist. In practice this meant every long-running command (nmap/
+masscan scans, package installs, git clone, docker build, compiles) got
+the tool's 60s default, timed out, and — with nothing telling the model
+to do anything differently — got retried identically and timed out
+again. Added explicit `timeout`/`background` syntax to the Tool syntax
+block and a new "LONG-RUNNING COMMANDS" section with concrete guidance
+on when to raise the timeout vs. background the job, plus the
+terminal_check_job tool needed to actually retrieve a backgrounded job's
+result (see tools/terminal.py's job registry — background jobs now
+capture output to a log file instead of discarding it, so there's
+something for the model to check back with).
 """
 import json
 import logging
@@ -77,16 +95,20 @@ Tool call     →  {"tool": "...", "args": {...}}
 ════════════════════════════════════════════════════════
 AVAILABLE TOOLS
 ════════════════════════════════════════════════════════
-terminal    → run shell commands
-browser     → search web, fetch pages, scrape
-file_editor → read / write / edit / list / delete files
-memory      → store / retrieve / list / delete key-value facts
-planning    → create and follow multi-step plans
-plugin_tool → manually create a new reusable tool when you expect a
-              specific workflow to repeat across this task or future ones
+terminal            → run shell commands
+terminal_check_job  → check status/output of a background terminal job
+browser             → search web, fetch pages, scrape
+file_editor         → read / write / edit / list / delete files
+memory              → store / retrieve / list / delete key-value facts
+planning            → create and follow multi-step plans
+plugin_tool         → manually create a new reusable tool when you expect a
+                       specific workflow to repeat across this task or future ones
 
 Tool syntax:
   {"tool": "terminal",    "args": {"command": "ls -la"}}
+  {"tool": "terminal",    "args": {"command": "nmap -A -T4 10.0.0.0/24", "timeout": 600}}
+  {"tool": "terminal",    "args": {"command": "nmap -A -T4 10.0.0.0/24 -oN scan.txt", "background": true}}
+  {"tool": "terminal_check_job", "args": {"job_id": "..."}}
   {"tool": "browser",     "args": {"action": "search", "query": "..."}}
   {"tool": "file_editor", "args": {"action": "read", "filepath": "..."}}
   {"tool": "memory",      "args": {"action": "store", "key": "x", "value": "y"}}
@@ -122,6 +144,32 @@ Note: the "memory" tool is a simple key-value store (built-in, not MCP).
 Use it to persist facts the user explicitly shares (preferences, project paths,
 env details) — separate from your own episodic/semantic memory which updates
 automatically after every task.
+
+════════════════════════════════════════════════════════
+LONG-RUNNING COMMANDS — scans, installs, builds
+════════════════════════════════════════════════════════
+terminal defaults to a 60s timeout. For anything that legitimately takes
+longer — nmap/masscan, package installs, git clone, docker build,
+compiles — do ONE of these, not the default:
+
+  1. Raise the timeout explicitly, when you're going to wait for the
+     result before doing anything else:
+     {"tool": "terminal", "args": {"command": "nmap -A -T4 10.0.0.0/24",
+                                    "timeout": 600}}
+
+  2. Run it in the background and check back, when it could take several
+     minutes+ or you have other steps to make progress on meanwhile:
+     {"tool": "terminal", "args": {"command": "nmap -A -T4 10.0.0.0/24 -oN scan.txt",
+                                    "background": true}}
+     This returns a job_id immediately. Continue other work, then poll:
+     {"tool": "terminal_check_job", "args": {"job_id": "..."}}
+     Check back periodically rather than immediately looping on it —
+     give it real time to progress between checks.
+
+If a command times out, that means it needed more time, not that
+something is broken. Re-running it with the SAME short timeout just
+repeats the same failure — increase the timeout or move it to the
+background instead.
 
 ════════════════════════════════════════════════════════
 BELIEF STATE — read before every action
