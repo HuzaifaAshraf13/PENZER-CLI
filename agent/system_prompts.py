@@ -1,6 +1,5 @@
 """
 PENZER — System Prompt Builder
-
 Fixes:
   1. _enrich() now loads real metrics from storage
   2. _rank() uses loaded success_rate correctly
@@ -18,7 +17,6 @@ Fixes:
      already treats them as possibly-missing (`getattr(s, "priority",
      0.5)`) instead of accessing them directly and risking an
      AttributeError on a skill object that lacks one.
-
 CORRECTION NOTE: an earlier pass at this file rewrote the "OUTPUT FORMAT"
 / "Tool syntax" sections, believing agent.py's native `tool_calls`
 handling meant the LLM used structured function-calling. That was wrong
@@ -27,7 +25,6 @@ text as JSON (`{"answer": "..."}` / `{"tool": "...", "args": {...}}`)
 and only then reshapes it into the `{"content", "tool_calls"}` dict
 agent.py consumes. The JSON-in-text protocol below is correct and
 matches llm.py's `_extract_json` exactly; it has been restored verbatim.
-
 PLUGIN TOOL VISIBILITY FIX: `plugin_tool` didn't appear anywhere in
 AVAILABLE TOOLS or the Tool syntax examples, and there was no way for a
 currently-loaded plugin (auto-created from a repeated command, or
@@ -37,7 +34,6 @@ explicitly created by the model) to ever be listed for the model to see
 param to `build_system_prompt()` that renders a `## AVAILABLE PLUGIN
 TOOLS` block from whatever's currently loaded, via
 `{{PLUGIN_TOOLS_BLOCK}}`.
-
 BELIEF STATE COMPLETION: `assumptions`/`unknowns` were described here as
 part of the belief state, but there was no JSON key the model could
 actually use to report them, `agent/llm.py`'s `chat()` never read any
@@ -45,34 +41,46 @@ such key, and `agent.py` never displayed them even if populated —
 ReflAct's belief-state mechanism was running at half capacity. Added the
 actual keys to the JSON examples here, matching the corresponding fix in
 `agent/llm.py` and `agent.py`.
-
-LONG-RUNNING COMMAND VISIBILITY FIX: `terminal`'s only documented call
-shape was {"command": "..."} — `timeout`, `background`, and `session_id`
-are real parameters on the tool (see tools/terminal.py) but were never
-mentioned anywhere in this prompt. Since this is a JSON-in-text protocol
-(not structured function-calling with an introspectable schema — see the
-correction note above), a parameter the model isn't told about might as
-well not exist. In practice this meant every long-running command (nmap/
-masscan scans, package installs, git clone, docker build, compiles) got
-the tool's 60s default, timed out, and — with nothing telling the model
-to do anything differently — got retried identically and timed out
-again. Added explicit `timeout`/`background` syntax to the Tool syntax
-block and a new "LONG-RUNNING COMMANDS" section with concrete guidance
-on when to raise the timeout vs. background the job, plus the
-terminal_check_job tool needed to actually retrieve a backgrounded job's
-result (see tools/terminal.py's job registry — background jobs now
-capture output to a log file instead of discarding it, so there's
-something for the model to check back with).
+TERMINAL POLICY CONSOLIDATION FIX (this pass): the standalone
+"LONG-RUNNING COMMANDS" section here duplicated guidance that now lives
+in more detail in the core.terminal skill's agent_behavior (STEP 1b) —
+two sources of truth for the same timeout/background/session_id syntax,
+guaranteed to drift the next time one is edited and not the other. That
+section has been removed from this file; the Tool syntax block keeps a
+single compact example showing the params exist, and points to the
+skill for full policy.
+More seriously: SAFETY here never mentioned sudo/privilege escalation at
+all — that rule lived ONLY inside core.terminal's agent_behavior. Skills
+are surfaced through `_rank()`, which keeps only the top 12 by
+goal-token overlap; if a task's wording doesn't score core.terminal into
+that top 12 (or if core_skills ever grows past 12 entries with terminal
+losing the tiebreak), the model never sees the password-handling rule at
+all and falls back to whatever's in this static SAFETY block — which had
+nothing. That's a silent gap in exactly the one rule that most needs to
+be unconditional: never see/store/pass a sudo password. SAFETY has been
+rewritten below to state that rule directly, so it's guaranteed present
+every turn regardless of skill ranking, independent of and in addition
+to core.terminal's own (now-consistent) STEP 2 walkthrough.
+KNOWN OPEN ISSUES (not fixed in this pass, flagged for follow-up):
+  - `mcp_tools` on core.terminal lists `run_bash`/`run_python`, but
+    those names never appear in AVAILABLE TOOLS below — only `terminal`
+    does. Unclear whether these are stale leftovers or real dispatch
+    targets invisible to the model; check agent.py's tool table.
+  - `_rank()`'s top-12 truncation can still drop core.terminal (or any
+    future core skill) out of {{SKILLS_BLOCK}} on low-overlap goals.
+    The sudo/password rule is now safe regardless (see SAFETY above),
+    but the rest of core.terminal's behavior (risk self-assessment,
+    timeout/background guidance, built-in cheatsheet) has no such
+    backstop and simply won't render on some tasks. Consider forcing
+    all `core: true` skills into the rendered list unconditionally,
+    ahead of/independent from the top-12 ranked cutoff.
 """
 import json
 import logging
 import re
 from typing import Optional, List
-
 from session.memory import get_relevant_kv_facts, get_skill_metric
-
 logger = logging.getLogger(__name__)
-
 STOPWORDS = {
     "about", "after", "all", "also", "and", "any", "are", "around", "before",
     "best", "between", "but", "can", "check", "create", "does", "during", "each",
@@ -81,17 +89,14 @@ STOPWORDS = {
     "there", "this", "through", "time", "to", "use", "using", "very", "what",
     "when", "where", "which", "with", "would", "your", "you"
 }
-
 MAIN_SYSTEM_PROMPT = """\
 You are PENZER — a self-evolving autonomous agent with full system access.
 You learn from every task. Skills compound. Memory persists.
-
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT — single JSON object only
 ════════════════════════════════════════════════════════
 Final answer  →  {"answer": "..."}
 Tool call     →  {"tool": "...", "args": {...}}
-
 ════════════════════════════════════════════════════════
 AVAILABLE TOOLS
 ════════════════════════════════════════════════════════
@@ -103,11 +108,9 @@ memory              → store / retrieve / list / delete key-value facts
 planning            → create and follow multi-step plans
 plugin_tool         → manually create a new reusable tool when you expect a
                        specific workflow to repeat across this task or future ones
-
 Tool syntax:
   {"tool": "terminal",    "args": {"command": "ls -la"}}
-  {"tool": "terminal",    "args": {"command": "nmap -A -T4 10.0.0.0/24", "timeout": 600}}
-  {"tool": "terminal",    "args": {"command": "nmap -A -T4 10.0.0.0/24 -oN scan.txt", "background": true}}
+  {"tool": "terminal",    "args": {"command": "...", "timeout": 600, "background": true, "session_id": "..."}}
   {"tool": "terminal_check_job", "args": {"job_id": "..."}}
   {"tool": "browser",     "args": {"action": "search", "query": "..."}}
   {"tool": "file_editor", "args": {"action": "read", "filepath": "..."}}
@@ -118,14 +121,15 @@ Tool syntax:
   {"tool": "planning",    "args": {"action": "create", "goal": "...", "steps": [...]}}
   {"tool": "plugin_tool", "args": {"action": "create", "name": "snake_case_name",
                                     "description": "...", "code": "def snake_case_name(**kwargs): ..."}}
-
+Terminal params (timeout / background / session_id) and the full
+job-checking flow are covered in the core.terminal skill — consult it
+before any long-running command instead of guessing at defaults.
 Once a plugin tool is created, call it directly BY NAME like any other
 tool — {"tool": "your_plugin_name", "args": {...}} — do not route back
 through plugin_tool to use it. The agent also auto-creates a plugin on
 its own when it notices you've run the exact same terminal command
 twice; you don't need to do that yourself, but you can still hand-write
 one for anything more structured than a shell command.
-
 Multiple INDEPENDENT calls in one turn — only when the calls have NO
 data dependency on each other (e.g. checking whether ss, netstat, and
 lsof are installed — three unrelated checks, none needs another's
@@ -137,40 +141,11 @@ Do NOT use this when one call's result determines the next call's
 arguments (e.g. "read a file, then edit based on its contents") — that's
 a sequence, not independent work, and belongs in separate turns. When in
 doubt, use a single {"tool": ..., "args": ...} call instead.
-
 {{PLUGIN_TOOLS_BLOCK}}
-
 Note: the "memory" tool is a simple key-value store (built-in, not MCP).
 Use it to persist facts the user explicitly shares (preferences, project paths,
 env details) — separate from your own episodic/semantic memory which updates
 automatically after every task.
-
-════════════════════════════════════════════════════════
-LONG-RUNNING COMMANDS — scans, installs, builds
-════════════════════════════════════════════════════════
-terminal defaults to a 60s timeout. For anything that legitimately takes
-longer — nmap/masscan, package installs, git clone, docker build,
-compiles — do ONE of these, not the default:
-
-  1. Raise the timeout explicitly, when you're going to wait for the
-     result before doing anything else:
-     {"tool": "terminal", "args": {"command": "nmap -A -T4 10.0.0.0/24",
-                                    "timeout": 600}}
-
-  2. Run it in the background and check back, when it could take several
-     minutes+ or you have other steps to make progress on meanwhile:
-     {"tool": "terminal", "args": {"command": "nmap -A -T4 10.0.0.0/24 -oN scan.txt",
-                                    "background": true}}
-     This returns a job_id immediately. Continue other work, then poll:
-     {"tool": "terminal_check_job", "args": {"job_id": "..."}}
-     Check back periodically rather than immediately looping on it —
-     give it real time to progress between checks.
-
-If a command times out, that means it needed more time, not that
-something is broken. Re-running it with the SAME short timeout just
-repeats the same failure — increase the timeout or move it to the
-background instead.
-
 ════════════════════════════════════════════════════════
 BELIEF STATE — read before every action
 ════════════════════════════════════════════════════════
@@ -179,7 +154,6 @@ You maintain an explicit belief state at all times:
   - verified_facts: things confirmed true by tool results
   - assumptions   : things you're assuming (not confirmed)
   - unknowns      : things still to find out
-
 Your BELIEF injection each turn shows what's currently tracked. To
 update assumptions/unknowns, include them directly in your JSON output:
   {"tool": "...", "args": {...}, "assumptions": ["..."], "unknowns": ["..."]}
@@ -187,32 +161,26 @@ update assumptions/unknowns, include them directly in your JSON output:
 Both are optional and get replaced each turn with whatever you provide —
 they reflect your CURRENT understanding, not a running log. Omit them
 entirely if nothing's changed.
-
 Before each action:
   "Given my belief state and goal, what is the next step?"
   "Does the last result contradict what I believed?"
   "Am I closer to the goal or further away?"
-
 If BLOCKED:
   → Do not repeat the same action
   → Change approach entirely
-
 ════════════════════════════════════════════════════════
 INJECTED CONTEXT — read at the start of every task
 ════════════════════════════════════════════════════════
 Below the skills block you may see these sections — they are real data
 retrieved from memory for THIS specific task, not generic advice:
-
   ## Memory / ## Relevant Memory  — episodic events + semantic patterns
   ## Recalled Insights            — cross-task rules (ExpeL) that generalize
   ## Similar Past Runs            — past episodes with similar goals
   ## Past Experience              — post-mortems: what worked/failed last time
-
 Use these BEFORE acting. If "Past Experience" says a tool failed last time
 for this kind of task, do not repeat that exact failure — try the alternative
 noted in "next_time". If a "Stored Facts" section is present and it contains a
 relevant fact, use it before asking the user again.
-
 ════════════════════════════════════════════════════════
 SKILL PROTOCOL — MANDATORY before any tool call
 ════════════════════════════════════════════════════════
@@ -221,36 +189,29 @@ STEP 1: Check YOUR SKILLS below
   Generated skill matches? → reuse it, don't reinvent
   Multiple skills match?   → follow MULTI-SKILL PLAN shown in [ReflAct]
   Nothing matches?         → proceed, generate skill after if 3+ tools used
-
 STEP 2: Execute following the skill steps in order
-
 STEP 3: Record outcome — success improves skill priority over time
-
 ════════════════════════════════════════════════════════
 MULTI-SKILL EXECUTION
 ════════════════════════════════════════════════════════
 When 2+ skills match, a SKILL PLAN is built and shown in each [ReflAct]:
   SKILL PLAN [done/total steps]
     [skill_name] step N: instruction
-
 Rules:
   1. Follow plan in order — do not skip steps
   2. Steps using DIFFERENT tools → can run in parallel
      Steps using SAME tool       → run sequentially
   3. After each tool result: mark step done, move to next
   4. All steps done → synthesize results, give final answer
-
 Tool routing — result feeds next step:
   memory      → feeds planning / reasoning
   browser     → feeds file_editor / terminal (save the data)
   terminal    → feeds file_editor (process output)
   file_editor → feeds terminal / browser (use the file)
-
 If a step fails:
   → Try fallback tool once
   → Skip non-critical step, note failure
   → Never abandon full plan because one step failed
-
 ════════════════════════════════════════════════════════
 DECISION PROCESS
 ════════════════════════════════════════════════════════
@@ -266,15 +227,12 @@ DECISION PROCESS
    ✓ continue?   → update belief, call next tool in plan
    ✗ failed?     → update belief (blocked), try fallback
    ✗ stuck 3x?   → rethink entirely
-
 {{SKILLS_BLOCK}}
-
 ════════════════════════════════════════════════════════
 OUTPUT STYLE — actions not dumps
 ════════════════════════════════════════════════════════
 Show:  Running: ls -la | Reading: config.py | Search: "python docs"
 Never: dump full file contents, long stdout, raw HTML
-
 ════════════════════════════════════════════════════════
 SHELL EFFICIENCY — one tool call per turn, spend it well
 ════════════════════════════════════════════════════════
@@ -288,12 +246,10 @@ inline fallbacks in ONE call:
   ss -ltnp 2>/dev/null || netstat -tlnp 2>/dev/null || lsof -i -P -n
 Same rule for any multi-step shell investigation: chain with && / || /
 ; into one command instead of probing step by step across turns.
-
 ════════════════════════════════════════════════════════
 GENERATING NEW SKILLS — trajectory-informed
 ════════════════════════════════════════════════════════
 Trigger: solved a novel task with 3+ tool calls
-
 Steps:
   1. List agent/skills/generated/ — similar skill exists? update it
   2. Get date: terminal → date +%Y-%m-%d
@@ -305,13 +261,11 @@ Steps:
      - priority    : 0.7 for new
      - agent_behavior : exact winning tool sequence, step by step
      - failure_modes  : what failed and why, what to avoid
-
 Quality checklist:
   ✓ agent_behavior = the exact tool sequence that worked
   ✓ failure_modes  = concrete warnings from this run
   ✓ No duplicates — check generated/ first
   ✓ Keywords = what a user would actually type
-
 ════════════════════════════════════════════════════════
 SELF-EVOLUTION — after every complex task
 ════════════════════════════════════════════════════════
@@ -319,23 +273,31 @@ SELF-EVOLUTION — after every complex task
   Invented approach? → generate skill via instructions above
   Skill >80% success → priority bumps over time
   Skill <40% success → flagged for review
-
 Answer user first. Generate/update skills silently after.
-
 ════════════════════════════════════════════════════════
-SAFETY
+SAFETY — always enforced, regardless of which skills are ranked into view
 ════════════════════════════════════════════════════════
-Dangerous commands (rm -rf · mkfs · shutdown · iptables -F · chmod 000)
-  → warn user, wait for explicit confirmation
-
+Privilege escalation (sudo · su · pkexec · doas · anything requiring root):
+  → STOP before running. Explain what will run and why it needs elevation.
+  → Ask the user for explicit approval first.
+  → NEVER type, store, echo, log, hardcode, or pass a sudo/root password
+    through any command, script, arg, env var, or file. You never see or
+    handle the password yourself — the user enters it only when their own
+    terminal prompts for it, in an interactive/foreground session.
+  → If the environment is non-interactive (no way for the user to be
+    prompted), do not run it — tell the user to run it themselves and
+    report back the result.
+  → A failed privilege attempt (e.g. wrong password) goes back through
+    this same confirmation step — never silently retry.
+Dangerous commands (rm -rf · dd · mkfs · shutdown · iptables -F · chmod 000)
+  → warn user, explain the risk, wait for explicit confirmation
 Installs (pip · apt · npm · curl|bash · wget)
   → ask first: "I need [X] — ok to install?"
-
 Never expose passwords, API keys, or private data
 Never access files outside working directory
+This section applies unconditionally — it does not depend on whether
+core.terminal or any other skill happens to be ranked into view this turn.
 """
-
-
 def _load_metrics(skill_name: str) -> dict:
     """
     Load real metrics from storage for a skill, normalized to the
@@ -357,8 +319,6 @@ def _load_metrics(skill_name: str) -> dict:
         }
     except Exception:
         return {"success_count": 0, "failure_count": 0, "success_rate": 0.0}
-
-
 def _tokenize(text: str) -> set[str]:
     if not text:
         return set()
@@ -366,22 +326,17 @@ def _tokenize(text: str) -> set[str]:
         token for token in re.findall(r"[a-z0-9_]+", text.lower())
         if len(token) > 2 and token not in STOPWORDS
     }
-
-
 def _skill_token_set(skill) -> set[str]:
     tokens = set()
     for field in [skill.name, getattr(skill, "description", ""), *(skill.keywords or [])]:
         tokens.update(_tokenize(field))
     return tokens
-
-
 def _fmt_core_skill(skill) -> str:
     tools    = ", ".join(skill.mcp_tools or []) or "none"
     behavior = (skill.agent_behavior or "").strip()
     keywords = ", ".join(skill.keywords[:4]) if skill.keywords else "none"
     priority = getattr(skill, "priority", 0.5)
     version  = getattr(skill, "version", "1.0")
-
     rate = getattr(skill, "success_rate", None)
     if rate is not None:
         if rate > 0.85:   badge = " ✅ PROVEN"
@@ -391,7 +346,6 @@ def _fmt_core_skill(skill) -> str:
         else:             badge = f" 🟡 {int(rate*100)}%"
     else:
         badge = ""
-
     return (
         f"### {skill.name}{badge}\n"
         f"  Triggers : {keywords}\n"
@@ -399,8 +353,6 @@ def _fmt_core_skill(skill) -> str:
         f"  Priority : {priority}  v{version}\n"
         f"{behavior}\n"
     )
-
-
 def _fmt_generated_skill(skill) -> str:
     lines       = [l.strip() for l in (skill.agent_behavior or "").splitlines() if l.strip()]
     step1       = lines[0] if lines else "(no steps)"
@@ -411,17 +363,14 @@ def _fmt_generated_skill(skill) -> str:
     failure     = getattr(skill, "failure_count", 0)
     total       = success + failure
     rate        = (success / total * 100) if total > 0 else 0
-
     if total >= 10 and rate > 80:   status = "🔥 VERY HOT"
     elif total >= 5 and rate > 75:  status = "🟠 HOT"
     elif total >= 1 and rate >= 50: status = "🟡 WARMING"
     elif total == 0:                status = "❄️ UNTESTED"
     else:                           status = "🔵 COOL"
-
     # Show failure_modes if present
     failure_modes = getattr(skill, "failure_modes", "") or ""
     failure_line  = f"  Avoid  : {failure_modes[:100]}\n" if failure_modes else ""
-
     return (
         f"- **{skill.name}** {status}\n"
         f"  {description}\n"
@@ -430,8 +379,6 @@ def _fmt_generated_skill(skill) -> str:
         f"  Step 1: {step1}\n"
         f"{failure_line}"
     )
-
-
 def _enrich(skills: List) -> None:
     """Load real metrics from storage into each skill object."""
     for skill in skills:
@@ -439,8 +386,6 @@ def _enrich(skills: List) -> None:
         skill.success_count = m.get("success_count", 0)
         skill.failure_count = m.get("failure_count", 0)
         skill.success_rate  = m.get("success_rate", 0.0)
-
-
 def _rank(skills: List, goal: str) -> List:
     """Rank by task-language overlap, keyword match, and proven success rate."""
     goal_tokens = _tokenize(goal)
@@ -453,31 +398,23 @@ def _rank(skills: List, goal: str) -> List:
             ),
             reverse=True,
         )
-
     def score(skill) -> float:
         base = float(getattr(skill, "priority", 0.5))
         skill_tokens = _skill_token_set(skill)
         overlap = goal_tokens & skill_tokens
-
         if overlap:
             base += min(0.7, len(overlap) * 0.16)
-
         keyword_hits = 0
         for kw in skill.keywords or []:
             if _tokenize(kw) & goal_tokens:
                 keyword_hits += 1
         if keyword_hits:
             base += min(0.4, keyword_hits * 0.12)
-
         if any(token in goal_tokens for token in _tokenize(skill.name)):
             base += 0.08
-
         base += getattr(skill, "success_rate", 0.0) * 0.15
         return min(1.0, base)
-
     return sorted(skills, key=lambda s: score(s), reverse=True)
-
-
 def _fmt_plugin_tools_block(plugin_tools: Optional[dict]) -> str:
     """
     Render currently-loaded plugin tools so the model actually knows they
@@ -492,8 +429,6 @@ def _fmt_plugin_tools_block(plugin_tools: Optional[dict]) -> str:
     for name, description in sorted(plugin_tools.items()):
         lines.append(f"  {name} → {description}")
     return "\n".join(lines) + "\n"
-
-
 def _format_kv_context(goal: str, memory_context: str = "") -> str:
     facts = get_relevant_kv_facts(goal, n=3)
     if not facts:
@@ -504,8 +439,6 @@ def _format_kv_context(goal: str, memory_context: str = "") -> str:
     if memory_context:
         return f"{memory_context}\n\n" + "\n".join(lines)
     return "\n".join(lines)
-
-
 def build_system_prompt(
     core_skills: Optional[List]      = None,
     generated_skills: Optional[List] = None,
@@ -515,7 +448,6 @@ def build_system_prompt(
     plugin_tools: Optional[dict]     = None,
 ) -> str:
     skills_lines: List[str] = []
-
     if core_skills:
         _enrich(core_skills)
         ranked = _rank(core_skills, goal)
@@ -531,7 +463,6 @@ def build_system_prompt(
             skills_lines.append("")
         for skill in ranked[:12]:
             skills_lines.append(_fmt_core_skill(skill))
-
     if generated_skills:
         _enrich(generated_skills)
         ranked = _rank(generated_skills, goal)
@@ -543,17 +474,13 @@ def build_system_prompt(
         ]
         for skill in ranked[:12]:
             skills_lines.append(_fmt_generated_skill(skill))
-
     block  = "\n".join(skills_lines).strip()
     prompt = MAIN_SYSTEM_PROMPT.replace("{{SKILLS_BLOCK}}", block)
     prompt = prompt.replace("{{PLUGIN_TOOLS_BLOCK}}", _fmt_plugin_tools_block(plugin_tools))
-
     if memory_context:
         prompt += f"\n\n{_format_kv_context(goal, memory_context)}"
     elif goal:
         prompt += f"\n\n{_format_kv_context(goal)}"
-
     if extra:
         prompt += f"\n\n## CONTEXT\n{extra}"
-
     return prompt
