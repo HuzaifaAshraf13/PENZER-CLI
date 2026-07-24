@@ -10,7 +10,9 @@ import asyncio, json, re, time, logging
 from typing import Any
 from session.memory import remember_semantic, store_insight, store_post_mortem
 from agent.config import STUCK_MIN, ABSOLUTE_MAX_ITER, MAX_RUNTIME_SECONDS, MAX_TOKENS_PER_RUN
+
 logger = logging.getLogger(__name__)
+
 from agent.penzermodule.belief_manager import Phase
 
 # Matches a leading/trailing ``` or ```json fence. Previously this used
@@ -22,6 +24,7 @@ from agent.penzermodule.belief_manager import Phase
 # gets silently eaten). A regex anchored to the actual fence syntax is
 # correct instead of coincidentally-usually-correct.
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+
 
 class ReflectionManager:
     @staticmethod
@@ -40,13 +43,13 @@ class ReflectionManager:
                 # value of the shape the default implied, rather than
                 # raising out of what every caller treats as a safe parse.
                 return {} if default.strip().startswith("{") else []
+
     async def _evaluate_completion(self, agent, goal: str, result: str) -> tuple[bool | None, str]:
         """
         Returns (completed, reason). `completed` is a tri-state:
           True  — evaluator explicitly confirmed the goal was met
           False — evaluator explicitly confirmed it was not
           None  — evaluator timed out / errored / returned junk; unknown
-
         Previously any exception (including a timeout) returned `True`,
         i.e. a hung or erroring evaluator silently asserted success —
         exactly backwards for a check whose entire purpose is catching
@@ -78,6 +81,7 @@ class ReflectionManager:
         except Exception as e:
             logger.debug("Evaluate completion: %s", e)
             return None, "evaluator unavailable"
+
     async def _write_post_mortem_and_insights(self, agent, goal: str, result: str) -> None:
         worked = " -> ".join(
             f"{t['tool']}({agent._fmt_action(t['tool'], t['args'])})"
@@ -121,6 +125,7 @@ class ReflectionManager:
                 )
         except Exception as e:
             logger.debug("Post-mortem: %s", e)
+
     def _inject_meta_skill_reminder(self, agent):
         winning = " -> ".join(
             f"{t['tool']}({agent._fmt_action(t['tool'], t['args'])})"
@@ -135,13 +140,13 @@ class ReflectionManager:
             "3. Include: name, description, keywords, agent_behavior, failure_modes, mcp_tools.\n"
             "Then give your final answer."
         )})
+
     def _stuck(self, agent) -> bool:
         """
         Detects two kinds of stuck-ness: (a) the same tool result content
         repeating, or (b) the same tool+arguments signature repeating 3+
         times, within a small trailing window — plus a fallback of "the
         last STUCK_MIN trace entries all failed".
-
         The window is bounded by agent._resume_boundary_history_len (set
         alongside agent._resume_boundary_trace_len whenever a run is
         resumed) so this can't be fooled by stale pre-crash history.
@@ -175,7 +180,17 @@ class ReflectionManager:
         for m in w:
             if m.get("role") == "assistant":
                 try:
-                    for tc in json.loads(m["content"]).get("tool_calls", []):
+                    # NOTE: agent.py logs assistant turns to history using
+                    # the key "tools" (see agent.py's _loop(), the
+                    # `self.history.append({..., "content": json.dumps(
+                    # {"reasoning": text, "tools": calls})})` line) — not
+                    # "tool_calls". This must match that key exactly, or
+                    # this always reads an empty list and _stuck() loses
+                    # its signature-repetition check entirely (silently —
+                    # it would just fall through to the "all failed"
+                    # fallback below, never firing on a genuine repeated-
+                    # call loop that hasn't outright failed yet).
+                    for tc in json.loads(m["content"]).get("tools", []):
                         signatures.append(
                             f"{tc.get('name')}:{json.dumps(tc.get('arguments', {}), sort_keys=True)}"
                         )
@@ -189,6 +204,7 @@ class ReflectionManager:
         # construction, unlike the history-based checks above.
         recent = agent._trace[-STUCK_MIN:]
         return len(recent) >= STUCK_MIN and all(not s["success"] for s in recent)
+
     async def _reflect(self, agent) -> str:
         failed = "\n".join(
             f"  {s['tool']} -> {s.get('error_type','?')}: {s['result'][:80]}"
@@ -210,6 +226,7 @@ class ReflectionManager:
         except Exception as e:
             logger.debug("Reflect: %s", e)
             return "Try a completely different approach."
+
     def _can_extend_iterations(self, agent) -> bool:
         """
         Called only when about to hit the current iteration cap. Iteration
