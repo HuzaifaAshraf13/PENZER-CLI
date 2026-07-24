@@ -39,7 +39,13 @@ agent_behavior: |
 
   STEP 3 — AFTER COMPLETION
     - Save to memory: what worked, what was tricky, which step needed replanning
-    - If the plan was a repeatable pattern → hand off to core.meta to generate a skill
+    - If the plan was a repeatable pattern → generate the skill yourself,
+      following core.meta's GATE 1 / STEP 1-3 / TEMPLATE directly with
+      file_editor. There is no delegation between skills — skills are
+      static text matched into context by keyword overlap, not callable
+      agents you can hand a task to. Consulting core.meta here means
+      following its documented steps in this same turn, not invoking it
+      as if it were a tool.
 
   EXAMPLE PLAN
     Task: find and fix a bug in my code
@@ -51,7 +57,9 @@ agent_behavior: |
 
 priority: 0.9
 core: true
-version: "3.0"
+version: "3.1"
 ---
 # Task Planner
-Plan before acting. One step, one tool call, verify before continuing. Replan on failure.
+Plan before acting. One step, one tool call, verify before continuing. Replan
+on failure. Generate resulting skills directly with file_editor — no
+skill-to-skill handoff mechanism exists.

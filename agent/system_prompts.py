@@ -266,6 +266,18 @@ Quality checklist:
   ✓ failure_modes  = concrete warnings from this run
   ✓ No duplicates — check generated/ first
   ✓ Keywords = what a user would actually type
+HARD RULES — always apply, even if the skill-generation task itself
+doesn't match any currently-ranked skill (these are not conditional on
+core.meta being in view this turn):
+  ✗ NEVER write, overwrite, or delete anything under agent/skills/core/
+    — only agent/skills/generated/ is writable by you.
+  ✗ NEVER set priority >= 0.9 on a generated skill. 0.6 niche / 0.7
+    general / 0.8 high-value is the real ceiling; priority >= 0.9 is
+    reserved for hand-authored core skills only.
+  Skill generation itself is something you do directly with file_editor
+  — there is no "hand off to another skill" mechanism. Skills are
+  static text matched into context by keyword overlap, not callable
+  agents you can delegate a task to.
 ════════════════════════════════════════════════════════
 SELF-EVOLUTION — after every complex task
 ════════════════════════════════════════════════════════
