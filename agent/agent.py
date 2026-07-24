@@ -55,7 +55,9 @@ from agent.config import (
 # per-call timeouts (see _call_timeout there). Keeping an unused
 # same-named import here risked someone "fixing" a timeout issue by
 # editing agent.config.TOOL_TIMEOUT and finding nothing changes.
+
 logger = logging.getLogger(__name__)
+
 # Every manager PenzerAgent owns, wired up automatically in __init__ as
 # self.<attr_name> = <Class>(). To add a new manager module, add one
 # line here — see "ADDING A NEW MANAGER MODULE" in the module docstring.
@@ -88,12 +90,14 @@ def _install_shutdown_dispatcher() -> None:
     global _signal_installed
     if _signal_installed:
         return
+
     def _dispatch(signum, frame):
         for a in list(_LIVE_AGENTS):
             try:
                 a._handle_shutdown(signum, frame)
             except Exception:
                 logger.exception("Error dispatching shutdown to an agent instance")
+
     try:
         signal.signal(signal.SIGINT, _dispatch)
         _signal_installed = True
@@ -133,6 +137,7 @@ class PenzerAgent:
             setattr(self, attr, cls())
         _LIVE_AGENTS.add(self)
         _install_shutdown_dispatcher()
+
     def _reset(self):
         self._cache:               dict  = {}
         self._trace:               list  = []
@@ -235,13 +240,16 @@ class PenzerAgent:
             if not t.done():
                 t.cancel()
         self._background_tasks: set = set()
+
     def _handle_shutdown(self, signum, frame):
         self._shutdown = True
+
     def request_shutdown(self) -> None:
         """Public entry point for hosts that manage their own signal
         handling (or run agents off the main thread, where this process
         can't install a SIGINT handler at all) to request a graceful stop."""
         self._handle_shutdown(None, None)
+
     def _safe_status(self, message: str) -> None:
         """Wraps the user-supplied on_status callback. Now that
         _run_loop_safely exists, a bug in the callback (a broken UI hook,
@@ -253,6 +261,7 @@ class PenzerAgent:
             self.on_status(message)
         except Exception:
             logger.exception("on_status callback raised")
+
     def _spawn_background(self, coro, name: str) -> None:
         """Launch a fire-and-forget coroutine with actual tracking:
         added to self._background_tasks (so _reset() can cancel
@@ -262,13 +271,16 @@ class PenzerAgent:
         which only prints to stderr and is easy to miss in production."""
         task = asyncio.ensure_future(coro)
         self._background_tasks.add(task)
+
         def _on_done(t: asyncio.Task) -> None:
             self._background_tasks.discard(t)
             if not t.cancelled():
                 exc = t.exception()
                 if exc is not None:
                     logger.error("Background task '%s' failed: %s", name, exc)
+
         task.add_done_callback(_on_done)
+
     async def async_init(self) -> "PenzerAgent":
         try:
             import tools.tools
@@ -280,6 +292,7 @@ class PenzerAgent:
             logger.debug("MCP: %s", e)
         self.tools.setdefault("memory", "builtin")
         return self
+
     # ------------------------------------------------------------------
     # Persistence helper — used at every point the run might stop, get
     # interrupted, or hand off to a resume, so state on disk never goes
@@ -293,6 +306,7 @@ class PenzerAgent:
         set_execution_state({"state": self._resume_state})
         self._persist_resume_snapshot()
         self._flush_steps()
+
     # ------------------------------------------------------------------
     # Belief / memory / planner / execution / reflection / persistence
     # delegates — thin pass-throughs so callers keep using self._foo(...)
@@ -300,22 +314,31 @@ class PenzerAgent:
     # ------------------------------------------------------------------
     def _max_iter_for_complexity(self, score: float) -> int:
         return self.planner._max_iter_for_complexity(score)
+
     def _transition(self, to: Phase, reason: str = "") -> None:
         return self.belief._transition(self, to, reason)
+
     def _record_step(self, kind: str, description: str, **extra) -> dict:
         return self.memory._record_step(self, kind, description, **extra)
+
     def _flush_steps(self) -> None:
         return self.memory._flush_steps(self)
+
     def get_steps(self, n: int = 50) -> list[dict]:
         return self.memory.get_steps(self, n)
+
     def get_persisted_steps(self, run_id: str | None = None, n: int = 100) -> list[dict]:
         return self.memory.get_persisted_steps(self, run_id, n)
+
     def clear_run_steps(self, run_id: str | None = None) -> int:
         return self.memory.clear_run_steps(self, run_id)
+
     def _extract_json(self, text: str, default: str = "{}"):
         return self.reflection._extract_json(text, default)
+
     def _restore_snapshot(self, snapshot: dict) -> None:
         return self.persistence._restore_snapshot(self, snapshot)
+
     async def resume_last_task(self) -> str:
         snapshot = load_last_run()
         if not snapshot:
@@ -361,12 +384,16 @@ class PenzerAgent:
         self._resume_boundary_history_len = len(self.history)
         result = await self._run_loop_safely()
         return await self._finalize(self._goal, result)
+
     def list_plugin_tools(self) -> list[str]:
         return self.execution.list_plugin_tools(self)
+
     def _looks_like_memory_query(self, query: str) -> bool:
         return self.planner._looks_like_memory_query(self, query)
+
     def _match_core_skills(self, user_input: str) -> list:
         return self.planner._match_core_skills(self, user_input)
+
     async def _run_loop_safely(self) -> str:
         """Runs _loop() behind a top-level exception guard.
         Every known failure mode inside _loop already returns a clean
@@ -394,6 +421,7 @@ class PenzerAgent:
             except Exception:
                 logger.exception("Failed to persist state after unhandled loop exception")
             return f"Stopped: internal error ({type(e).__name__}: {e})"
+
     async def run(self, user_input: str) -> str:
         self._reset()
         self._goal             = user_input
@@ -489,6 +517,7 @@ class PenzerAgent:
         self._flush_steps()
         result = await self._run_loop_safely()
         return await self._finalize(user_input, result)
+
     async def _finalize(self, user_input: str, result: str) -> str:
         """
         Shared post-loop wrap-up for both `run()` and `resume_last_task()`.
@@ -542,44 +571,64 @@ class PenzerAgent:
             # persistence error mask a successful run.
             logger.exception("Error during _finalize bookkeeping")
         return result
+
     def _orchestrate_skills(self) -> None:
         return self.planner._orchestrate_skills(self)
+
     def _skill_plan_summary(self) -> str:
         return self.planner._skill_plan_summary(self)
+
     def _mark_skill_step_done(self, tool_name: str) -> None:
         return self.planner._mark_skill_step_done(self, tool_name)
+
     def _skills_for_tool(self, tool_name: str) -> list:
         return self.planner._skills_for_tool(self, tool_name)
+
     def _update_working_memory(self, tool: str, result: str, ok: bool) -> None:
         return self.memory._update_working_memory(self, tool, result, ok)
+
     def _persist_resume_snapshot(self) -> None:
         return self.persistence._persist_resume_snapshot(self)
+
     def _working_mem_summary(self) -> str:
         return self.memory._working_mem_summary(self)
+
     async def _plan_hierarchical(self, goal: str) -> list[dict]:
         return await self.planner._plan_hierarchical(self, goal)
+
     async def _replan_milestone(self, milestone: str, reason: str) -> list[str]:
         return await self.planner._replan_milestone(self, milestone, reason)
+
     def _tool_confidence(self, tool_name: str, args: dict) -> float:
         return self.execution._tool_confidence(self, tool_name, args)
+
     def _update_belief(self, tool: str, args: dict, result: str, ok: bool) -> None:
         return self.belief._update_belief(self, tool, args, result, ok)
+
     def _belief_summary(self) -> str:
         return self.belief._belief_summary(self)
+
     def _check_consistency(self) -> list[str]:
         return self.belief._check_consistency(self)
+
     async def _evaluate_completion(self, goal: str, result: str) -> tuple[bool | None, str]:
         return await self.reflection._evaluate_completion(self, goal, result)
+
     async def _write_post_mortem_and_insights(self, goal: str, result: str) -> None:
         return await self.reflection._write_post_mortem_and_insights(self, goal, result)
+
     def _build_execution_queue(self) -> None:
         return self.planner._build_execution_queue(self)
+
     def _claim_next_execution_item(self) -> dict | None:
         return self.planner._claim_next_execution_item(self)
+
     def _complete_current_execution_item(self, success: bool = True) -> None:
         return self.planner._complete_current_execution_item(self, success)
+
     def _can_extend_iterations(self) -> bool:
         return self.reflection._can_extend_iterations(self)
+
     # ------------------------------------------------------------------
     # Main loop and its per-iteration helpers. Each helper owns exactly
     # one job so a future change (new stop condition, new recovery path,
@@ -627,9 +676,20 @@ class PenzerAgent:
             empty = 0
             if text:
                 self._record_step("reasoning", text[:200])
+            # Use "tools" (not "tool_calls") as the history key here to
+            # match the schema llm.py's chat() actually parses back out
+            # on the next turn (data.get("tools") / data.get("tool")).
+            # Using a different key than what the model is taught to
+            # produce risked the model pattern-matching its own prior
+            # turns (very common) and echoing "tool_calls" back on a
+            # later turn — a key chat() never recognized, causing that
+            # entire response to fall through every schema check and get
+            # misreported as a stalled/garbled final answer instead of a
+            # real tool call. See llm.py's chat() for the corresponding
+            # parsing side of this.
             self.history.append({
                 "role": "assistant",
-                "content": json.dumps({"reasoning": text, "tool_calls": calls}),
+                "content": json.dumps({"reasoning": text, "tools": calls}),
             })
             if len(self._trace) - self._resume_boundary_trace_len >= STUCK_MIN and self._stuck():
                 stuck_result = await self._handle_stuck()
@@ -654,6 +714,7 @@ class PenzerAgent:
         # does with the result, e.g. _finalize's `result[:200]`).
         logger.error("_loop() fell through its for-loop body — this should be unreachable")
         return "Stopped: internal error (loop exited without a result)"
+
     def _check_stop_conditions(self, i: int) -> str | None:
         """Checks iteration/time/token/shutdown/resource limits for this
         iteration. Returns a terminal result string if the loop should
@@ -710,6 +771,7 @@ class PenzerAgent:
             self._persist_all()
             return f"Stopped: token budget exceeded ({tokens_used} tokens)"
         return None
+
     async def _pre_iteration_tasks(self, i: int) -> None:
         """Housekeeping that runs once per iteration before the LLM call:
         background history trim, status callback, claiming the next
@@ -743,6 +805,7 @@ class PenzerAgent:
             )
         if (i + 1) % CHECKPOINT_EVERY == 0:
             await self._checkpoint(i)
+
     def _apply_belief_updates(self, r: dict) -> None:
         """ReflAct belief-state fields are optional in the model's JSON
         output. Only overwrite when the model actually provides a
@@ -756,6 +819,7 @@ class PenzerAgent:
         new_unknowns = r.get("unknowns")
         if new_unknowns:
             self._belief["unknowns"] = [str(u)[:120] for u in new_unknowns][:5]
+
     def _handle_empty_calls(self, text: str, empty: int) -> tuple[str | None, int]:
         """Handles a model turn that proposed no tool calls: either a
         final answer (closes out the run) or a non-actionable turn
@@ -799,6 +863,7 @@ class PenzerAgent:
             self.history.append({"role": "user", "content":
                 f"Goal: {self._goal}\nGive final answer or call next tool."})
         return None, empty
+
     async def _handle_stuck(self) -> str | None:
         """Called once _stuck() has already been confirmed true. Tries
         milestone replanning first, then falls back to a general
@@ -844,6 +909,7 @@ class PenzerAgent:
         self._record_step("recovery", diagnosis[:200])
         self._transition(Phase.EXECUTING, reason="recovery attempted")
         return None
+
     def _filter_by_confidence(self, calls: list) -> list:
         """Drops proposed tool calls below the confidence threshold,
         logging a [Skipped] tool message into history for each one so
@@ -858,6 +924,7 @@ class PenzerAgent:
             else:
                 filtered_calls.append(c)
         return filtered_calls
+
     async def _execute_tool_calls(self, filtered_calls: list, i: int) -> None:
         """Runs the given tool calls (with speculative execution + a
         per-call fallback on error), records each result into
@@ -939,6 +1006,7 @@ class PenzerAgent:
         ):
             self._meta_skill_triggered = True
             self._inject_meta_skill_reminder()
+
     # ------------------------------------------------------------------
     # LLM call wrapper
     # ------------------------------------------------------------------
@@ -961,6 +1029,7 @@ class PenzerAgent:
         if content is not None and not isinstance(content, str):
             raise ValueError(f"LLM response 'content' was {type(content).__name__}, expected str")
         return r
+
     async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
         delay = RATE_LIMIT_BASE
         for attempt in range(max_attempts):
@@ -997,21 +1066,28 @@ class PenzerAgent:
                 return None
         self._last_llm_error = "rate_limit"
         return None
+
     # ------------------------------------------------------------------
     # Execution delegates
     # ------------------------------------------------------------------
     async def _execute_single_tool(self, call: dict) -> tuple[str, float]:
         return await self.execution._execute_single_tool(self, call)
+
     async def _run_speculative(self, calls: list) -> list[tuple[str, float]]:
         return await self.execution._run_speculative(self, calls)
+
     async def _run_race(self, calls: list) -> list[tuple[str, float]]:
         return await self.execution._run_race(self, calls)
+
     def _fallback_tool(self, tool_name: str) -> str | None:
         return self.execution._fallback_tool(self, tool_name)
+
     async def _run_with_fallback(self, call: dict, prior_result: tuple[str, float] | None = None) -> tuple[str, float]:
         return await self.execution._run_with_fallback(self, call, prior_result)
+
     async def _run_parallel(self, calls: list) -> list[tuple[str, float]]:
         return await self.execution._run_parallel(self, calls)
+
     def _msgs(self, step: int) -> list[dict]:
         if step == 0 or not self._trace:
             return self.history
@@ -1039,24 +1115,32 @@ class PenzerAgent:
             "Given belief state, working memory, and skill plan — execute next pending step."
         )
         return self.history + [{"role": "user", "content": inj}]
+
     def _inject_meta_skill_reminder(self):
         return self.reflection._inject_meta_skill_reminder(self)
+
     async def _run(self, name: str, args: dict) -> str:
         return await self.execution._run(self, name, args)
+
     def _run_memory_tool(self, args: dict) -> str:
         return self.execution._run_memory_tool(self, args)
+
     async def _maybe_auto_create_plugin(self) -> bool:
         return await self.execution._maybe_auto_create_plugin(self)
+
     def get_plugin_tool_descriptions(self) -> dict[str, str]:
         return self.execution.get_plugin_tool_descriptions(self)
+
     async def _run_plugin_tool(self, args: dict) -> str:
         return await self.execution._run_plugin_tool(self, args)
+
     # ------------------------------------------------------------------
     # Small pure formatting / classification helpers
     # ------------------------------------------------------------------
     def _fmt_action(self, name: str, args: dict) -> str:
         fmt = ACTION_FORMATTERS.get(name)
         return fmt(args) if fmt else f"-> {json.dumps(args)[:60]}"
+
     def _fmt_tool_output(self, name: str, args: dict, raw: Any, ok: bool, elapsed: float) -> str:
         hdr = f"[{name}] {self._fmt_action(name, args)} ({elapsed}s) {'ok' if ok else 'FAILED'}"
         if not ok:
@@ -1073,6 +1157,7 @@ class PenzerAgent:
         if name == "memory" and args.get("action") in ("store", "delete"):
             return f"{hdr}\nDone"
         return f"{hdr}\n{self._brief(raw)}"
+
     def _brief(self, raw: Any) -> str:
         s = str(raw).strip() or "(empty)"
         try:
@@ -1086,6 +1171,7 @@ class PenzerAgent:
         except (json.JSONDecodeError, ValueError):
             pass
         return s[:250] + f" … [{len(s)-250} more]" if len(s) > 250 else s
+
     def _is_error(self, r: Any) -> bool:
         """
         Prefers a structured signal when the tool returned one: if `r`
@@ -1116,6 +1202,7 @@ class PenzerAgent:
             "error", "failed", "exception", "traceback",
             "not found", "unknown tool", "permission denied", "timeout",
         ))
+
     def _is_timeout(self, r: Any) -> bool:
         """True specifically for the string _execute_single_tool produces
         on asyncio.TimeoutError ("Timeout after {N}s") — used to exclude
@@ -1129,6 +1216,7 @@ class PenzerAgent:
         its own error text — that IS a case where trying a different tool
         can plausibly help, so it should still be eligible for fallback)."""
         return bool(re.match(r"^Timeout after \d+s$", str(r).strip()))
+
     def _categorize_error(self, result: Any) -> str:
         """Prefers an explicit "error_type" from a structured {"status":
         "error", ...} envelope — a tool can be specific about its own
@@ -1146,22 +1234,28 @@ class PenzerAgent:
             if pattern in sl:
                 return label
         return "ERROR"
+
     def _last_role(self) -> str:
         for m in reversed(self.history):
             if m.get("role") in ("user", "assistant", "tool"):
                 return m["role"]
         return ""
+
     # ------------------------------------------------------------------
     # Reflection / persistence delegates
     # ------------------------------------------------------------------
     def _stuck(self) -> bool:
         return self.reflection._stuck(self)
+
     async def _reflect(self) -> str:
         return await self.reflection._reflect(self)
+
     async def _trim(self) -> None:
         return await self.persistence._trim(self)
+
     async def _checkpoint(self, iteration: int):
         return await self.persistence._checkpoint(self, iteration)
+
     # ------------------------------------------------------------------
     # Session lifecycle / metrics
     # ------------------------------------------------------------------
@@ -1170,6 +1264,7 @@ class PenzerAgent:
         self._reset()
         clear_history()
         clear_last_run()
+
     def get_metrics(self) -> dict:
         return {
             "goal":            self._goal,

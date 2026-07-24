@@ -16,9 +16,12 @@ from logger import get_logger, console as console
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state, kill_all_running, set_live_hooks
 from config import PROFILE_OPTIONS, get_profile_settings
+
 logger = get_logger("cli")
+
 from agent.agent import PenzerAgent
 from agent.server import start_server
+
 for _log in [
     "agent.agent", "agent.penzermodule", "penzer.core", "penzer.server",
     "agent.skills.search", "agent.skills.loader",
@@ -26,6 +29,8 @@ for _log in [
     "tools.executor", "tools.plugins",
 ]:
     logging.getLogger(_log).setLevel(logging.WARNING)
+
+
 def compose_summary_lines(matched: list[str] | None = None, trace: list | None = None, calls_used: int = 0, tokens_used: int = 0) -> list[str]:
     """Generate formatted status lines with rich formatting."""
     lines = []
@@ -39,6 +44,8 @@ def compose_summary_lines(matched: list[str] | None = None, trace: list | None =
         llm_text = f"[bold cyan]LLM:[/] [magenta]{calls_used}[/] calls [dim]·[/] ~[magenta]{tokens_used}[/] tokens"
         lines.append(llm_text)
     return lines
+
+
 class LiveStatusView:
     def __init__(self) -> None:
         self.current = "[dim]Starting…[/]"
@@ -60,6 +67,7 @@ class LiveStatusView:
             self.current = message
             self.events.append(message)
             self.events = self.events[-6:]
+
     def render(self) -> str:
         with self._lock:
             lines = []
@@ -74,28 +82,57 @@ class LiveStatusView:
                 first_state = state.splitlines()[0]
                 lines.append(f"  [dim]↳[/] {first_state}")
             return "\n".join(lines)
+
+
 def clean_response(text: str) -> str:
-    """Clean and parse CLI response text with robust error handling."""
+    """Clean and parse CLI response text with robust error handling.
+
+    By the time a response reaches here, agent.run()/resume_last_task()
+    has already returned — the run loop has fully finished (successfully,
+    or by giving up/erroring out with an explanatory message). There is
+    no legitimate case where the *final* result string still contains an
+    unresolved tool call: agent.py's _loop() only exits with a final
+    string once the model gave a real answer (_handle_empty_calls) or the
+    run was stopped for a specific, already-explained reason (iteration
+    limit, timeout, resource limit, etc). So if this text still parses as
+    JSON containing a tool/tools/tool_calls key, that's not "the task is
+    still executing" — it's evidence something upstream (most likely
+    llm.py's response parser) failed to fully resolve a model response,
+    and the raw JSON leaked through as the "final answer" by mistake.
+    We still want a readable message here rather than dumping raw JSON at
+    the user, but we log it so the actual cause (an llm.py/agent.py
+    schema mismatch) doesn't go unnoticed.
+    """
     if not text:
         return ""
-
     text = text.strip()
     try:
         data = json.loads(text)
         if isinstance(data, dict):
-            if data.get("tool_calls") or data.get("tool"):
-                return "Executing task..."
+            # Accept "tool"/"tools" (llm.py's recognized schema) as well
+            # as "tool_calls" (agent.py's history-entry key) — any of
+            # these leaking through as a "final" response means the run
+            # ended on an unresolved/garbled model turn rather than a
+            # genuine answer, not that the task is actively in progress.
+            if data.get("tool_calls") or data.get("tools") or data.get("tool"):
+                logger.warning(
+                    "clean_response received a final result still containing "
+                    "an unresolved tool-call payload — this indicates the run "
+                    "ended on a malformed LLM response rather than a real "
+                    "final answer: %s", text[:200],
+                )
+                return "The task ended before producing a final answer (a malformed model response was returned). Please try rephrasing or running again."
             return data.get("answer") or data.get("thought") or data.get("content") or text
     except (json.JSONDecodeError, ValueError) as e:
         logger.debug(f"Failed to parse response JSON: {e}")
     except Exception as e:
         logger.warning(f"Unexpected error parsing response: {e}")
-
     # Fallback to basic cleaning if JSON parsing fails
     if text and text[0] in "⏳🔑🔐⚠️🔌⏱️🌐❌":
         return text
     text = re.sub(r'^(thought|answer)\s*:\s*', '', text, flags=re.IGNORECASE).strip()
     text = re.sub(r'```[\w]*\n?', '', text).strip()
+
     def strip_json_blocks(s: str) -> str:
         result, depth, in_string, escape = [], 0, False, False
         for ch in s:
@@ -117,8 +154,11 @@ def clean_response(text: str) -> str:
             if depth == 0:
                 result.append(ch)
         return ''.join(result).strip()
+
     text = strip_json_blocks(text)
     return text.strip() or "Done."
+
+
 def build_help_text() -> str:
     return "\n".join([
         "[bold]Commands[/bold]",
@@ -135,6 +175,8 @@ def build_help_text() -> str:
         "• [cyan]benchmark[/cyan]  Show a lightweight quality summary",
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
+
+
 PENZER_LOGO = r"""
  ____   _____   _   _   _____   _____   ____
 |  _ \ | ____| | \ | | |__  / | ____| |  _ \
@@ -142,6 +184,8 @@ PENZER_LOGO = r"""
 |  __/ | |___  | |\  |  / /_  | |___  |  _ <
 |_|    |_____| |_| \_| /____| |_____| |_| \_\
 """.strip("\n")
+
+
 def display_banner():
     console.print(f"[bold red]{PENZER_LOGO}")
     console.print(Panel(
@@ -151,8 +195,12 @@ def display_banner():
         border_style="red",
         padding=(0, 1),
     ))
+
+
 def display_help():
     console.print(Panel(build_help_text(), title="Help", border_style="cyan", padding=(0, 1)))
+
+
 def maybe_notify_update() -> None:
     try:
         result = check_for_update()
@@ -163,8 +211,12 @@ def maybe_notify_update() -> None:
             console.print()
     except Exception:
         pass
+
+
 def _env_path() -> Path:
     return Path(".env")
+
+
 def _read_env() -> dict[str, str]:
     env = {}
     path = _env_path()
@@ -178,6 +230,8 @@ def _read_env() -> dict[str, str]:
         key, value = line.split("=", 1)
         env[key.strip()] = value.strip().strip('"').strip("'")
     return env
+
+
 def _write_env(updates: dict[str, str]) -> None:
     path = _env_path()
     existing_lines = []
@@ -201,10 +255,14 @@ def _write_env(updates: dict[str, str]) -> None:
         if key not in existing_keys:
             existing_lines.append(f'{key}="{value}"')
     path.write_text("\n".join(existing_lines).strip() + "\n", encoding="utf-8")
+
+
 def _mask_key(key: str) -> str:
     if not key:
         return "(none)"
     return key if len(key) <= 8 else f"{key[:4]}...{key[-4:]}"
+
+
 def _handle_apikey_command(user_input: str) -> None:
     tokens = user_input.split()
     if len(tokens) == 1 or tokens[1] in ("help", "show"):
@@ -233,8 +291,11 @@ def _handle_apikey_command(user_input: str) -> None:
     console.print("  apikey set <API_KEY> <URL>")
     console.print("  apikey local <LOCAL_SERVER_URL>")
     console.print("[dim]Example: apikey set mykey https://api.openai.com/v1[/dim]")
+
+
 class ShutdownHandler:
     """Handles graceful shutdown of CLI components."""
+
     def __init__(self):
         self._should_exit = threading.Event()
         self._cleanup_handlers: list[Callable] = []
@@ -247,10 +308,8 @@ class ShutdownHandler:
         """Initiate graceful shutdown."""
         if self._should_exit.is_set():
             return
-
         logger.info("Initiating graceful shutdown...")
         self._should_exit.set()
-
         # Run cleanup handlers in reverse order
         for handler in reversed(self._cleanup_handlers):
             try:
@@ -261,6 +320,8 @@ class ShutdownHandler:
     def should_exit(self) -> bool:
         """Check if shutdown was requested."""
         return self._should_exit.is_set()
+
+
 def safe_subprocess_run(*args, **kwargs) -> subprocess.CompletedProcess:
     """Wrapper for subprocess.run with enhanced error handling."""
     try:
@@ -556,6 +617,8 @@ async def main():
         console.print(f"\n[red bold]ERROR: {str(e)}[/red bold]")
         import traceback
         traceback.print_exc()
+
+
 def main_entrypoint():
     try:
         asyncio.run(main())
@@ -568,6 +631,7 @@ def main_entrypoint():
         # here, can. Without this, Penzer would exit via an unhandled
         # traceback instead of a clean message.
         console.print("\n[dim]Interrupted. Goodbye.[/dim]")
+
 
 if __name__ == "__main__":
     main_entrypoint()

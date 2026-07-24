@@ -6,15 +6,16 @@ import os
 import json
 import re
 import asyncio
+import logging
 import httpx
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent
 RETRY_DELAYS = [0, 2, 4, 8, 16]
-
 # HTTP status codes that we retry with backoff (rate limiting + transient server errors)
 # 401/403 are NOT retried – they indicate authentication issues.
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -73,10 +74,8 @@ class LLMModel:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-
         # If the URL already ends with /v1, don't add another one
         base = self.url if "/v1" in self.url else f"{self.url}/v1"
-
         payload = {
             "model": self.model_name,
             "messages": messages,
@@ -148,11 +147,9 @@ class LLM:
 
     def _init_model(self) -> LLMModel:
         load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
-
         local_url = os.getenv("LOCAL_SERVER_URL", "").strip().strip("\"'")
         api_key   = os.getenv("API_KEY", "").strip().strip("\"'")
         api_url   = os.getenv("URL", "").strip().strip("\"'")
-
         if local_url:
             print("[LLM] Auto-detected: Local server")
             return LLMModel("", local_url)
@@ -177,14 +174,12 @@ class LLM:
                 if end > start:
                     text = text[start:end].strip()
                     break
-
         text = text.strip()
         # Try direct parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
-
         # Try to find a JSON object anywhere in the text
         start = text.find("{")
         if start == -1:
@@ -206,22 +201,17 @@ class LLM:
         tool_calls = []
         pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
         matches = list(pattern.finditer(text))
-
         if not matches:
             return [], text
-
         # Remove all <tool_call> blocks from the original text
         cleaned = pattern.sub('', text).strip()
-
         for idx, match in enumerate(matches):
             inner = match.group(1).strip()
-
             # Extract function name: <function=NAME> or <function>NAME</function>
             func_match = re.search(r'<function[=>]\s*(\w+)', inner)
             if not func_match:
                 continue
             func_name = func_match.group(1)
-
             # Extract parameters: <parameter=KEY> VALUE
             args = {}
             param_matches = re.finditer(
@@ -231,20 +221,17 @@ class LLM:
                 key = pm.group(1)
                 value = pm.group(2).strip()
                 args[key] = value
-
             # If no parameter tags, use the inner text after the function tag as "command"
             if not args:
                 inner_without_func = re.sub(r'<function[=>]\s*\w+\s*>', '', inner).strip()
                 if inner_without_func:
                     args = {"command": inner_without_func}
-
             if func_name:
                 tool_calls.append({
                     "id": f"tool_call_{idx + 1}",
                     "name": func_name,
                     "arguments": args
                 })
-
         return tool_calls, cleaned
 
     # ---------- Retry logic ----------
@@ -276,7 +263,6 @@ class LLM:
           - unknowns (list): optional belief-state fields
         """
         prompt = [{"role": "system", "content": system}] + messages
-
         try:
             raw = await self._call_with_backoff(prompt)
             self.call_count += 1
@@ -359,13 +345,29 @@ class LLM:
                     "unknowns": unknowns,
                 }
 
-            # Final answer (no tool call)
-            return {
-                "content": answer or raw.strip(),
-                "tool_calls": [],
-                "assumptions": assumptions,
-                "unknowns": unknowns,
-            }
+            # Final answer (no tool call) — but only if the model actually
+            # gave us an answer/thought field. If none of the known keys
+            # ("answer", "thought", "tool", "tools") were present, this
+            # JSON blob doesn't match any schema we taught the model —
+            # most commonly the model echoing back the history's
+            # "tools" key (used internally by agent.py's assistant-turn
+            # log entries) under a slightly different name, or some other
+            # malformed structure. Returning the raw JSON as "content"
+            # here would let it silently pass through _loop() in agent.py
+            # as a bogus final answer (and later get flagged by cli.py's
+            # clean_response() as "still executing", which is exactly
+            # backwards — the run has actually stalled, not progressed).
+            # Fall through to the "no recognized schema" handling below,
+            # which the caller (agent.py's _llm_with_retry / _loop) treats
+            # as an empty/non-actionable turn and prompts the model to
+            # continue, rather than ending the run.
+            if answer:
+                return {
+                    "content": answer,
+                    "tool_calls": [],
+                    "assumptions": assumptions,
+                    "unknowns": unknowns,
+                }
 
         # --- XML tool calls (fallback) ---
         tool_calls, cleaned = self._parse_xml_tool_calls(raw)
@@ -377,7 +379,19 @@ class LLM:
                 "unknowns": [],
             }
 
-        # --- No structured tool call found – return raw text ---
+        # --- No structured tool call found ---
+        # If `raw` parsed as JSON (data is not None) but matched none of
+        # the schemas above (no answer/thought/tool/tools, and no XML
+        # tool_call tags either), don't hand the raw JSON string back as
+        # if it were a genuine final answer — that lets a malformed or
+        # echoed response silently masquerade as real content downstream.
+        # Treat it as an empty response instead, so agent.py's _loop()
+        # nudges the model to continue rather than ending the run on
+        # garbage. Only genuinely unstructured plain-text output falls
+        # through to the raw-text return.
+        if data is not None:
+            logger.warning("LLM returned JSON with no recognized schema: %s", raw[:200])
+            return {"content": "", "tool_calls": [], "assumptions": [], "unknowns": []}
         return {"content": raw.strip(), "tool_calls": [], "assumptions": [], "unknowns": []}
 
 
