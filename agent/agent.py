@@ -676,20 +676,32 @@ class PenzerAgent:
             empty = 0
             if text:
                 self._record_step("reasoning", text[:200])
-            # Use "tools" (not "tool_calls") as the history key here to
-            # match the schema llm.py's chat() actually parses back out
-            # on the next turn (data.get("tools") / data.get("tool")).
-            # Using a different key than what the model is taught to
-            # produce risked the model pattern-matching its own prior
-            # turns (very common) and echoing "tool_calls" back on a
-            # later turn — a key chat() never recognized, causing that
-            # entire response to fall through every schema check and get
-            # misreported as a stalled/garbled final answer instead of a
-            # real tool call. See llm.py's chat() for the corresponding
-            # parsing side of this.
+            # Two things have to match what llm.py's chat() actually
+            # parses back out on the model's *next* turn:
+            #   1. the wrapper key — "tools", not "tool_calls".
+            #   2. the shape of each call inside it — {"tool", "args"},
+            #      not {"name", "arguments"}.
+            # `calls` here uses "name"/"arguments" because that's llm.py's
+            # own internal normalization (used regardless of whether the
+            # model's response came in old single-tool, new tools-array,
+            # or XML form). Writing that internal shape straight into
+            # history would show the model a DIFFERENT schema than the
+            # one it's actually taught to produce ("tool"/"args") — and a
+            # model that pattern-matches its own prior turns (very
+            # common) can drift into echoing "name"/"arguments" back,
+            # which chat() doesn't recognize, causing that turn to fall
+            # through every schema check. Converting back to the taught
+            # shape here keeps the transcript internally consistent with
+            # what the system prompt teaches, closing that loophole too.
             self.history.append({
                 "role": "assistant",
-                "content": json.dumps({"reasoning": text, "tools": calls}),
+                "content": json.dumps({
+                    "reasoning": text,
+                    "tools": [
+                        {"tool": c.get("name", ""), "args": c.get("arguments", {})}
+                        for c in calls
+                    ],
+                }),
             })
             if len(self._trace) - self._resume_boundary_trace_len >= STUCK_MIN and self._stuck():
                 stuck_result = await self._handle_stuck()

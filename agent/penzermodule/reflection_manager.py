@@ -180,20 +180,31 @@ class ReflectionManager:
         for m in w:
             if m.get("role") == "assistant":
                 try:
-                    # NOTE: agent.py logs assistant turns to history using
-                    # the key "tools" (see agent.py's _loop(), the
-                    # `self.history.append({..., "content": json.dumps(
-                    # {"reasoning": text, "tools": calls})})` line) — not
-                    # "tool_calls". This must match that key exactly, or
-                    # this always reads an empty list and _stuck() loses
-                    # its signature-repetition check entirely (silently —
-                    # it would just fall through to the "all failed"
-                    # fallback below, never firing on a genuine repeated-
-                    # call loop that hasn't outright failed yet).
-                    for tc in json.loads(m["content"]).get("tools", []):
-                        signatures.append(
-                            f"{tc.get('name')}:{json.dumps(tc.get('arguments', {}), sort_keys=True)}"
-                        )
+                    entry = json.loads(m["content"])
+                    # agent.py's _loop() writes each assistant turn's tool
+                    # calls back into history using the SAME "tool"/"args"
+                    # shape the system prompt teaches the model to
+                    # produce (see system_prompts.py's OUTPUT FORMAT /
+                    # Tool syntax sections) — not the internal
+                    # "name"/"arguments" normalization llm.py uses
+                    # between itself and agent.py. Reading the wrong key
+                    # pair here doesn't error, it just silently returns
+                    # an empty signatures list every time, so this
+                    # specific repeated-call check never fires — it
+                    # degrades to relying only on the "all recent trace
+                    # entries failed" fallback below, missing genuine
+                    # stuck-in-a-loop cases that haven't outright failed
+                    # yet (e.g. re-running the same successful-but-
+                    # useless command over and over). Accept both key
+                    # pairs defensively — "tool"/"args" (current,
+                    # canonical) and "name"/"arguments" (older history
+                    # entries written before this fix, or a model that
+                    # drifted into echoing the internal shape) — so this
+                    # keeps working across both old and new transcripts.
+                    for tc in entry.get("tools", []):
+                        name = tc.get("tool") or tc.get("name") or ""
+                        args = tc.get("args") if "args" in tc else tc.get("arguments", {})
+                        signatures.append(f"{name}:{json.dumps(args, sort_keys=True)}")
                 except Exception:
                     pass
         if len(signatures) >= 3 and len(set(signatures)) == 1:

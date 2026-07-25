@@ -316,11 +316,21 @@ class LLM:
                 for idx, t in enumerate(tools_array):
                     if not isinstance(t, dict):
                         continue
-                    tname = str(t.get("tool", "")).strip()
-                    targs = t.get("args", {})
+                    # Accept both the older {"tool": ..., "args": ...} shape
+                    # and the {"name": ..., "arguments": ...} shape used by
+                    # agent.py's own history entries (and echoed back by
+                    # models that pattern-match their own prior turns) —
+                    # without this, a "tools" array using name/arguments
+                    # parsed as zero valid tool_calls (tname stayed empty),
+                    # fell through every schema check, and the turn was
+                    # wrongly reported as "no recognized schema" even
+                    # though it was a perfectly valid tool call.
+                    tname = str(t.get("tool") or t.get("name") or "").strip()
+                    targs = t.get("args") if "args" in t else t.get("arguments", {})
+                    tid = t.get("id") or f"tool_call_{idx + 1}"
                     if tname:
                         tool_calls.append({
-                            "id": f"tool_call_{idx + 1}",
+                            "id": tid,
                             "name": tname,
                             "arguments": targs if isinstance(targs, dict) else {},
                         })
@@ -380,17 +390,28 @@ class LLM:
             }
 
         # --- No structured tool call found ---
-        # If `raw` parsed as JSON (data is not None) but matched none of
-        # the schemas above (no answer/thought/tool/tools, and no XML
-        # tool_call tags either), don't hand the raw JSON string back as
-        # if it were a genuine final answer — that lets a malformed or
-        # echoed response silently masquerade as real content downstream.
-        # Treat it as an empty response instead, so agent.py's _loop()
-        # nudges the model to continue rather than ending the run on
-        # garbage. Only genuinely unstructured plain-text output falls
-        # through to the raw-text return.
-        if data is not None:
-            logger.warning("LLM returned JSON with no recognized schema: %s", raw[:200])
+        # chat() is used for two different kinds of prompts: agent.py's
+        # tool-calling turns (which follow the answer/thought/tool/tools
+        # schema handled above) AND other callers — e.g.
+        # reflection_manager.py's completion evaluator and post-mortem
+        # writer — that ask for their own unrelated JSON schemas
+        # ("completed"/"reason", "what_worked"/"what_failed"/...) and
+        # parse the returned content themselves via agent._extract_json().
+        # Those callers need the raw content regardless of whether it
+        # matches the tool-calling schema, so unrecognized JSON must NOT
+        # be suppressed in general — only the specific leak pattern this
+        # was originally guarding against: a payload that LOOKS like a
+        # tool-calling turn (has a "tool", "tools", or "tool_calls" key —
+        # most commonly the model echoing that shape back from its own
+        # history) but produced no usable tool_calls and no answer. That
+        # specific shape is never valid content for ANY caller, so it's
+        # still safe to suppress instead of letting it leak through as a
+        # bogus final answer (see agent.py's _loop() / cli.py's
+        # clean_response()). Anything else — including schemas chat()
+        # doesn't recognize at all, like the evaluator/post-mortem JSON —
+        # is returned as-is so the caller can parse it in its own way.
+        if isinstance(data, dict) and any(k in data for k in ("tool", "tools", "tool_calls")):
+            logger.warning("LLM returned an unresolved tool-call-shaped payload with no usable content: %s", raw[:200])
             return {"content": "", "tool_calls": [], "assumptions": [], "unknowns": []}
         return {"content": raw.strip(), "tool_calls": [], "assumptions": [], "unknowns": []}
 
