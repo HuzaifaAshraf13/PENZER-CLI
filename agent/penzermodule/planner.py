@@ -8,8 +8,10 @@ the agent needs to change.
 """
 import logging
 import asyncio, re
+from functools import lru_cache
 from session.memory import get_relevant_kv_facts
 from agent.config import ITER_BY_COMPLEXITY
+
 logger = logging.getLogger(__name__)
 
 # Fix #12: the old check was `cue in q` (plain substring), so "my " and
@@ -26,6 +28,32 @@ _MEMORY_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 
+
+@lru_cache(maxsize=256)
+def _keyword_re(keyword: str) -> re.Pattern:
+    """Compile (and cache) a word-boundary regex for a single skill
+    keyword. Same fix as _MEMORY_CUE_RE above (Fix #12), applied to
+    per-skill keyword matching in _match_core_skills — that method was
+    still using plain substring containment (`k.lower() in lowered`),
+    which has exactly the same false-positive problem the memory-cue
+    check was already fixed for. Short, common keywords make this
+    concrete: a skill listing "ip" as a keyword (e.g. core.terminal, for
+    networking tasks) would substring-match inside "multiple", "equip",
+    "trip", "zip", "recipe"; "mac" matches inside "machine"/"macro";
+    "lan" matches inside "plan"/"landing". Any of those would silently
+    pull an unrelated skill's full agent_behavior into the prompt for a
+    task that has nothing to do with it. \\b anchors the match to actual
+    word boundaries so "ip" only matches the standalone token "ip", not
+    "ip" as a substring of a longer word. re.escape guards against a
+    keyword containing regex-special characters (e.g. "c++", "a/b")
+    being interpreted as regex syntax instead of literal text.
+    Cached per keyword string since the same core-skill keyword lists
+    get checked against every new user_input — recompiling the same
+    handful of patterns on every call is wasted work.
+    """
+    return re.compile(r"\b" + re.escape(keyword) + r"\b", re.IGNORECASE)
+
+
 class Planner:
     @staticmethod
     def _max_iter_for_complexity(score: float) -> int:
@@ -34,21 +62,30 @@ class Planner:
         if score < 0.6:
             return ITER_BY_COMPLEXITY["medium"]
         return ITER_BY_COMPLEXITY["complex"]
+
     def _looks_like_memory_query(self, agent, query: str) -> bool:
         return bool(_MEMORY_CUE_RE.search(query))
+
     def _match_core_skills(self, agent, user_input: str) -> list:
         lowered = user_input.lower()
         matched = []
         facts = get_relevant_kv_facts(user_input, n=3)
         for skill in agent.core_skills:
             skill_name = (skill.name or "").lower()
-            keyword_hit = any(k.lower() in lowered for k in skill.keywords or [])
+            # Word-boundary match instead of substring containment — see
+            # _keyword_re's docstring above for why this matters with
+            # short keywords like "ip"/"mac"/"lan".
+            keyword_hit = any(
+                _keyword_re(k.lower()).search(lowered)
+                for k in (skill.keywords or []) if k
+            )
             if keyword_hit:
                 matched.append(skill)
                 continue
             if "memory" in skill_name and (facts or agent._looks_like_memory_query(lowered)):
                 matched.append(skill)
         return matched
+
     def _orchestrate_skills(self, agent) -> None:
         agent._skill_plan  = []
         agent._skill_steps = {s.name: 0 for s in agent._active_skills}
@@ -67,6 +104,7 @@ class Planner:
         agent._skill_plan.sort(key=lambda s: next(
             (i for i, t in enumerate(tool_order) if t in s["tools"]), len(tool_order)
         ))
+
     def _skill_plan_summary(self, agent) -> str:
         if not agent._skill_plan:
             return ""
@@ -77,6 +115,7 @@ class Planner:
         for s in pending:
             lines.append(f"  [{s['skill']}] step {s['step']+1}: {s['instruction'][:80]}")
         return "\n".join(lines)
+
     def _mark_skill_step_done(self, agent, tool_name: str) -> None:
         """Credits progress per-skill instead of stopping at the first
         match in the merged, tool-sorted plan. The merged plan interleaves
@@ -100,9 +139,11 @@ class Planner:
                 agent._skill_steps[skill_name] = step["step"] + 1
                 if all(s["done"] for s in agent._skill_plan if s["skill"] == skill_name):
                     agent._skill_done.add(skill_name)
+
     def _skills_for_tool(self, agent, tool_name: str) -> list:
         return [s for s in agent._active_skills
                 if not set(s.mcp_tools or []) or tool_name in set(s.mcp_tools or [])]
+
     async def _plan_hierarchical(self, agent, goal: str) -> list[dict]:
         """
         Level 1: 3-5 high-level milestones
@@ -134,6 +175,7 @@ class Planner:
             logger.debug("Hierarchical planner: %s", e)
         agent._record_step("planning", "No hierarchical plan needed — proceeding directly.")
         return []
+
     async def _replan_milestone(self, agent, milestone: str, reason: str) -> list[str]:
         """Replan only the failed milestone branch — not the whole task."""
         try:
@@ -152,12 +194,12 @@ class Planner:
         except Exception as e:
             logger.debug("Replan: %s", e)
         return []
+
     def _requeue_milestone_steps(self, agent, milestone_idx: int, new_steps: list[str]) -> None:
         """
         Splices newly-replanned steps for `milestone_idx` into the live
         execution queue at the current position, so _claim_next_execution_item
         actually serves them on the next turn.
-
         Previously a successful replan only wrote to agent._subtasks /
         agent._subtask_idx, which nothing in the claim path reads —
         _claim_next_execution_item re-derives _subtasks wholesale from
@@ -174,7 +216,6 @@ class Planner:
         work complete. Give final answer." even though the last step had
         just failed, and cleared agent._milestones, silently disabling
         milestone-based replanning for the rest of the run.
-
         This method fixes the root cause by actually inserting the new
         steps into agent._execution_queue (and keeping agent._milestones'
         own step list in sync, since that's what re-derives _subtasks
@@ -189,6 +230,7 @@ class Planner:
         ]
         agent._execution_queue[agent._execution_index:agent._execution_index] = new_items
         agent._execution_complete = False
+
     def _build_execution_queue(self, agent) -> None:
         agent._execution_queue = []
         agent._execution_index = 0
@@ -214,6 +256,7 @@ class Planner:
                         "milestone_idx": milestone_idx,
                         "step_index": step_idx,
                     })
+
     def _claim_next_execution_item(self, agent) -> dict | None:
         if agent._execution_complete:
             return None
@@ -231,6 +274,7 @@ class Planner:
         else:
             agent._subtasks = getattr(agent, "_subtasks", [])
         return item
+
     _MAX_ITEM_RETRIES = 1
 
     def _complete_current_execution_item(self, agent, success: bool = True) -> None:
