@@ -8,9 +8,9 @@ the agent needs to change.
 """
 import logging
 import asyncio, re
-from functools import lru_cache
 from session.memory import get_relevant_kv_facts
 from agent.config import ITER_BY_COMPLEXITY
+from agent.system_prompts import _tokenize, _skill_token_set
 
 logger = logging.getLogger(__name__)
 
@@ -29,31 +29,6 @@ _MEMORY_CUE_RE = re.compile(
 )
 
 
-@lru_cache(maxsize=256)
-def _keyword_re(keyword: str) -> re.Pattern:
-    """Compile (and cache) a word-boundary regex for a single skill
-    keyword. Same fix as _MEMORY_CUE_RE above (Fix #12), applied to
-    per-skill keyword matching in _match_core_skills — that method was
-    still using plain substring containment (`k.lower() in lowered`),
-    which has exactly the same false-positive problem the memory-cue
-    check was already fixed for. Short, common keywords make this
-    concrete: a skill listing "ip" as a keyword (e.g. core.terminal, for
-    networking tasks) would substring-match inside "multiple", "equip",
-    "trip", "zip", "recipe"; "mac" matches inside "machine"/"macro";
-    "lan" matches inside "plan"/"landing". Any of those would silently
-    pull an unrelated skill's full agent_behavior into the prompt for a
-    task that has nothing to do with it. \\b anchors the match to actual
-    word boundaries so "ip" only matches the standalone token "ip", not
-    "ip" as a substring of a longer word. re.escape guards against a
-    keyword containing regex-special characters (e.g. "c++", "a/b")
-    being interpreted as regex syntax instead of literal text.
-    Cached per keyword string since the same core-skill keyword lists
-    get checked against every new user_input — recompiling the same
-    handful of patterns on every call is wasted work.
-    """
-    return re.compile(r"\b" + re.escape(keyword) + r"\b", re.IGNORECASE)
-
-
 class Planner:
     @staticmethod
     def _max_iter_for_complexity(score: float) -> int:
@@ -67,19 +42,35 @@ class Planner:
         return bool(_MEMORY_CUE_RE.search(query))
 
     def _match_core_skills(self, agent, user_input: str) -> list:
+        """
+        A skill is activated when there's meaningful token overlap
+        between the goal and that skill's name + description + keywords
+        combined (via _skill_token_set, shared with system_prompts.py's
+        _rank()) — not just an exact hit against a hand-maintained
+        keywords list. A skill's description sentence (closer to how a
+        person actually phrases a request than a curated keyword list)
+        pulls its own weight here, so a newly-worded task doesn't
+        require someone to remember to update `keywords:` for it to be
+        found. This also gets word-boundary matching for free (short
+        keywords like "ip"/"mac"/"lan" no longer substring-match inside
+        unrelated words like "multiple"/"machine"/"plan"), since
+        _tokenize splits on real word boundaries rather than doing
+        substring search.
+        No skill (including terminal) is treated as unconditionally
+        active — every skill, terminal included, has to actually match
+        the task's wording/description overlap to be included. Keeping
+        terminal's own `keywords`/`description` broad enough to cover
+        the tasks it should legitimately handle (rather than special-
+        casing it here to bypass matching) is what keeps this scoped —
+        see terminal.skill.md's keyword list.
+        """
         lowered = user_input.lower()
+        goal_tokens = _tokenize(user_input)
         matched = []
         facts = get_relevant_kv_facts(user_input, n=3)
         for skill in agent.core_skills:
             skill_name = (skill.name or "").lower()
-            # Word-boundary match instead of substring containment — see
-            # _keyword_re's docstring above for why this matters with
-            # short keywords like "ip"/"mac"/"lan".
-            keyword_hit = any(
-                _keyword_re(k.lower()).search(lowered)
-                for k in (skill.keywords or []) if k
-            )
-            if keyword_hit:
+            if goal_tokens & _skill_token_set(skill):
                 matched.append(skill)
                 continue
             if "memory" in skill_name and (facts or agent._looks_like_memory_query(lowered)):

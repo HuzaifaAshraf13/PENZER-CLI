@@ -308,6 +308,18 @@ class LLM:
 
             assumptions = _as_list(data.get("assumptions"))
             unknowns = _as_list(data.get("unknowns"))
+            # Optional self-report: which skill (by name) the model
+            # believes it's following this turn. This is the backstop
+            # for the pre-filter matching in planner.py's
+            # _match_core_skills — that filter is a best-effort GUESS
+            # based on word overlap and can miss a genuinely relevant
+            # skill. Rather than relying solely on getting the filter
+            # right, the model can name a skill directly (it can see
+            # every core skill's name/description in the system prompt
+            # regardless of what the filter pre-selected), and agent.py
+            # promotes that skill into the active set for subsequent
+            # turns. Optional and additive — omitting it changes nothing.
+            skill_used = str(data.get("skill_used") or data.get("skill") or "").strip() or None
 
             # Multiple independent tool calls (new format)
             tools_array = data.get("tools")
@@ -340,6 +352,7 @@ class LLM:
                         "tool_calls": tool_calls,
                         "assumptions": assumptions,
                         "unknowns": unknowns,
+                        "skill_used": skill_used,
                     }
 
             # Single tool call (old format)
@@ -353,6 +366,7 @@ class LLM:
                     }],
                     "assumptions": assumptions,
                     "unknowns": unknowns,
+                    "skill_used": skill_used,
                 }
 
             # Final answer (no tool call) — but only if the model actually
@@ -377,6 +391,7 @@ class LLM:
                     "tool_calls": [],
                     "assumptions": assumptions,
                     "unknowns": unknowns,
+                    "skill_used": skill_used,
                 }
 
         # --- XML tool calls (fallback) ---

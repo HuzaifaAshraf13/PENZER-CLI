@@ -456,11 +456,25 @@ class PenzerAgent:
         self._novel_task          = not bool(self._matched_skills)
         if self._active_skills:
             self._orchestrate_skills()
+        # Advisory, not restrictive — see system_prompts.py's "SKILL-MATCH
+        # ADVISORY FIX" note. This hint is a best-guess suggestion from
+        # token overlap, not the only skill(s) allowed. The full skills
+        # list is rendered separately (SKILLS_BLOCK) regardless of this
+        # hint, and the model can act on any skill shown there via the
+        # optional "skill_used" self-report field (see
+        # _apply_skill_selection) even if it wasn't suggested here.
         skills_hint = (
-            f"SKILLS MATCHED: {', '.join(self._matched_skills)}\n"
-            "All matched skills active — follow their merged SKILL PLAN.\n"
+            f"Suggested skills (best-guess from task wording, not exhaustive): "
+            f"{', '.join(self._matched_skills)}\n"
+            "Follow their merged SKILL PLAN if they fit. If a different skill "
+            "in CORE SKILLS/LEARNED PATTERNS below is actually the better match, "
+            "use that instead and report it via \"skill_used\".\n"
         ) if self._matched_skills else (
-            "NO SKILLS MATCHED — proceed. Generate skill after if 3+ tools used.\n"
+            "No skill was suggested by the initial match — check the full "
+            "CORE SKILLS/LEARNED PATTERNS list below yourself before assuming "
+            "none apply; report any skill you do use via \"skill_used\". If "
+            "genuinely nothing applies, proceed and generate a skill after if "
+            "3+ tools were used.\n"
         )
         insight_hint = ""
         if self._task_insights:
@@ -484,7 +498,21 @@ class PenzerAgent:
             )
         self._system_prompt = build_system_prompt(
             core_skills=self.core_skills,
-            generated_skills=matched_gen,
+            # Full library, not just matched_gen — mirrors core_skills
+            # above. build_system_prompt() already ranks + shows the top
+            # 12 via _rank()/_fmt_generated_skill() regardless of match,
+            # exactly like it does for core skills. Passing only the
+            # pre-filtered matched_gen subset here meant a skill the
+            # model had itself generated could be completely invisible
+            # in the prompt whenever search_generated_skills() didn't
+            # score it as relevant for this task's wording — the model
+            # had no way to even know it existed, let alone self-select
+            # it via "skill_used". matched_gen is still used above for
+            # self._active_skills (which drives the auto-built SKILL
+            # PLAN of skills the pre-filter is confident about); this
+            # only changes what's rendered for the model to SEE and
+            # choose from itself.
+            generated_skills=self.gen_skills,
             memory_context=past_memory,
             extra=skills_hint + insight_hint + mortem_hint,
             goal=user_input,
@@ -668,6 +696,7 @@ class PenzerAgent:
             calls = r.get("tool_calls") or []
             text  = r.get("content", "").strip()
             self._apply_belief_updates(r)
+            self._apply_skill_selection(r.get("skill_used"))
             if not calls:
                 result, empty = self._handle_empty_calls(text, empty)
                 if result is not None:
@@ -802,13 +831,14 @@ class PenzerAgent:
                     "content": "[Executor] All planned work complete. Give final answer."})
                 self._milestones = []
         if (i + 1) % 5 == 0:
-            matched_gen = search_generated_skills(
-                self._goal, self.gen_skills,
-                context=build_context_from_history(self.history),
-            )
+            # Full library, not a pre-filtered search — see the matching
+            # comment at the initial build_system_prompt() call in run().
+            # The periodic mid-run refresh should give the model the same
+            # full visibility into its own generated skills as the
+            # initial prompt does, not a narrower one.
             self._system_prompt = build_system_prompt(
                 core_skills=self.core_skills,
-                generated_skills=matched_gen,
+                generated_skills=self.gen_skills,
                 memory_context=get_relevant_memories(
                     self._goal, n=3, deep=self._is_complex_task
                 ),
@@ -831,6 +861,53 @@ class PenzerAgent:
         new_unknowns = r.get("unknowns")
         if new_unknowns:
             self._belief["unknowns"] = [str(u)[:120] for u in new_unknowns][:5]
+
+    def _apply_skill_selection(self, skill_used: str | None) -> None:
+        """
+        Backstop for planner.py's _match_core_skills(): that pre-filter
+        is a best-effort GUESS at which skills are relevant, made once
+        up front from the goal's wording (token overlap against each
+        skill's name/description/keywords). It can be wrong — a task can
+        be phrased in a way the filter doesn't recognize even though a
+        listed skill (visible to the model in the system prompt
+        regardless of the filter's guess) is clearly the right fit.
+        Rather than relying solely on getting the filter right, the
+        model can self-report which skill it's actually following via
+        the optional "skill_used"/"skill" JSON field (see llm.py's
+        chat()) — a form of progressive disclosure: the model sees every
+        core skill's summary every turn, and only once it names one does
+        that skill's full agent_behavior get folded into the live
+        SKILL PLAN for subsequent turns.
+        No-op if skill_used is empty/None (the common case — most turns
+        don't need to name a skill explicitly, they just follow the
+        plan/hint already in place) or if it doesn't match any known
+        skill by name (a hallucinated or mistyped name shouldn't crash
+        the run or silently do nothing conspicuous — it's just ignored,
+        same as any other malformed optional field). If it names a
+        skill already active, this is also a no-op — nothing to promote.
+        """
+        if not skill_used:
+            return
+        if skill_used in self._matched_skills:
+            return
+        by_name = {s.name: s for s in list(self.core_skills) + list(self.gen_skills)}
+        skill = by_name.get(skill_used)
+        if skill is None:
+            return
+        self._active_skills.append(skill)
+        self._matched_skills.append(skill.name)
+        self._novel_task = False
+        self._record_step(
+            "recovery",
+            f"Model self-selected skill '{skill.name}' (not in the initial "
+            f"keyword/description match) — promoting it into the active plan.",
+        )
+        # Re-derives self._skill_plan from the now-updated _active_skills
+        # list, so the newly-promoted skill's agent_behavior actually
+        # shows up in the next [ReflAct] injection's SKILL PLAN, not just
+        # in _matched_skills bookkeeping with no effect on what the model
+        # is told to do next.
+        self._orchestrate_skills()
 
     def _handle_empty_calls(self, text: str, empty: int) -> tuple[str | None, int]:
         """Handles a model turn that proposed no tool calls: either a

@@ -41,14 +41,14 @@ such key, and `agent.py` never displayed them even if populated —
 ReflAct's belief-state mechanism was running at half capacity. Added the
 actual keys to the JSON examples here, matching the corresponding fix in
 `agent/llm.py` and `agent.py`.
-TERMINAL POLICY CONSOLIDATION FIX (this pass): the standalone
-"LONG-RUNNING COMMANDS" section here duplicated guidance that now lives
-in more detail in the core.terminal skill's agent_behavior (STEP 1b) —
-two sources of truth for the same timeout/background/session_id syntax,
-guaranteed to drift the next time one is edited and not the other. That
-section has been removed from this file; the Tool syntax block keeps a
-single compact example showing the params exist, and points to the
-skill for full policy.
+TERMINAL POLICY CONSOLIDATION FIX: the standalone "LONG-RUNNING COMMANDS"
+section here duplicated guidance that now lives in more detail in the
+core.terminal skill's agent_behavior (STEP 1b) — two sources of truth
+for the same timeout/background/session_id syntax, guaranteed to drift
+the next time one is edited and not the other. That section has been
+removed from this file; the Tool syntax block keeps a single compact
+example showing the params exist, and points to the skill for full
+policy.
 More seriously: SAFETY here never mentioned sudo/privilege escalation at
 all — that rule lived ONLY inside core.terminal's agent_behavior. Skills
 are surfaced through `_rank()`, which keeps only the top 12 by
@@ -61,6 +61,30 @@ be unconditional: never see/store/pass a sudo password. SAFETY has been
 rewritten below to state that rule directly, so it's guaranteed present
 every turn regardless of skill ranking, independent of and in addition
 to core.terminal's own (now-consistent) STEP 2 walkthrough.
+SKILL-MATCH ADVISORY FIX (this pass): the pre-filter that decides which
+skills get called out as "SKILLS MATCHED" (planner.py's
+_match_core_skills — token overlap between the goal's wording and each
+skill's name/description/keywords) is a best-effort GUESS, not a
+guarantee. Previously the hint text this function builds was phrased as
+a hard binary — "SKILLS MATCHED: X" (implying only X applies) or "NO
+SKILLS MATCHED — proceed" (implying nothing here applies) — even though
+the SKILLS_BLOCK below it renders the FULL text of every top-ranked core
+skill regardless of whether the pre-filter matched it. That mismatch
+caused a real bug: a task worded in a way the filter didn't recognize
+(e.g. "look at the network I'm connected to" not overlapping with
+core.terminal's then-narrower keyword list) got told "NO SKILLS
+MATCHED", and the model treated that as license to skip straight to
+generating an answer from general knowledge — fabricating plausible-
+looking fake network data — instead of noticing core.terminal's full
+agent_behavior was sitting right there in the skills block above it and
+using it anyway. The hint below is now explicitly advisory ("best-guess
+suggestion, not a restriction") and paired with a new optional
+"skill_used" JSON field (see OUTPUT FORMAT below, matching a
+corresponding fix in agent/llm.py's chat() and agent/agent.py's
+_apply_skill_selection()) that lets the model self-report which skill it
+is actually following, overriding the filter's guess when it's wrong —
+progressive disclosure with a real correction path, instead of a
+pre-filter whose only failure mode was silent.
 KNOWN OPEN ISSUES (not fixed in this pass, flagged for follow-up):
   - `mcp_tools` on core.terminal lists `run_bash`/`run_python`, but
     those names never appear in AVAILABLE TOOLS below — only `terminal`
@@ -80,7 +104,9 @@ import logging
 import re
 from typing import Optional, List
 from session.memory import get_relevant_kv_facts, get_skill_metric
+
 logger = logging.getLogger(__name__)
+
 STOPWORDS = {
     "about", "after", "all", "also", "and", "any", "are", "around", "before",
     "best", "between", "but", "can", "check", "create", "does", "during", "each",
@@ -89,14 +115,28 @@ STOPWORDS = {
     "there", "this", "through", "time", "to", "use", "using", "very", "what",
     "when", "where", "which", "with", "would", "your", "you"
 }
+
 MAIN_SYSTEM_PROMPT = """\
 You are PENZER — a self-evolving autonomous agent with full system access.
 You learn from every task. Skills compound. Memory persists.
+
 ════════════════════════════════════════════════════════
 OUTPUT FORMAT — single JSON object only
 ════════════════════════════════════════════════════════
 Final answer  →  {"answer": "..."}
 Tool call     →  {"tool": "...", "args": {...}}
+
+Optional on any turn — which skill (by exact name, from CORE SKILLS or
+LEARNED PATTERNS below) you're actually following:
+  {"tool": "...", "args": {...}, "skill_used": "Terminal Executor"}
+Only needed when you're following a skill OTHER than the one(s) named in
+the "Suggested skills" hint below (see SKILL PROTOCOL) — that hint is a
+best-guess suggestion, not a restriction, and you can act on any skill
+listed in CORE SKILLS / LEARNED PATTERNS even if it wasn't suggested.
+When you do, report it via skill_used so the plan/tracking catches up.
+Omit it on turns where you're following the suggested skill(s), or when
+no skill applies at all.
+
 ════════════════════════════════════════════════════════
 AVAILABLE TOOLS
 ════════════════════════════════════════════════════════
@@ -108,6 +148,7 @@ memory              → store / retrieve / list / delete key-value facts
 planning            → create and follow multi-step plans
 plugin_tool         → manually create a new reusable tool when you expect a
                        specific workflow to repeat across this task or future ones
+
 Tool syntax:
   {"tool": "terminal",    "args": {"command": "ls -la"}}
   {"tool": "terminal",    "args": {"command": "...", "timeout": 600, "background": true, "session_id": "..."}}
@@ -121,15 +162,18 @@ Tool syntax:
   {"tool": "planning",    "args": {"action": "create", "goal": "...", "steps": [...]}}
   {"tool": "plugin_tool", "args": {"action": "create", "name": "snake_case_name",
                                     "description": "...", "code": "def snake_case_name(**kwargs): ..."}}
+
 Terminal params (timeout / background / session_id) and the full
 job-checking flow are covered in the core.terminal skill — consult it
 before any long-running command instead of guessing at defaults.
+
 Once a plugin tool is created, call it directly BY NAME like any other
 tool — {"tool": "your_plugin_name", "args": {...}} — do not route back
 through plugin_tool to use it. The agent also auto-creates a plugin on
 its own when it notices you've run the exact same terminal command
 twice; you don't need to do that yourself, but you can still hand-write
 one for anything more structured than a shell command.
+
 Multiple INDEPENDENT calls in one turn — only when the calls have NO
 data dependency on each other (e.g. checking whether ss, netstat, and
 lsof are installed — three unrelated checks, none needs another's
@@ -141,11 +185,14 @@ Do NOT use this when one call's result determines the next call's
 arguments (e.g. "read a file, then edit based on its contents") — that's
 a sequence, not independent work, and belongs in separate turns. When in
 doubt, use a single {"tool": ..., "args": ...} call instead.
+
 {{PLUGIN_TOOLS_BLOCK}}
+
 Note: the "memory" tool is a simple key-value store (built-in, not MCP).
 Use it to persist facts the user explicitly shares (preferences, project paths,
 env details) — separate from your own episodic/semantic memory which updates
 automatically after every task.
+
 ════════════════════════════════════════════════════════
 BELIEF STATE — read before every action
 ════════════════════════════════════════════════════════
@@ -154,6 +201,7 @@ You maintain an explicit belief state at all times:
   - verified_facts: things confirmed true by tool results
   - assumptions   : things you're assuming (not confirmed)
   - unknowns      : things still to find out
+
 Your BELIEF injection each turn shows what's currently tracked. To
 update assumptions/unknowns, include them directly in your JSON output:
   {"tool": "...", "args": {...}, "assumptions": ["..."], "unknowns": ["..."]}
@@ -161,13 +209,16 @@ update assumptions/unknowns, include them directly in your JSON output:
 Both are optional and get replaced each turn with whatever you provide —
 they reflect your CURRENT understanding, not a running log. Omit them
 entirely if nothing's changed.
+
 Before each action:
   "Given my belief state and goal, what is the next step?"
   "Does the last result contradict what I believed?"
   "Am I closer to the goal or further away?"
+
 If BLOCKED:
   → Do not repeat the same action
   → Change approach entirely
+
 ════════════════════════════════════════════════════════
 INJECTED CONTEXT — read at the start of every task
 ════════════════════════════════════════════════════════
@@ -177,48 +228,69 @@ retrieved from memory for THIS specific task, not generic advice:
   ## Recalled Insights            — cross-task rules (ExpeL) that generalize
   ## Similar Past Runs            — past episodes with similar goals
   ## Past Experience              — post-mortems: what worked/failed last time
+
 Use these BEFORE acting. If "Past Experience" says a tool failed last time
 for this kind of task, do not repeat that exact failure — try the alternative
 noted in "next_time". If a "Stored Facts" section is present and it contains a
 relevant fact, use it before asking the user again.
+
 ════════════════════════════════════════════════════════
 SKILL PROTOCOL — MANDATORY before any tool call
 ════════════════════════════════════════════════════════
-STEP 1: Check YOUR SKILLS below
-  Core skill matches?      → follow agent_behavior exactly
-  Generated skill matches? → reuse it, don't reinvent
+STEP 1: Check the FULL CORE SKILLS / LEARNED PATTERNS list below — not
+  just the "Suggested skills" hint. The hint is generated by matching
+  the task's wording against each skill's name/description/keywords; it
+  is a best-effort GUESS meant to save you time, not an exhaustive or
+  authoritative answer. It can miss a skill that's clearly the right
+  fit just because the task happened to be phrased differently than
+  that skill's listed keywords anticipated.
+  A skill below (suggested or not) genuinely matches?
+                            → follow its agent_behavior exactly. If it
+                              wasn't in the suggested hint, report it via
+                              "skill_used" in your JSON output (see
+                              OUTPUT FORMAT above) so tracking/plan
+                              generation catches up with what you're
+                              actually doing.
   Multiple skills match?   → follow MULTI-SKILL PLAN shown in [ReflAct]
-  Nothing matches?         → proceed, generate skill after if 3+ tools used
+  Nothing in the list matches at all → proceed, generate a skill after
+                              if 3+ tools were used.
 STEP 2: Execute following the skill steps in order
 STEP 3: Record outcome — success improves skill priority over time
+
 ════════════════════════════════════════════════════════
 MULTI-SKILL EXECUTION
 ════════════════════════════════════════════════════════
 When 2+ skills match, a SKILL PLAN is built and shown in each [ReflAct]:
   SKILL PLAN [done/total steps]
     [skill_name] step N: instruction
+
 Rules:
   1. Follow plan in order — do not skip steps
   2. Steps using DIFFERENT tools → can run in parallel
      Steps using SAME tool       → run sequentially
   3. After each tool result: mark step done, move to next
   4. All steps done → synthesize results, give final answer
+
 Tool routing — result feeds next step:
   memory      → feeds planning / reasoning
   browser     → feeds file_editor / terminal (save the data)
   terminal    → feeds file_editor (process output)
   file_editor → feeds terminal / browser (use the file)
+
 If a step fails:
   → Try fallback tool once
   → Skip non-critical step, note failure
   → Never abandon full plan because one step failed
+
 ════════════════════════════════════════════════════════
 DECISION PROCESS
 ════════════════════════════════════════════════════════
 1. BELIEF STATE  — what do I know? what am I assuming?
 2. SKILL PLAN?   — merged plan active? follow step by step
 3. SINGLE SKILL? — follow its agent_behavior in order
-4. NO SKILLS?    — reason about best tool sequence
+4. NO SKILLS?    — check the full skills list yourself before assuming
+                    none apply (see SKILL PROTOCOL STEP 1) — only then
+                    reason about best tool sequence from scratch
 5. KNOW ANSWER?  → {"answer": "..."}
 6. ONE TOOL?     → call it
 7. COMPLEX TASK? → follow subtask plan shown in [Executor]
@@ -227,12 +299,15 @@ DECISION PROCESS
    ✓ continue?   → update belief, call next tool in plan
    ✗ failed?     → update belief (blocked), try fallback
    ✗ stuck 3x?   → rethink entirely
+
 {{SKILLS_BLOCK}}
+
 ════════════════════════════════════════════════════════
 OUTPUT STYLE — actions not dumps
 ════════════════════════════════════════════════════════
 Show:  Running: ls -la | Reading: config.py | Search: "python docs"
 Never: dump full file contents, long stdout, raw HTML
+
 ════════════════════════════════════════════════════════
 SHELL EFFICIENCY — one tool call per turn, spend it well
 ════════════════════════════════════════════════════════
@@ -241,11 +316,14 @@ separate "which X" calls one at a time burns a full turn PER check for
 zero task progress.
   Wrong (3 turns wasted): which ss / which netstat / which lsof
   Right (1 turn):         command -v ss netstat lsof 2>&1
+
 Better yet, skip the availability check — just run the real command with
 inline fallbacks in ONE call:
   ss -ltnp 2>/dev/null || netstat -tlnp 2>/dev/null || lsof -i -P -n
+
 Same rule for any multi-step shell investigation: chain with && / || /
 ; into one command instead of probing step by step across turns.
+
 ════════════════════════════════════════════════════════
 GENERATING NEW SKILLS — trajectory-informed
 ════════════════════════════════════════════════════════
@@ -261,11 +339,13 @@ Steps:
      - priority    : 0.7 for new
      - agent_behavior : exact winning tool sequence, step by step
      - failure_modes  : what failed and why, what to avoid
+
 Quality checklist:
   ✓ agent_behavior = the exact tool sequence that worked
   ✓ failure_modes  = concrete warnings from this run
   ✓ No duplicates — check generated/ first
   ✓ Keywords = what a user would actually type
+
 HARD RULES — always apply, even if the skill-generation task itself
 doesn't match any currently-ranked skill (these are not conditional on
 core.meta being in view this turn):
@@ -278,6 +358,7 @@ core.meta being in view this turn):
   — there is no "hand off to another skill" mechanism. Skills are
   static text matched into context by keyword overlap, not callable
   agents you can delegate a task to.
+
 ════════════════════════════════════════════════════════
 SELF-EVOLUTION — after every complex task
 ════════════════════════════════════════════════════════
@@ -285,7 +366,9 @@ SELF-EVOLUTION — after every complex task
   Invented approach? → generate skill via instructions above
   Skill >80% success → priority bumps over time
   Skill <40% success → flagged for review
+
 Answer user first. Generate/update skills silently after.
+
 ════════════════════════════════════════════════════════
 SAFETY — always enforced, regardless of which skills are ranked into view
 ════════════════════════════════════════════════════════
@@ -307,9 +390,12 @@ Installs (pip · apt · npm · curl|bash · wget)
   → ask first: "I need [X] — ok to install?"
 Never expose passwords, API keys, or private data
 Never access files outside working directory
+
 This section applies unconditionally — it does not depend on whether
 core.terminal or any other skill happens to be ranked into view this turn.
 """
+
+
 def _load_metrics(skill_name: str) -> dict:
     """
     Load real metrics from storage for a skill, normalized to the
@@ -331,6 +417,8 @@ def _load_metrics(skill_name: str) -> dict:
         }
     except Exception:
         return {"success_count": 0, "failure_count": 0, "success_rate": 0.0}
+
+
 def _tokenize(text: str) -> set[str]:
     if not text:
         return set()
@@ -338,11 +426,15 @@ def _tokenize(text: str) -> set[str]:
         token for token in re.findall(r"[a-z0-9_]+", text.lower())
         if len(token) > 2 and token not in STOPWORDS
     }
+
+
 def _skill_token_set(skill) -> set[str]:
     tokens = set()
     for field in [skill.name, getattr(skill, "description", ""), *(skill.keywords or [])]:
         tokens.update(_tokenize(field))
     return tokens
+
+
 def _fmt_core_skill(skill) -> str:
     tools    = ", ".join(skill.mcp_tools or []) or "none"
     behavior = (skill.agent_behavior or "").strip()
@@ -365,6 +457,8 @@ def _fmt_core_skill(skill) -> str:
         f"  Priority : {priority}  v{version}\n"
         f"{behavior}\n"
     )
+
+
 def _fmt_generated_skill(skill) -> str:
     lines       = [l.strip() for l in (skill.agent_behavior or "").splitlines() if l.strip()]
     step1       = lines[0] if lines else "(no steps)"
@@ -391,6 +485,8 @@ def _fmt_generated_skill(skill) -> str:
         f"  Step 1: {step1}\n"
         f"{failure_line}"
     )
+
+
 def _enrich(skills: List) -> None:
     """Load real metrics from storage into each skill object."""
     for skill in skills:
@@ -398,6 +494,8 @@ def _enrich(skills: List) -> None:
         skill.success_count = m.get("success_count", 0)
         skill.failure_count = m.get("failure_count", 0)
         skill.success_rate  = m.get("success_rate", 0.0)
+
+
 def _rank(skills: List, goal: str) -> List:
     """Rank by task-language overlap, keyword match, and proven success rate."""
     goal_tokens = _tokenize(goal)
@@ -410,6 +508,7 @@ def _rank(skills: List, goal: str) -> List:
             ),
             reverse=True,
         )
+
     def score(skill) -> float:
         base = float(getattr(skill, "priority", 0.5))
         skill_tokens = _skill_token_set(skill)
@@ -426,7 +525,10 @@ def _rank(skills: List, goal: str) -> List:
             base += 0.08
         base += getattr(skill, "success_rate", 0.0) * 0.15
         return min(1.0, base)
+
     return sorted(skills, key=lambda s: score(s), reverse=True)
+
+
 def _fmt_plugin_tools_block(plugin_tools: Optional[dict]) -> str:
     """
     Render currently-loaded plugin tools so the model actually knows they
@@ -441,6 +543,8 @@ def _fmt_plugin_tools_block(plugin_tools: Optional[dict]) -> str:
     for name, description in sorted(plugin_tools.items()):
         lines.append(f"  {name} → {description}")
     return "\n".join(lines) + "\n"
+
+
 def _format_kv_context(goal: str, memory_context: str = "") -> str:
     facts = get_relevant_kv_facts(goal, n=3)
     if not facts:
@@ -451,6 +555,8 @@ def _format_kv_context(goal: str, memory_context: str = "") -> str:
     if memory_context:
         return f"{memory_context}\n\n" + "\n".join(lines)
     return "\n".join(lines)
+
+
 def build_system_prompt(
     core_skills: Optional[List]      = None,
     generated_skills: Optional[List] = None,
