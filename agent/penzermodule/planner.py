@@ -43,26 +43,32 @@ class Planner:
 
     def _match_core_skills(self, agent, user_input: str) -> list:
         """
-        A skill is activated when there's meaningful token overlap
-        between the goal and that skill's name + description + keywords
-        combined (via _skill_token_set, shared with system_prompts.py's
-        _rank()) — not just an exact hit against a hand-maintained
-        keywords list. A skill's description sentence (closer to how a
-        person actually phrases a request than a curated keyword list)
-        pulls its own weight here, so a newly-worded task doesn't
-        require someone to remember to update `keywords:` for it to be
-        found. This also gets word-boundary matching for free (short
-        keywords like "ip"/"mac"/"lan" no longer substring-match inside
-        unrelated words like "multiple"/"machine"/"plan"), since
-        _tokenize splits on real word boundaries rather than doing
-        substring search.
-        No skill (including terminal) is treated as unconditionally
-        active — every skill, terminal included, has to actually match
-        the task's wording/description overlap to be included. Keeping
-        terminal's own `keywords`/`description` broad enough to cover
-        the tasks it should legitimately handle (rather than special-
-        casing it here to bypass matching) is what keeps this scoped —
-        see terminal.skill.md's keyword list.
+        A skill is activated by one of two signals, weighted differently:
+          - STRONG: any overlap with the skill's `keywords` list. Keywords
+            are curated specifically to signal "this task is in my
+            domain" — a single hit there is a deliberate, meaningful
+            signal, not noise.
+          - WEAK: overlap with the skill's name/description text alone
+            (no keyword involved) requires AT LEAST 2 shared words, not
+            just 1. A single incidental shared word between a task and
+            an unrelated skill's description (e.g. a common verb like
+            "check" or "look" appearing in both, purely by coincidence)
+            was enough to activate that skill under the original
+            single-token-overlap rule — and _orchestrate_skills() merges
+            every matched skill's FULL agent_behavior into one combined
+            plan, so a coincidental match doesn't just add noise to a
+            hint, it makes the model actually try to follow an unrelated
+            skill's steps as part of the task. That's what caused a
+            simple "look at my network" task to pull in Memory Manager
+            and Plugin Tool Creator alongside Terminal Executor and
+            balloon into 16 LLM calls / ~75k tokens for work that should
+            have taken 2-3 calls.
+          Requiring 2+ words for the weak signal keeps the description-
+          based matching (added specifically to fix RECALL — real
+          matches that keyword lists alone were missing) while cutting
+          the false-positive rate that same change introduced. Real
+          matches typically share more than one meaningful word with a
+          skill's own description; coincidental ones usually don't.
         """
         lowered = user_input.lower()
         goal_tokens = _tokenize(user_input)
@@ -70,7 +76,18 @@ class Planner:
         facts = get_relevant_kv_facts(user_input, n=3)
         for skill in agent.core_skills:
             skill_name = (skill.name or "").lower()
-            if goal_tokens & _skill_token_set(skill):
+            keyword_tokens = set()
+            for kw in skill.keywords or []:
+                keyword_tokens |= _tokenize(kw)
+            name_desc_tokens = _tokenize(skill.name or "") | _tokenize(
+                getattr(skill, "description", "") or ""
+            )
+            keyword_hit = bool(goal_tokens & keyword_tokens)
+            # Don't double-count a word that's both a keyword and also
+            # happens to appear in the name/description — only count it
+            # toward the weak signal if it ISN'T already a keyword hit.
+            weak_overlap = goal_tokens & (name_desc_tokens - keyword_tokens)
+            if keyword_hit or len(weak_overlap) >= 2:
                 matched.append(skill)
                 continue
             if "memory" in skill_name and (facts or agent._looks_like_memory_query(lowered)):
