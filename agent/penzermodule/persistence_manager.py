@@ -17,7 +17,31 @@ from agent.config import TRIM_AT, KEEP_LAST, MAX_CONSISTENCY_VIOLATIONS
 logger = logging.getLogger(__name__)
 from agent.penzermodule.belief_manager import Phase
 class PersistenceManager:
+    def _coerce_belief(self, belief: object, fallback: dict) -> dict:
+        if isinstance(belief, dict):
+            normalized = dict(fallback)
+            goal_progress = belief.get("goal_progress")
+            if isinstance(goal_progress, str) and goal_progress:
+                normalized["goal_progress"] = goal_progress
+            for key in ("verified_facts", "assumptions", "unknowns"):
+                value = belief.get(key)
+                if isinstance(value, list):
+                    normalized[key] = value
+            last_action = belief.get("last_action")
+            if isinstance(last_action, str):
+                normalized["last_action"] = last_action
+            last_outcome = belief.get("last_outcome")
+            if isinstance(last_outcome, str):
+                normalized["last_outcome"] = last_outcome
+            return normalized
+        logger.warning("Restore received malformed belief payload; using defaults")
+        return dict(fallback)
+
     def _restore_snapshot(self, agent, snapshot: dict) -> None:
+        if not isinstance(snapshot, dict):
+            logger.warning("Restore received malformed snapshot payload of type %s; using defaults", type(snapshot).__name__)
+            snapshot = {}
+
         agent._goal = snapshot.get("goal", agent._goal)
         agent._run_id = snapshot.get("run_id", agent._run_id)
         # Restoring iteration count lets a resumed run continue counting
@@ -27,18 +51,60 @@ class PersistenceManager:
         # measured "iterations since the most recent resume," not total
         # iterations spent on the task, defeating the point of a ceiling.
         agent._iteration = snapshot.get("iteration", agent._iteration)
+        agent._history_version = snapshot.get("history_version", agent._history_version)
+        agent._resume_boundary_trace_len = snapshot.get(
+            "resume_boundary_trace_len", agent._resume_boundary_trace_len
+        )
+        agent._resume_boundary_history_len = snapshot.get(
+            "resume_boundary_history_len", agent._resume_boundary_history_len
+        )
         agent.history = snapshot.get("history", agent.history)
         agent._trace = snapshot.get("trace", agent._trace)
         agent._resume_state = snapshot.get("resume_state", agent._resume_state)
         agent._milestones = snapshot.get("milestones", agent._milestones)
+        if not isinstance(agent._milestones, list):
+            logger.warning("Restore received malformed milestones payload; resetting to empty")
+            agent._milestones = []
         agent._execution_queue = snapshot.get("execution_queue", agent._execution_queue)
-        agent._execution_index = snapshot.get("execution_index", agent._execution_index)
+        if not isinstance(agent._execution_queue, list):
+            logger.warning("Restore received malformed execution_queue payload; resetting to empty")
+            agent._execution_queue = []
+        snapshot_execution_complete = snapshot.get("execution_complete", agent._execution_complete)
+        if not agent._execution_queue and agent._milestones:
+            agent._execution_queue = []
+            agent._execution_index = 0
+            agent._active_execution_item = None
+            agent._execution_complete = False
+            for milestone_idx, milestone in enumerate(agent._milestones):
+                milestone_name = str(milestone.get("milestone", "")).strip()
+                if milestone_name:
+                    agent._execution_queue.append({
+                        "kind": "milestone",
+                        "title": milestone_name,
+                        "milestone_idx": milestone_idx,
+                        "step_index": None,
+                    })
+                for step_idx, step in enumerate(milestone.get("steps", []) or []):
+                    if step:
+                        agent._execution_queue.append({
+                            "kind": "step",
+                            "title": step,
+                            "milestone_idx": milestone_idx,
+                            "step_index": step_idx,
+                        })
+        else:
+            agent._execution_index = snapshot.get("execution_index", agent._execution_index)
+            if agent._execution_queue and snapshot_execution_complete and agent._execution_index < len(agent._execution_queue):
+                agent._execution_complete = False
+            else:
+                agent._execution_complete = snapshot_execution_complete
         agent._active_execution_item = snapshot.get("active_execution_item", agent._active_execution_item)
-        agent._belief = snapshot.get("belief", agent._belief)
+        agent._belief = self._coerce_belief(snapshot.get("belief", agent._belief), agent._belief)
         try:
-            agent._phase = Phase(snapshot.get("phase", agent._phase.value))
+            phase = Phase(snapshot.get("phase", agent._phase.value))
         except ValueError:
-            agent._phase = Phase.PLANNING
+            phase = Phase.PLANNING
+        agent._transition(phase, reason="restored snapshot")
         agent._complexity_score = snapshot.get("complexity_score", agent._complexity_score)
         agent._is_complex_task = snapshot.get("is_complex_task", agent._is_complex_task)
         # NOTE: this is the single source of truth for max_iter on resume.
@@ -57,7 +123,34 @@ class PersistenceManager:
         agent._milestone_idx = snapshot.get("milestone_idx", agent._milestone_idx)
         agent._total_subtasks = snapshot.get("total_subtasks", agent._total_subtasks)
         agent._current_subtask = snapshot.get("current_subtask", agent._current_subtask)
-        agent._execution_complete = snapshot.get("execution_complete", agent._execution_complete)
+        if not agent._execution_queue and agent._milestones:
+            agent._execution_complete = False
+        elif agent._phase == Phase.DONE and agent._milestones and not agent._execution_complete:
+            logger.warning(
+                "Restore rejected a DONE phase snapshot with pending milestones; reopening execution state"
+            )
+            agent._transition(Phase.BLOCKED, reason="restored snapshot had stale done state")
+            agent._execution_complete = False
+            agent._execution_queue = []
+            agent._execution_index = 0
+            agent._active_execution_item = None
+            for milestone_idx, milestone in enumerate(agent._milestones):
+                milestone_name = str(milestone.get("milestone", "")).strip()
+                if milestone_name:
+                    agent._execution_queue.append({
+                        "kind": "milestone",
+                        "title": milestone_name,
+                        "milestone_idx": milestone_idx,
+                        "step_index": None,
+                    })
+                for step_idx, step in enumerate(milestone.get("steps", []) or []):
+                    if step:
+                        agent._execution_queue.append({
+                            "kind": "step",
+                            "title": step,
+                            "milestone_idx": milestone_idx,
+                            "step_index": step_idx,
+                        })
         # Fix #5: the snapshot previously omitted these — on an agent
         # instance reused across multiple run()/resume_last_task() calls
         # (agent.py now also calls _reset() before restoring, as a second
@@ -91,9 +184,12 @@ class PersistenceManager:
                 "goal": agent._goal,
                 "run_id": agent._run_id,
                 "iteration": agent._iteration,
+                "history_version": agent._history_version,
                 "history": agent.history,
                 "trace": agent._trace,
                 "resume_state": agent._resume_state,
+                "resume_boundary_trace_len": agent._resume_boundary_trace_len,
+                "resume_boundary_history_len": agent._resume_boundary_history_len,
                 "milestones": agent._milestones,
                 "execution_queue": agent._execution_queue,
                 "execution_index": agent._execution_index,

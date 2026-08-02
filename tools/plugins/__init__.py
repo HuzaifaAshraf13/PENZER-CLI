@@ -4,6 +4,7 @@ import importlib
 import inspect
 import json
 import os
+import ast
 from pathlib import Path
 
 _PLUGIN_DIR = Path(__file__).parent
@@ -80,6 +81,12 @@ def create_plugin_tool(name: str, description: str, code: str, *, module_name: s
             '"""Auto-generated plugin tool."""\n\n'
             f"{function_source}\n"
         )
+
+    try:
+        ast.parse(module_content)
+    except SyntaxError as exc:
+        raise ValueError(f"Plugin code is invalid python: {exc}") from exc
+
     module_path.write_text(module_content, encoding="utf-8")
 
     _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)

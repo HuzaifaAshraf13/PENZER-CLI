@@ -3,10 +3,29 @@
 File Editor Tool: Read, write, edit, delete, and manage files.
 """
 
+import os
 from pathlib import Path
 
 from agent.core import mcp
 from tools.standards import success, error, warning
+
+_WORKDIR = Path.cwd()
+
+
+def _is_disallowed_write(target: Path) -> bool:
+    try:
+        resolved = target.resolve(strict=False)
+        workdir = _WORKDIR.resolve(strict=False)
+        return not str(resolved).startswith(str(workdir))
+    except Exception:
+        return True
+
+
+def _requires_approval(action: str, filepath: Path | None) -> tuple[bool, str]:
+    if action in {"delete", "write", "append", "replace"} and filepath is not None:
+        if _is_disallowed_write(filepath):
+            return True, "Approval required before destructive or out-of-workdir file mutation."
+    return False, ""
 
 
 @mcp.tool()
@@ -37,7 +56,12 @@ def file_editor(action: str, filepath: str = None, content: str = None,
     """
     try:
         filepath = Path(filepath) if filepath else None
-        
+
+        if filepath is not None:
+            requires_approval, approval_message = _requires_approval(action, filepath)
+            if requires_approval:
+                return warning(data={}, message=approval_message)
+
         if action == "read":
             if not filepath:
                 return error("read action requires 'filepath'")

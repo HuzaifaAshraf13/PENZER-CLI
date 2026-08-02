@@ -15,7 +15,7 @@ from rich.panel import Panel
 from logger import get_logger, console as console
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state, kill_all_running, set_live_hooks
-from config import PROFILE_OPTIONS, get_profile_settings
+from config import PROFILE_OPTIONS, get_profile_settings, validate_config
 
 logger = get_logger("cli")
 
@@ -166,6 +166,7 @@ def build_help_text() -> str:
         "• [cyan]clear[/cyan]     Clear the terminal",
         "• [cyan]plugins[/cyan]   List available plugin tools",
         "• [cyan]apikey[/cyan]    Manage API credentials",
+        "• [cyan]doctor[/cyan]    Show startup health diagnostics",
         "• [cyan]update[/cyan]    Check for updates",
         "• [cyan]state[/cyan]     Show current execution state",
         "• [cyan]memory[/cyan]    Show saved facts and memory state",
@@ -267,28 +268,33 @@ def _handle_apikey_command(user_input: str) -> None:
     tokens = user_input.split()
     if len(tokens) == 1 or tokens[1] in ("help", "show"):
         env = _read_env()
-        local_url = env.get("LOCAL_SERVER_URL", "(none)")
-        api_key = _mask_key(env.get("API_KEY", ""))
-        api_url = env.get("URL", "(none)")
+        local_url = env.get("LOCAL_SERVER_URL") or env.get("LLM_LOCAL_SERVER_URL", "(none)")
+        api_key = env.get("LLM_API_KEY") or env.get("API_KEY", "")
+        api_url = env.get("LLM_API_URL") or env.get("URL", "(none)")
         console.print("[white]API credentials in .env:[/white]")
         console.print(f"  LOCAL_SERVER_URL={local_url}")
-        console.print(f"  API_KEY={api_key}")
-        console.print(f"  URL={api_url}")
+        console.print(f"  LLM_API_KEY={_mask_key(api_key)}")
+        console.print(f"  LLM_API_URL={api_url}")
         return
     if len(tokens) >= 3 and tokens[1] == "local":
         local_url = tokens[2]
-        _write_env({"LOCAL_SERVER_URL": local_url})
+        _write_env({"LOCAL_SERVER_URL": local_url, "LLM_LOCAL_SERVER_URL": local_url})
         console.print(f"[green]LOCAL_SERVER_URL set to {local_url}[/green]")
         return
     if len(tokens) >= 4 and tokens[1] in ("set", "update"):
         api_key = tokens[2]
         api_url = tokens[3]
-        _write_env({"API_KEY": api_key, "URL": api_url})
-        console.print("[green]API_KEY and URL updated in .env[/green]")
+        _write_env({
+            "LLM_API_KEY": api_key,
+            "API_KEY": api_key,
+            "LLM_API_URL": api_url,
+            "URL": api_url,
+        })
+        console.print("[green]LLM_API_KEY and LLM_API_URL updated in .env[/green]")
         return
     console.print("[yellow]Usage:[/yellow]")
     console.print("  apikey show")
-    console.print("  apikey set <API_KEY> <URL>")
+    console.print("  apikey set <LLM_API_KEY> <LLM_API_URL>")
     console.print("  apikey local <LOCAL_SERVER_URL>")
     console.print("[dim]Example: apikey set mykey https://api.openai.com/v1[/dim]")
 
@@ -333,6 +339,64 @@ def safe_subprocess_run(*args, **kwargs) -> subprocess.CompletedProcess:
     except Exception as e:
         logger.error(f"Unexpected subprocess error: {e}")
         raise
+
+
+def run_doctor() -> dict:
+    """Return a structured health report for startup-sensitive subsystems."""
+    from pathlib import Path
+
+    config_errors = validate_config()
+    memory_ok = True
+    memory_message = "memory store available"
+    try:
+        import session.memory_storage as storage
+        storage._load()
+    except Exception as exc:
+        memory_ok = False
+        memory_message = f"memory store unavailable: {exc}"
+
+    plugin_ok = True
+    plugin_message = "plugin directory readable"
+    try:
+        from tools.plugins import discover_plugins
+        list(discover_plugins())
+    except Exception as exc:
+        plugin_ok = False
+        plugin_message = f"plugin discovery failed: {exc}"
+
+    skills_ok = True
+    skills_message = "skills parse cleanly"
+    try:
+        from agent.skills.loader import load_all_skills
+        load_all_skills()
+    except Exception as exc:
+        skills_ok = False
+        skills_message = f"skill loading failed: {exc}"
+
+    mcp_ok = True
+    mcp_message = "MCP registry reachable"
+    try:
+        from agent.core import get_mcp_status
+        get_mcp_status()
+    except Exception as exc:
+        mcp_ok = False
+        mcp_message = f"MCP status unavailable: {exc}"
+
+    checks = {
+        "config": {
+            "ok": not config_errors,
+            "message": "; ".join(config_errors) if config_errors else "config validated",
+        },
+        "memory": {"ok": memory_ok, "message": memory_message},
+        "plugins": {"ok": plugin_ok, "message": plugin_message},
+        "skills": {"ok": skills_ok, "message": skills_message},
+        "mcp": {"ok": mcp_ok, "message": mcp_message},
+    }
+    ok = all(check["ok"] for check in checks.values())
+    return {
+        "ok": ok,
+        "checks": checks,
+    }
 
 
 # ─────────────────────────────────────────
@@ -429,6 +493,14 @@ async def main():
                 continue
             if user_input.lower().startswith("apikey"):
                 _handle_apikey_command(user_input)
+                continue
+            if user_input.lower() == "doctor":
+                report = run_doctor()
+                status = "healthy" if report.get("ok") else "needs attention"
+                panel_lines = [f"Status: {status}"]
+                for name, entry in report.get("checks", {}).items():
+                    panel_lines.append(f"- {name}: {'ok' if entry.get('ok') else 'issue'} — {entry.get('message', '')}")
+                console.print(Panel("\n".join(panel_lines), title="Doctor", border_style="cyan"))
                 continue
             if user_input.lower() == "update":
                 try:

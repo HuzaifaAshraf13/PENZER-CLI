@@ -40,11 +40,11 @@ def _detect_provider(url: str) -> str:
 class LLMModel:
     """Universal async LLM model – handles any provider."""
 
-    def __init__(self, api_key: str, url: str):
+    def __init__(self, api_key: str, url: str, model_name: Optional[str] = None):
         self.api_key = api_key
         self.url = url.rstrip("/")
         self.provider = _detect_provider(url)
-        self.model_name = os.getenv("MODEL_NAME", self.provider)
+        self.model_name = model_name or os.getenv("LLM_MODEL", os.getenv("MODEL_NAME", self.provider))
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -147,19 +147,22 @@ class LLM:
 
     def _init_model(self) -> LLMModel:
         load_dotenv(str(PROJECT_ROOT / ".env"), override=False)
+
         local_url = os.getenv("LOCAL_SERVER_URL", "").strip().strip("\"'")
-        api_key   = os.getenv("API_KEY", "").strip().strip("\"'")
-        api_url   = os.getenv("URL", "").strip().strip("\"'")
+        api_key = os.getenv("LLM_API_KEY", os.getenv("API_KEY", "")).strip().strip("\"'")
+        api_url = os.getenv("LLM_API_URL", os.getenv("URL", "")).strip().strip("\"'")
+        model_name = os.getenv("LLM_MODEL", os.getenv("MODEL_NAME", "")).strip().strip("\"'")
+
         if local_url:
             print("[LLM] Auto-detected: Local server")
-            return LLMModel("", local_url)
+            return LLMModel("", local_url, model_name=model_name or None)
         elif api_key and api_url:
             provider = _detect_provider(api_url)
             print(f"[LLM] Auto-detected: {provider} API")
-            return LLMModel(api_key, api_url)
+            return LLMModel(api_key, api_url, model_name=model_name or None)
         else:
             raise FileNotFoundError(
-                "No LOCAL_SERVER_URL or API credentials (API_KEY + URL) found in .env"
+                "No LOCAL_SERVER_URL or API credentials (LLM_API_KEY + LLM_API_URL or legacy API_KEY + URL) found in .env"
             )
 
     # ---------- JSON extraction ----------

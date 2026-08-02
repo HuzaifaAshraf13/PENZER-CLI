@@ -87,3 +87,5 @@ tools/plugins/*.py
 # Plugin registry and runtime state (local only)
 .penzer/
 !.penzer/memory/
+markdown.md
+tests/

@@ -11,11 +11,12 @@ It is designed for users who want an interactive shell agent that can help with 
 
 ## ✨ Highlights
 
-- **Autonomous task execution** — plan, act, observe, and retry
-- **Persistent memory** — retain useful context across sessions
-- **Runtime skill growth** — create and reuse helper tools
-- **Terminal control** — run shell commands with built-in safety checks
-- **Plugin support** — turn repeated workflows into reusable helpers
+- **Autonomous task execution** — plan, act, observe, and retry with resumable state
+- **Persistent memory** — retain useful context across sessions with episodic, semantic, and KV memory
+- **Runtime skill growth** — create and reuse helper tools and generated skills
+- **Terminal control** — run shell commands with approval-aware safety checks
+- **Plugin support** — turn repeated workflows into reusable helpers at runtime
+- **Reliability safeguards** — protect against malformed resume state, inconsistent phase transitions, and untrusted tool output
 
 ---
 
@@ -63,8 +64,9 @@ touch .env
 Then add:
 
 ```env
-API_KEY="your-api-key-here"
-URL="your-api-url-here"
+LLM_API_KEY="your-api-key-here"
+LLM_API_URL="https://api.openai.com/v1"
+LLM_MODEL="gpt-4o-mini"
 ```
 
 ### Option B: Local model server
@@ -72,7 +74,8 @@ URL="your-api-url-here"
 If you run a local server such as Ollama, llama.cpp, vLLM, or LM Studio, add:
 
 ```env
-LOCAL_SERVER_URL="http://localhost:8000"
+LOCAL_MODEL_ENABLED="true"
+LOCAL_MODEL_PATH="/path/to/model.gguf"
 ```
 
 If both cloud and local settings are present, Penzer will ask which one to use.
@@ -101,10 +104,13 @@ apikey set your-api-key https://api.openai.com/v1
 help          Show help
 clear         Clear the screen
 plugins       List available runtime plugin tools
-apikey show   Show current API settings from .env
-apikey set    Set cloud API credentials
-apikey local  Set a local model server URL
-update        Check for updates
+doctor        Show startup health diagnostics
+state         Show current execution state
+memory        Show saved facts and memory state
+checkpoints   Show saved checkpoints
+resume        Resume the last interrupted task
+profile       Show or switch the current CLI profile
+benchmark     Show a lightweight quality summary
 exit          Exit Penzer
 ```
 
@@ -129,13 +135,15 @@ Generated plugins are stored under `tools/plugins/`, and their registry is kept 
 ```text
 PENZER-CLI/
 ├── cli.py                   # Main CLI entry point
+├── config.py                # Runtime settings, profile defaults, and validation
 ├── setup.py                 # Package setup
 ├── setup.sh                 # Installer script
 ├── requirements.txt         # Python dependencies
 ├── .env                     # API credentials
-├── agent/                   # Agent orchestration and prompts
-├── session/                 # Memory and persistence
-├── tools/                   # Built-in tools and plugin support
+├── agent/                   # Agent orchestration, prompts, and managers
+├── session/                 # Memory, persistence, checkpoints, and history
+├── tools/                   # Built-in tools, executor, and plugin support
+├── tests/                   # Regression tests for runtime and safety guarantees
 └── logs/                    # Runtime logs
 ```
 
@@ -147,10 +155,11 @@ PENZER-CLI/
 2. Penzer reasons about the best next step.
 3. It selects tools, skills, or plugins to act.
 4. It executes, observes the result, and adapts.
-5. It stores useful lessons for later tasks.
+5. It records progress and can persist a resumable snapshot for later recovery.
+6. It stores useful lessons for later tasks.
 
 ```text
-User goal → Reasoning → Tool use → Observation → Memory
+User goal → Reasoning → Tool use → Observation → Memory → Resume-safe state
 ```
 
 ---
@@ -162,6 +171,13 @@ If `penzer` does not start, try:
 ```bash
 source ~/.bashrc
 penzer
+```
+
+If you want to validate the current setup, run:
+
+```bash
+penzer
+# then type: doctor
 ```
 
 If you want to reconfigure model access, use:

@@ -12,7 +12,9 @@ import logging
 import resource
 import threading
 import queue
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 from config import get_profile_settings
@@ -140,6 +142,8 @@ _change_log: list = []
 _exec_count: int = 0
 _exec_budget: int = 100  # max executions per session
 _execution_state: dict = {}
+_APPROVAL_AUDIT_PATH = Path("logs") / "approval_audit.jsonl"
+_APPROVAL_AUDIT_LOCK = threading.RLock()
 
 # ─────────────────────────────────────────
 # RUNNING PROCESS REGISTRY
@@ -270,6 +274,17 @@ def _read_line_with_timeout(prompt: str, timeout: Optional[float]):
         return None
 
 
+def _append_approval_audit(entry: dict) -> None:
+    """Persist an append-only JSONL audit record to disk."""
+    try:
+        _APPROVAL_AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _APPROVAL_AUDIT_LOCK:
+            with open(_APPROVAL_AUDIT_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    except Exception as exc:
+        logger.warning("approval audit write failed: %s", exc)
+
+
 def _log_approval_decision(command: str, category: str, decision: str, reason: str = "") -> None:
     """
     Records the approval DECISION itself — approved, denied, or
@@ -285,14 +300,16 @@ def _log_approval_decision(command: str, category: str, decision: str, reason: s
     gets recorded.
     """
     global _change_log
-    _change_log.append({
+    entry = {
         "type": "approval_decision",
         "category": category,       # "privileged" | "dangerous" | "sensitive"
         "command": command[:200],
         "decision": decision,       # "approved" | "denied" | "no_response"
         "reason": (reason or "")[:200],
         "timestamp": datetime.now().isoformat(),
-    })
+    }
+    _change_log.append(entry)
+    _append_approval_audit(entry)
 
 
 def confirm_action(

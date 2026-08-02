@@ -6,6 +6,7 @@ Centralized settings for the autonomous pentesting agent
 import os
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 # ============================================================================
 # PATHS
@@ -80,7 +81,10 @@ LOCAL_MODEL_THREADS = int(os.getenv("LOCAL_MODEL_THREADS", "4"))
 # MCP SERVER SETTINGS
 # ============================================================================
 MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
-MCP_PORT = int(os.getenv("MCP_PORT", "5000"))
+try:
+    MCP_PORT = int(os.getenv("MCP_PORT", "5000"))
+except ValueError:
+    MCP_PORT = 5000
 MCP_TIMEOUT = 30
 
 # ============================================================================
@@ -167,6 +171,38 @@ PROFILE_OPTIONS = {
     "safe": "Safer approvals and fewer risky actions",
     "fast": "Faster execution with fewer confirmation prompts",
 }
+
+
+def validate_config() -> list[str]:
+    """Return all startup configuration errors in one pass."""
+    errors: list[str] = []
+
+    if not LLM_API_KEY.strip():
+        errors.append("LLM_API_KEY is required for non-local execution.")
+    if not LLM_MODEL.strip():
+        errors.append("LLM_MODEL must not be empty.")
+    if LLM_API_URL and not LLM_API_URL.startswith(("http://", "https://")):
+        errors.append("LLM_API_URL must be a valid http(s) URL when provided.")
+
+    profile_name = (os.getenv("PENZER_PROFILE", DEFAULT_PROFILE) or DEFAULT_PROFILE).lower()
+    if profile_name not in PROFILE_OPTIONS:
+        errors.append(f"PENZER_PROFILE must be one of: {', '.join(PROFILE_OPTIONS)}.")
+
+    try:
+        port = int(os.getenv("MCP_PORT", "5000"))
+        if port < 1 or port > 65535:
+            errors.append("MCP_PORT must be an integer between 1 and 65535.")
+    except Exception:
+        errors.append("MCP_PORT must be an integer between 1 and 65535.")
+
+    if not isinstance(LOCAL_MODEL_ENABLED, bool):
+        errors.append("LOCAL_MODEL_ENABLED must be a boolean-like env value.")
+    if LOCAL_MODEL_GPU_LAYERS < 0:
+        errors.append("LOCAL_MODEL_GPU_LAYERS must be >= 0.")
+    if LOCAL_MODEL_THREADS < 1:
+        errors.append("LOCAL_MODEL_THREADS must be >= 1.")
+
+    return errors
 
 
 def get_profile_settings(profile_name: str | None = None) -> dict:

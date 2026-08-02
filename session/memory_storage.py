@@ -32,6 +32,8 @@ import json
 import logging
 import threading
 import copy
+import os
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -92,6 +94,18 @@ def _fresh() -> dict:
     }
 
 
+def _quarantine_corrupt_file(path: Path, section: str, error: Exception) -> None:
+    """Move a malformed JSON blob aside so startup can continue."""
+    try:
+        quarantine_path = path.with_suffix(path.suffix + ".corrupt")
+        if quarantine_path.exists():
+            quarantine_path.unlink()
+        path.replace(quarantine_path)
+        logger.warning("Quarantined corrupted memory section %s at %s: %s", section, quarantine_path, error)
+    except Exception as quarantine_error:
+        logger.warning("Unable to quarantine corrupted memory section %s at %s: %s", section, path, quarantine_error)
+
+
 def _load_section(section: str) -> any:
     path = MEMORY_FILES.get(section)
     if not path:
@@ -101,8 +115,26 @@ def _load_section(section: str) -> any:
             with open(path) as f:
                 return json.load(f)
     except Exception as e:
-        logger.debug("Section load %s: %s", section, e)
+        _quarantine_corrupt_file(path, section, e)
+        logger.warning("Section load %s fell back to defaults after corruption recovery: %s", section, e)
     return None
+
+
+def _atomic_write_json(path: Path, value: any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, cls=SetEncoder)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _save_section(section: str, value: any) -> None:
@@ -110,9 +142,7 @@ def _save_section(section: str, value: any) -> None:
     if not path:
         return
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(value, f, indent=2)
+        _atomic_write_json(path, value)
     except Exception as e:
         logger.error("Section save %s: %s", section, e)
 
@@ -233,8 +263,7 @@ def _save(data: dict) -> None:
                         "history", "skill_metrics", "checkpoints", "consolidation",
                         "graph_nodes", "graph_edges", "steps"]:
                 _save_section(key, data.get(key, _fresh().get(key)))
-            with open(STORAGE_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write_json(STORAGE_FILE, data)
             _cache_state = {"data": copy.deepcopy(data), "mtime": _newest_mtime()}
         except Exception as e:
             logger.error("Storage save: %s", e)
@@ -246,9 +275,7 @@ def _save(data: dict) -> None:
 
 def save_last_run(snapshot: dict) -> None:
     try:
-        LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LAST_RUN_PATH, "w") as f:
-            json.dump(snapshot, f, indent=2, cls=SetEncoder)  # <-- FIXED: added cls=SetEncoder
+        _atomic_write_json(LAST_RUN_PATH, snapshot)
     except Exception as e:
         logger.error("Save last run: %s", e)
 
