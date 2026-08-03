@@ -6,6 +6,7 @@ All terminal, bash, and python calls route through here.
 import os
 import re
 import sys
+import time
 import signal
 import subprocess
 import logging
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field, asdict
 from config import get_profile_settings
+from agent.activity_timeline import emit_activity_event, update_activity_event
 
 logger = logging.getLogger(__name__)
 
@@ -555,7 +557,15 @@ def execute(
         set_execution_state(state)
 
     logger.info(f"executor[{mode}][{cwd}]: {command[:150]}")
+    activity_id = emit_activity_event(
+        event_type="terminal",
+        title="Terminal",
+        message=command[:160],
+        status="running",
+        details={"mode": mode, "cwd": cwd},
+    )
 
+    start = time.time()
     proc = None
     pid_key = None
     try:
@@ -603,6 +613,7 @@ def execute(
             except Exception:
                 pass
 
+        duration = round(time.time() - start, 2)
         data = {
             "stdout":    stdout[:MAX_OUTPUT],
             "stderr":    stderr[:10_000],
@@ -610,15 +621,32 @@ def execute(
             "cwd":       _cwd,
             "mode":      mode,
             "exec_count": _exec_count,
+            "duration_sec": duration,
         }
         update_execution_state(
             needs_confirmation=False,
             confirmation_reason="",
         )
+        if activity_id:
+            update_activity_event(
+                activity_id,
+                status="success" if proc.returncode == 0 else "warning",
+                message=command[:160],
+                details={
+                    "mode": mode,
+                    "cwd": _cwd,
+                    "exit_code": proc.returncode,
+                    "duration_sec": duration,
+                    "stdout": stdout[:4000],
+                    "stderr": stderr[:2000],
+                },
+            )
         return _success(data) if proc.returncode == 0 else _warn_data(data, f"Exit code {proc.returncode}")
     except Exception as e:
         if proc is not None:
             _kill_proc_group(proc)
+        if activity_id:
+            update_activity_event(activity_id, status="failed", message=str(e))
         return _error(str(e))
     finally:
         if pid_key is not None:

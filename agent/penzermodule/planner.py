@@ -159,6 +159,7 @@ class Planner:
         Returns: [{milestone, steps: [str]}]
         """
         agent._safe_status("Planning…")
+        activity_id = agent._emit_activity("thinking", "Planning task", message="Creating a plan for the requested work", details={"goal": goal[:160]})
         try:
             r = await asyncio.wait_for(
                 agent.llm.chat(
@@ -178,10 +179,13 @@ class Planner:
                     f"Planned {len(plan)} milestones: " +
                     "; ".join(m.get("milestone", "") for m in plan)[:200],
                 )
+                agent._update_activity(activity_id, status="success", message="Plan created")
                 return plan
         except Exception as e:
             logger.debug("Hierarchical planner: %s", e)
         agent._record_step("planning", "No hierarchical plan needed — proceeding directly.")
+        if activity_id:
+            agent._update_activity(activity_id, status="success", message="No hierarchical plan needed")
         return []
 
     async def _replan_milestone(self, agent, milestone: str, reason: str) -> list[str]:

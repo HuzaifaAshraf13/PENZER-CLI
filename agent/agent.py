@@ -34,6 +34,7 @@ from agent.system_prompts import build_system_prompt
 from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
 from tools.plugins import create_plugin_tool, load_plugin_tools
 from tools.executor import get_execution_state, update_execution_state, set_execution_state
+from agent.activity_timeline import emit_activity_event, update_activity_event, get_activity_timeline
 from agent.penzermodule import (
     Phase, PHASE_TRANSITIONS, PHASE_TO_GOAL_PROGRESS,
     BeliefManager, MemoryManager, Planner, ExecutionManager,
@@ -289,6 +290,12 @@ class PenzerAgent:
         except Exception:
             logger.exception("on_status callback raised")
 
+    def _emit_activity(self, event_type: str, title: str, message: str = "", status: str = "running", details: dict | None = None) -> str | None:
+        return emit_activity_event(event_type=event_type, title=title, message=message, status=status, details=details, run_id=self._run_id)
+
+    def _update_activity(self, event_id: str, **updates: dict) -> dict | None:
+        return update_activity_event(event_id, **updates)
+
     def _spawn_background(self, coro, name: str) -> None:
         """Launch a fire-and-forget coroutine with actual tracking:
         added to self._background_tasks (so _reset() can cancel
@@ -472,13 +479,55 @@ class PenzerAgent:
         self._task_insights     = get_insights(user_input, n=3)
         self._past_trajectories = get_similar_trajectories(user_input, n=2)
         episode_replay = get_episode_replay(user_input, n=3) if self._is_complex_task else ""
+        self._emit_activity(
+            "memory",
+            "Memory retrieval",
+            message=(
+                "Loaded historical memory and past experience."
+                if past_memory or past_mortems or self._task_insights or self._past_trajectories or episode_replay
+                else "No historical memory retrieved."
+            ),
+            status="success",
+            details={
+                "past_memory": bool(past_memory),
+                "past_mortems": len(past_mortems),
+                "insights": len(self._task_insights),
+                "trajectories": len(self._past_trajectories),
+                "episode_replay": bool(episode_replay),
+            },
+        )
         matched_gen  = search_generated_skills(
             user_input, self.gen_skills,
             context=build_context_from_history(self.history),
         )
+        self._emit_activity(
+            "search",
+            "Skill search",
+            message=f"Matched {len(matched_gen)} generated skills.",
+            status="success",
+            details={
+                "generated_skills": [s.name for s in matched_gen],
+                "query": user_input[:120],
+            },
+        )
         matched_core = self._match_core_skills(user_input)
         self._active_skills       = matched_core + list(matched_gen)
         self._matched_skills      = [s.name for s in self._active_skills]
+        self._emit_activity(
+            "skill",
+            "Skill matching",
+            message=(
+                "Matched at least one skill."
+                if self._matched_skills
+                else "No skills matched initially."
+            ),
+            status="success",
+            details={
+                "matched_skills": self._matched_skills,
+                "matched_core": [s.name for s in matched_core],
+                "matched_generated": [s.name for s in matched_gen],
+            },
+        )
         self._last_matched_skills = self._matched_skills
         self._novel_task          = not bool(self._matched_skills)
         if self._active_skills:
@@ -608,6 +657,21 @@ class PenzerAgent:
                 )
             if self._belief["goal_progress"] == "complete":
                 clear_last_run()
+            timeline = get_activity_timeline()
+            if timeline is not None:
+                self._emit_activity(
+                    "summary",
+                    "Run summary",
+                    message=(
+                        "Completed successfully." if self._belief["goal_progress"] == "complete" else "Run finished with partial progress."
+                    ),
+                    status="success",
+                    details={
+                        "iterations": self._iteration + 1,
+                        "tools_used": len(self._trace),
+                        "skills_matched": len(self._matched_skills),
+                    },
+                )
             if len(self._trace) >= COMPLEX_THRESHOLD:
                 completed, eval_reason = await self._evaluate_completion(user_input, result)
                 if completed is False:
@@ -947,6 +1011,13 @@ class PenzerAgent:
         self._active_skills.append(skill)
         self._matched_skills.append(skill.name)
         self._novel_task = False
+        self._emit_activity(
+            "skill",
+            "Skill selected",
+            message=f"Model self-selected skill '{skill.name}'.",
+            status="success",
+            details={"skill": skill.name},
+        )
         self._record_step(
             "recovery",
             f"Model self-selected skill '{skill.name}' (not in the initial "

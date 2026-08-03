@@ -10,6 +10,7 @@ import time, asyncio, inspect, json, re, hashlib, logging
 from tools.plugins import create_plugin_tool, load_plugin_tools
 from tools.executor import requires_privilege_escalation, SUDO_INTERACTIVE_TIMEOUT
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
+from agent.activity_timeline import emit_activity_event, update_activity_event
 
 logger = logging.getLogger(__name__)
 
@@ -160,11 +161,20 @@ class ExecutionManager:
         start = time.time()
         if name == "memory":
             agent._safe_status(f"🧠 {agent._fmt_action(name, args)}")
+            activity_id = agent._emit_activity(
+                "memory",
+                "Memory activity",
+                message=agent._fmt_action(name, args),
+                status="running",
+                details={"tool": name, "args": args},
+            )
             try:
                 raw = agent._run_memory_tool(args)
             except Exception as e:
                 logger.exception("Memory tool error")
                 raw = f"Error: {e}"
+            if activity_id:
+                agent._update_activity(activity_id, status="success" if not agent._is_error(raw) else "failed", message=str(raw)[:160], details={"tool": name, "result": str(raw)[:400]})
             return raw, round(time.time() - start, 2)
         # A call is valid if it's a registered MCP tool, the plugin_tool
         # creation action, or a dynamically created plugin (auto- or
@@ -176,6 +186,14 @@ class ExecutionManager:
         if name != "plugin_tool" and name not in agent._plugin_tools and name not in agent.tools:
             return f"Unknown tool '{name}'.", 0.0
         agent._safe_status(f"{TOOL_LABELS.get(name, name)} {agent._fmt_action(name, args)}")
+        event_type = "plugin" if name == "plugin_tool" or name in agent._plugin_tools else "tool"
+        activity_id = agent._emit_activity(
+            event_type,
+            f"{name} activity",
+            message=agent._fmt_action(name, args),
+            status="running",
+            details={"tool": name, "args": args},
+        )
         timeout = _call_timeout(name, args)
         try:
             raw = await asyncio.wait_for(agent._run(name, args), timeout=timeout)
@@ -184,6 +202,8 @@ class ExecutionManager:
         except Exception as e:
             logger.exception("Unhandled tool execution error: %s", name)
             raw = f"Error: {e}"
+        if activity_id:
+            agent._update_activity(activity_id, status="success" if not agent._is_error(raw) else "failed", message=str(raw)[:160], details={"tool": name, "result": str(raw)[:400]})
         return raw, round(time.time() - start, 2)
 
     async def _run_speculative(self, agent, calls: list) -> list[tuple[str, float]]:
@@ -563,20 +583,38 @@ class ExecutionManager:
             if _DANGEROUS_PLUGIN_PATTERNS.search(code):
                 logger.warning("Refusing explicit plugin creation — code matched a denylisted pattern")
                 return "Plugin creation declined — code matched a denylisted dangerous pattern"
+            activity_id = emit_activity_event(
+                "plugin",
+                "Plugin creation",
+                message=f"Creating plugin '{name}'",
+                status="running",
+                details={"name": name, "description": description},
+            )
             async with agent._plugin_lock:
                 try:
                     result = create_plugin_tool(name=name, description=description or "Generated plugin", code=code)
                 except Exception as exc:
+                    if activity_id:
+                        update_activity_event(activity_id, status="failed", message=str(exc))
                     return f"Plugin creation failed: {exc}"
                 agent._plugin_tools = load_plugin_tools()
                 tool_name = result.get("name", name)
                 if tool_name in agent._plugin_tools:
+                    if activity_id:
+                        update_activity_event(
+                            activity_id,
+                            status="success",
+                            message=f"Plugin created successfully: {tool_name}",
+                            details={"name": tool_name},
+                        )
                     agent._record_step(
                         "plugin_created",
                         f"Created reusable tool '{tool_name}': {description or 'Generated plugin'}",
                         tool=tool_name,
                     )
                     return f"Plugin created successfully: {tool_name}. It's now callable directly by name."
+                if activity_id:
+                    update_activity_event(activity_id, status="warning", message=f"Plugin created but not available: {tool_name}")
                 return f"Plugin created but not yet available: {tool_name}"
         return "Unknown plugin action"
 

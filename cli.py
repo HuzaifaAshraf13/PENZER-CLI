@@ -9,13 +9,14 @@ import subprocess
 import os
 import signal
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from rich.markdown import Markdown
 from rich.panel import Panel
 from logger import get_logger, console as console
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state, kill_all_running, set_live_hooks
 from config import PROFILE_OPTIONS, get_profile_settings, validate_config
+from agent.activity_timeline import ActivityTimeline, set_activity_timeline, get_activity_timeline
 
 logger = get_logger("cli")
 
@@ -52,6 +53,8 @@ class LiveStatusView:
         self.events: list[str] = []
         self._lock = threading.Lock()
         self.current_skill = ""
+        self.timeline = ActivityTimeline()
+        set_activity_timeline(self.timeline)
 
     def update_skill(self, skill_name: str) -> None:
         with self._lock:
@@ -74,14 +77,94 @@ class LiveStatusView:
             if self.current_skill:
                 lines.append(self.current_skill)
             lines.append(f"[bold]●[/] {self.current}")
-            recent = [event for event in self.events[-3:] if event != self.current]
-            if recent:
-                lines.append("  [dim]↳[/] " + " [dim]→[/] ".join(recent))
             state = format_execution_state()
             if state and state != "No execution state yet.":
                 first_state = state.splitlines()[0]
                 lines.append(f"  [dim]↳[/] {first_state}")
+            if self.timeline.events:
+                total_events = len(self.timeline.events)
+                active_events = sum(1 for event in self.timeline.events if event.get("status") == "running")
+                lines.append(f"[dim]{active_events}/{total_events} active activities[/dim]")
+                activity_text = self._render_activity_bubble()
+                if activity_text:
+                    lines.append("\n" + activity_text)
             return "\n".join(lines)
+
+    def _render_activity_bubble(self) -> str:
+        total_events = len(self.timeline.events)
+        active_events = sum(1 for event in self.timeline.events if event.get("status") == "running")
+        last_running = next((event for event in reversed(self.timeline.events) if event.get("status") == "running"), None)
+        event = last_running or (self.timeline.events[-1] if self.timeline.events else None)
+        if not event:
+            return "[dim]No activity yet.[/]"
+        status = event.get("status", "running")
+        label = self._activity_label(event)
+        summary_suffix = f"  [dim]({active_events}/{total_events} active)[/]" if total_events > 1 else ""
+        if status == "running":
+            bubble = f"[bold blue]●[/] [bold]{label}[/bold]{summary_suffix}"
+            bubble += "  [dim](type 'activity' to expand)[/]"
+            return bubble
+        if status == "success":
+            return f"[bold green]✓ Completed[/bold green] in {self._compute_total_duration()}s  [dim]({total_events} events total)[/dim]  [dim](type 'activity' to reopen)[/]"
+        if status == "failed":
+            return f"[bold red]✗ Failed[/bold red] — {label}  [dim]({total_events} events total)[/dim]  [dim](type 'activity' to inspect)[/]"
+        return f"[bold yellow]⚠[/bold yellow] {label}  [dim]({total_events} events total)[/dim]  [dim](type 'activity' to inspect)[/]"
+
+    def _short_label(self, text: str, max_chars: int = 40) -> str:
+        clean = " ".join(str(text or "").split())
+        if len(clean) <= max_chars:
+            return clean
+        return clean[: max_chars - 1].rstrip() + "…"
+
+    def _activity_label(self, event: dict[str, Any]) -> str:
+        event_type = event.get("event_type", "activity")
+        details = event.get("details") or {}
+        title = event.get("title") or event.get("message") or "Working"
+        message = str(event.get("message") or "")
+        if event_type == "terminal":
+            if message:
+                return f"Running command: {self._short_label(message, 50)}"
+            return "Running command…"
+        if event_type == "file_operation":
+            operation = str(details.get("operation") or event.get("title") or "file").lower()
+            path = details.get("path") or details.get("filepath") or details.get("file")
+            filename = Path(path).name if path else None
+            if operation in {"read", "list"}:
+                return f"Reading {filename or 'files'}…"
+            if operation in {"write", "replace", "append", "create", "delete"}:
+                if filename:
+                    return f"Updating {filename}…"
+                return "Updating files…"
+            return "Working with files…"
+        if event_type == "search":
+            query = details.get("query") or message
+            if query:
+                return f"Searching for {self._short_label(query, 40)}"
+            return "Searching…"
+        if event_type == "memory":
+            return "Recalling memory…"
+        if event_type == "plugin":
+            return "Managing plugins…"
+        if event_type == "skill":
+            return "Matching skills…"
+        if event_type == "thinking":
+            return "Planning task…"
+        if event_type == "tool":
+            tool_name = details.get("tool") or event.get("title")
+            if tool_name:
+                return f"Executing {self._short_label(tool_name, 40)}…"
+            return "Running skill…"
+        if event_type == "summary":
+            return "Finalizing results…"
+        return title
+
+    def _compute_total_duration(self) -> str:
+        total = 0.0
+        for event in self.timeline.events:
+            duration = event.get("details", {}).get("duration_sec")
+            if isinstance(duration, (int, float)):
+                total += float(duration)
+        return f"{total:.1f}"
 
 
 def clean_response(text: str) -> str:
@@ -171,11 +254,42 @@ def build_help_text() -> str:
         "• [cyan]state[/cyan]     Show current execution state",
         "• [cyan]memory[/cyan]    Show saved facts and memory state",
         "• [cyan]checkpoints[/cyan] Show saved checkpoints",
+        "• [cyan]activity[/cyan]  Show the execution activity drawer",
         "• [cyan]resume[/cyan]    Resume last interrupted task",
         "• [cyan]profile[/cyan]   Show or switch the current CLI profile",
         "• [cyan]benchmark[/cyan]  Show a lightweight quality summary",
+        "• [cyan]dashboard[/cyan] Show a runtime overview of memory, plugins, and health",
         "• [cyan]exit[/cyan]      Leave Penzer",
     ])
+
+
+def build_session_summary(*, history_entries: int, memory_entries: int, checkpoint_count: int, profile_name: str, last_goal: str | None = None) -> str:
+    """Build a compact CLI summary for the current session state."""
+    lines = [
+        f"Profile: {profile_name}",
+        f"History entries: {history_entries}",
+        f"Stored facts: {memory_entries}",
+        f"Checkpoints: {checkpoint_count}",
+    ]
+    if last_goal:
+        lines.append(f"Last goal: {last_goal}")
+    return "\n".join(lines)
+
+
+def build_dashboard_text(*, profile_name: str, history_entries: int, memory_entries: int, checkpoint_count: int, plugin_count: int, health_status: str, last_goal: str | None = None) -> str:
+    """Build a richer CLI dashboard overview for the current runtime state."""
+    lines = [
+        "[bold]Dashboard[/bold]",
+        f"Profile: {profile_name}",
+        f"Health: {health_status}",
+        f"History entries: {history_entries}",
+        f"Stored facts: {memory_entries}",
+        f"Checkpoints: {checkpoint_count}",
+        f"Plugins: {plugin_count}",
+    ]
+    if last_goal:
+        lines.append(f"Last goal: {last_goal}")
+    return "\n".join(lines)
 
 
 PENZER_LOGO = r"""
@@ -512,14 +626,30 @@ async def main():
             if user_input.lower() == "state":
                 console.print(Panel(format_execution_state(), title="Execution State", border_style="yellow"))
                 continue
+            if user_input.lower() in ("activity", "drawer"):
+                timeline = get_activity_timeline()
+                if timeline and timeline.events:
+                    console.print(Panel(timeline.render_drawer(), title="Execution Activity", border_style="cyan"))
+                else:
+                    console.print(Panel("No activity recorded yet.", title="Execution Activity", border_style="cyan"))
+                continue
             if user_input.lower() == "memory":
                 from session.memory import kv_list, load_history
+                history = load_history()
+                stored_facts = kv_list()
+                summary = build_session_summary(
+                    history_entries=len(history),
+                    memory_entries=max(1, len([line for line in str(stored_facts).splitlines() if line.strip()])),
+                    checkpoint_count=len(load_checkpoints()) if "load_checkpoints" in globals() else 0,
+                    profile_name=get_profile_settings()["name"],
+                    last_goal=(history[-1].get("goal") if history else None),
+                )
                 console.print(Panel(
                     "\n".join([
                         "[bold]Stored facts[/bold]",
-                        kv_list(),
+                        stored_facts or "(none)",
                         "",
-                        f"[dim]Recent history entries: {len(load_history())}[/dim]",
+                        summary,
                     ]),
                     title="Memory",
                     border_style="magenta",
@@ -591,21 +721,42 @@ async def main():
                     for name, description in PROFILE_OPTIONS.items():
                         console.print(f"  - {name}: {description}")
                 continue
-            if user_input.lower() == "benchmark":
-                from session.memory import load_history
+            if user_input.lower() == "dashboard":
+                from session.memory import load_history, load_checkpoints
+                from tools.plugins import list_plugin_metadata
                 history = load_history()
                 settings = get_profile_settings()
-                summary = {
-                    "history_entries": len(history),
-                    "profile": settings["name"],
-                    "memory_entries": len(history),
-                    "approval_required": settings["approval_required"],
-                }
+                doctor_report = run_doctor()
+                plugin_count = len(list_plugin_metadata())
+                dashboard = build_dashboard_text(
+                    profile_name=settings["name"],
+                    history_entries=len(history),
+                    memory_entries=len(history),
+                    checkpoint_count=len(load_checkpoints()),
+                    plugin_count=plugin_count,
+                    health_status="healthy" if doctor_report.get("ok") else "needs attention",
+                    last_goal=(history[-1].get("goal") if history else None),
+                )
+                console.print(Panel(dashboard, title="Dashboard", border_style="magenta"))
+                continue
+
+            if user_input.lower() == "benchmark":
+                from session.memory import load_history, load_checkpoints
+                history = load_history()
+                settings = get_profile_settings()
+                summary = build_session_summary(
+                    history_entries=len(history),
+                    memory_entries=len(history),
+                    checkpoint_count=len(load_checkpoints()),
+                    profile_name=settings["name"],
+                    last_goal=(history[-1].get("goal") if history else None),
+                )
                 console.print(Panel(
-                    f"History entries: {summary['history_entries']}\n"
-                    f"Profile: {summary['profile']}\n"
-                    f"Approval required: {summary['approval_required']}\n"
-                    f"Memory-backed context: enabled",
+                    "\n".join([
+                        summary,
+                        f"Approval required: {settings['approval_required']}",
+                        "Memory-backed context: enabled",
+                    ]),
                     title="Benchmark Summary",
                     border_style="cyan",
                 ))
@@ -633,7 +784,7 @@ async def main():
                 with console.status("[cyan]Working…[/cyan]", spinner="dots") as status:
                     def _on_status(msg: str) -> None:
                         status_view.update(msg)
-                        status.update(f"[cyan]{status_view.current}[/cyan]")
+                        status.update(status_view.render())
                     agent.on_status = _on_status
                     set_live_hooks(status.stop, status.start)
                     _current_task = asyncio.ensure_future(agent.run(user_input))
