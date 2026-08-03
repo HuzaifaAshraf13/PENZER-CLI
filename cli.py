@@ -122,6 +122,10 @@ class LiveStatusView:
         details = event.get("details") or {}
         title = event.get("title") or event.get("message") or "Working"
         message = str(event.get("message") or "")
+        if event_type == "progress":
+            if message:
+                return self._short_label(message, 60)
+            return "Progress update…"
         if event_type == "terminal":
             if message:
                 return f"Running command: {self._short_label(message, 50)}"

@@ -242,14 +242,17 @@ class Planner:
         ]
         agent._execution_queue[agent._execution_index:agent._execution_index] = new_items
         agent._execution_complete = False
+        agent._update_execution_progress()
 
     def _build_execution_queue(self, agent) -> None:
         agent._execution_queue = []
         agent._execution_index = 0
         agent._active_execution_item = None
         agent._execution_complete = False
+        agent._completed_milestone_indices = set()
         if not agent._milestones:
             agent._execution_complete = True
+            agent._update_execution_progress()
             return
         for milestone_idx, milestone in enumerate(agent._milestones):
             milestone_name = milestone.get("milestone", "").strip()
@@ -268,13 +271,16 @@ class Planner:
                         "milestone_idx": milestone_idx,
                         "step_index": step_idx,
                     })
+        agent._update_execution_progress()
 
     def _claim_next_execution_item(self, agent) -> dict | None:
         if agent._execution_complete:
+            agent._update_execution_progress()
             return None
         if agent._execution_index >= len(agent._execution_queue):
             agent._execution_complete = True
             agent._active_execution_item = None
+            agent._update_execution_progress()
             return None
         item = agent._execution_queue[agent._execution_index]
         agent._execution_index += 1
@@ -285,6 +291,7 @@ class Planner:
             agent._subtasks = agent._milestones[agent._milestone_idx].get("steps", [])
         else:
             agent._subtasks = getattr(agent, "_subtasks", [])
+        agent._update_execution_progress()
         return item
 
     _MAX_ITEM_RETRIES = 1
@@ -310,10 +317,15 @@ class Planner:
             # draining normally. _handle_stuck's milestone-replan / general
             # reflection path is the real recovery mechanism; this cap just
             # stops a permanently-broken step from looping forever.
+        milestone_idx = item.get("milestone_idx")
+        if item.get("kind") == "step" and milestone_idx is not None:
+            agent._completed_milestone_indices.add(milestone_idx)
         agent._execution_complete = agent._execution_index >= len(agent._execution_queue)
+        agent._update_execution_progress()
         if agent._execution_complete:
             # Previously this only happened at the top of the *next*
             # iteration's loop body — so a task that gave its final
             # answer in the same iteration its last step completed would
             # transition to DONE with `_milestones` still populated.
             agent._milestones = []
+            agent._update_execution_progress()

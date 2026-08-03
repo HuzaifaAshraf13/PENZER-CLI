@@ -212,6 +212,8 @@ class PenzerAgent:
         self._execution_index:     int   = 0
         self._active_execution_item: dict | None = None
         self._execution_complete:  bool  = False
+        self._execution_progress_event_id: str | None = None
+        self._completed_milestone_indices: set[int] = set()
         # Working memory (Miller's Law — max 7 items)
         self._working_mem: deque = deque(maxlen=WORKING_MEMORY_SIZE)
         # Belief state (ReflAct)
@@ -295,6 +297,51 @@ class PenzerAgent:
 
     def _update_activity(self, event_id: str, **updates: dict) -> dict | None:
         return update_activity_event(event_id, **updates)
+
+    def _update_execution_progress(self) -> None:
+        if not self._milestones and not self._execution_queue:
+            return
+        total = len(self._milestones) if self._milestones else len(self._execution_queue)
+        total = max(1, total)
+        if self._milestones:
+            completed = len(self._completed_milestone_indices)
+            pending = max(0, total - completed)
+            message = f"{completed}/{total} completed"
+            if completed >= total:
+                message = "completed"
+        else:
+            completed = self._execution_index if self._execution_index <= total else total
+            pending = max(0, total - completed)
+            message = f"{completed}/{total} completed"
+            if completed >= total and total:
+                message = "completed"
+        if self._execution_progress_event_id:
+            self._update_activity(
+                self._execution_progress_event_id,
+                status="running" if completed < total else "success",
+                message=message,
+                details={
+                    "completed": completed,
+                    "total": total,
+                    "pending": pending,
+                    "milestone": self._milestone_idx + 1 if self._milestones else None,
+                    "milestones_total": len(self._milestones),
+                },
+            )
+            return
+        self._execution_progress_event_id = self._emit_activity(
+            "progress",
+            "Execution progress",
+            message=message,
+            status="running",
+            details={
+                "completed": completed,
+                "total": total,
+                "pending": pending,
+                "milestone": self._milestone_idx + 1 if self._milestones else None,
+                "milestones_total": len(self._milestones),
+            },
+        )
 
     def _spawn_background(self, coro, name: str) -> None:
         """Launch a fire-and-forget coroutine with actual tracking:
@@ -631,6 +678,7 @@ class PenzerAgent:
             self._execution_complete = True
             self._record_step("planning", "Simple task — no milestone breakdown needed.")
         self._transition(Phase.EXECUTING, reason="initial planning complete")
+        self._update_execution_progress()
         self._flush_steps()
         result = await self._run_loop_safely()
         return await self._finalize(user_input, result)
@@ -1167,6 +1215,8 @@ class PenzerAgent:
                 or "broader connections" in lowered
                 or "did not perform" in lowered
                 or "was not performed" in lowered
+                or "services, routes" in lowered
+                or "services or routes" in lowered
             )
             if is_partial_signal:
                 partial_candidates.append(result)
@@ -1180,15 +1230,20 @@ class PenzerAgent:
                 )
                 if self._phase != Phase.BLOCKED:
                     self._transition(Phase.BLOCKED, reason="partial result surfaced before work complete")
-            else:
-                self._transition(Phase.DONE, reason="partial result surfaced as final output")
-                self._record_step(
-                    "final_answer",
-                    result[:200],
-                    reason="partial_result",
-                    partial_result=True,
-                )
                 self._persist_all()
+                # A concrete partial investigation result is still a useful
+                # terminal output for the user, even if there is more work
+                # queued. Returning it here avoids looping back into another
+                # reflection pass for the same incomplete finding.
+                return result
+            self._transition(Phase.DONE, reason="partial result surfaced as final output")
+            self._record_step(
+                "final_answer",
+                result[:200],
+                reason="partial_result",
+                partial_result=True,
+            )
+            self._persist_all()
             return result
 
         if self._failures >= MAX_FAILURES:
@@ -1314,6 +1369,12 @@ class PenzerAgent:
             self._resume_state["current_step"] = action_desc
             self._resume_state["completed_steps"] = self._resume_state.get("completed_steps", []) + [action_desc]
             self._resume_state["next_action"] = "Continue to the next step if needed"
+            self._resume_state["execution_progress"] = {
+                "completed": self._execution_index,
+                "total": len(self._execution_queue) if self._execution_queue else 0,
+                "status": "completed" if self._execution_complete else "in_progress",
+            }
+            self._update_execution_progress()
             if not ok:
                 self._resume_state["blocked_steps"] = self._resume_state.get("blocked_steps", []) + [action_desc]
             if ok:
