@@ -64,8 +64,27 @@ class MemoryManager:
         different process or agent instance. Defaults to this agent's own
         run (which stays the same run_id across a resume)."""
         return _get_persisted_steps(run_id=run_id or agent._run_id, n=n)
+
+    def get_run_trace(self, agent, run_id: str | None = None, n: int = 100) -> list[dict]:
+        """Replay a run's persisted step trace."""
+        return self.get_persisted_steps(agent, run_id=run_id, n=n)
+
+    def render_run_trace(self, agent, run_id: str | None = None, n: int = 100) -> str:
+        """Render a replayable summary of a persisted run trace."""
+        steps = self.get_run_trace(agent, run_id=run_id, n=n)
+        lines = []
+        for s in steps:
+            lines.append(
+                f"{s.get('iteration', '?'):>3} "
+                f"{s.get('phase', '?'):<10} "
+                f"{s.get('kind', '?'):<12} "
+                f"{s.get('description', '')}"
+            )
+        return "\n".join(lines)
+
     def clear_run_steps(self, agent, run_id: str | None = None) -> int:
         return _clear_persisted_steps(run_id=run_id or agent._run_id)
+
     def _update_working_memory(self, agent, tool: str, result: str, ok: bool) -> None:
         """Keep last WORKING_MEMORY_SIZE relevant facts from tool results."""
         if ok and result:

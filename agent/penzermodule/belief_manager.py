@@ -72,6 +72,15 @@ class BeliefManager:
         the class to make invalid transitions raise instead, to catch
         these during development.
         """
+        if to == Phase.DONE and agent._has_pending_work():
+            msg = (
+                "Refusing transition to DONE while execution work remains; "
+                "staying in BLOCKED instead."
+            )
+            if getattr(agent, "_phase_strict", False):
+                raise ValueError(msg)
+            logger.warning(msg)
+            to = Phase.BLOCKED
         if to != agent._phase and to not in PHASE_TRANSITIONS.get(agent._phase, set()):
             msg = f"Invalid phase transition {agent._phase.value} -> {to.value} ({reason})"
             if getattr(agent, "_phase_strict", False):

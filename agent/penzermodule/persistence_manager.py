@@ -101,10 +101,37 @@ class PersistenceManager:
         agent._active_execution_item = snapshot.get("active_execution_item", agent._active_execution_item)
         agent._belief = self._coerce_belief(snapshot.get("belief", agent._belief), agent._belief)
         try:
-            phase = Phase(snapshot.get("phase", agent._phase.value))
+            requested_phase = Phase(snapshot.get("phase", agent._phase.value))
         except ValueError:
-            phase = Phase.PLANNING
-        agent._transition(phase, reason="restored snapshot")
+            requested_phase = Phase.PLANNING
+        if requested_phase == Phase.DONE and agent._has_pending_work():
+            logger.warning(
+                "Restore rejected a DONE phase snapshot with pending execution work; reopening execution state"
+            )
+            requested_phase = Phase.BLOCKED
+            agent._execution_complete = False
+            agent._active_execution_item = None
+            if agent._milestones and not agent._execution_queue:
+                agent._execution_index = 0
+                agent._execution_queue = []
+                for milestone_idx, milestone in enumerate(agent._milestones):
+                    milestone_name = str(milestone.get("milestone", "")).strip()
+                    if milestone_name:
+                        agent._execution_queue.append({
+                            "kind": "milestone",
+                            "title": milestone_name,
+                            "milestone_idx": milestone_idx,
+                            "step_index": None,
+                        })
+                    for step_idx, step in enumerate(milestone.get("steps", []) or []):
+                        if step:
+                            agent._execution_queue.append({
+                                "kind": "step",
+                                "title": step,
+                                "milestone_idx": milestone_idx,
+                                "step_index": step_idx,
+                            })
+        agent._transition(requested_phase, reason="restored snapshot")
         agent._complexity_score = snapshot.get("complexity_score", agent._complexity_score)
         agent._is_complex_task = snapshot.get("is_complex_task", agent._is_complex_task)
         # NOTE: this is the single source of truth for max_iter on resume.
@@ -125,32 +152,33 @@ class PersistenceManager:
         agent._current_subtask = snapshot.get("current_subtask", agent._current_subtask)
         if not agent._execution_queue and agent._milestones:
             agent._execution_complete = False
-        elif agent._phase == Phase.DONE and agent._milestones and not agent._execution_complete:
+        elif agent._phase == Phase.DONE and agent._has_pending_work():
             logger.warning(
-                "Restore rejected a DONE phase snapshot with pending milestones; reopening execution state"
+                "Restore rejected a DONE phase snapshot with pending execution work; reopening execution state"
             )
             agent._transition(Phase.BLOCKED, reason="restored snapshot had stale done state")
             agent._execution_complete = False
-            agent._execution_queue = []
-            agent._execution_index = 0
             agent._active_execution_item = None
-            for milestone_idx, milestone in enumerate(agent._milestones):
-                milestone_name = str(milestone.get("milestone", "")).strip()
-                if milestone_name:
-                    agent._execution_queue.append({
-                        "kind": "milestone",
-                        "title": milestone_name,
-                        "milestone_idx": milestone_idx,
-                        "step_index": None,
-                    })
-                for step_idx, step in enumerate(milestone.get("steps", []) or []):
-                    if step:
+            if agent._milestones and not agent._execution_queue:
+                agent._execution_queue = []
+                agent._execution_index = 0
+                for milestone_idx, milestone in enumerate(agent._milestones):
+                    milestone_name = str(milestone.get("milestone", "")).strip()
+                    if milestone_name:
                         agent._execution_queue.append({
-                            "kind": "step",
-                            "title": step,
+                            "kind": "milestone",
+                            "title": milestone_name,
                             "milestone_idx": milestone_idx,
-                            "step_index": step_idx,
+                            "step_index": None,
                         })
+                    for step_idx, step in enumerate(milestone.get("steps", []) or []):
+                        if step:
+                            agent._execution_queue.append({
+                                "kind": "step",
+                                "title": step,
+                                "milestone_idx": milestone_idx,
+                                "step_index": step_idx,
+                            })
         # Fix #5: the snapshot previously omitted these — on an agent
         # instance reused across multiple run()/resume_last_task() calls
         # (agent.py now also calls _reset() before restoring, as a second

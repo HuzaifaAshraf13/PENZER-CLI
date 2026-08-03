@@ -208,6 +208,25 @@ def get_steps(run_id: str | None = None, n: int = 100) -> list[dict]:
     return steps[-n:]
 
 
+def get_run_trace(run_id: str | None = None, n: int = 100) -> list[dict]:
+    """Replay a run's persisted step trace for regression and inspection."""
+    return get_steps(run_id, n)
+
+
+def render_run_trace(run_id: str | None = None, n: int = 100) -> str:
+    """Render a replayable summary of a persisted run trace."""
+    steps = get_run_trace(run_id, n)
+    lines = []
+    for s in steps:
+        lines.append(
+            f"{s.get('iteration', '?'):>3} "
+            f"{s.get('phase', '?'):<10} "
+            f"{s.get('kind', '?'):<12} "
+            f"{s.get('description', '')}"
+        )
+    return "\n".join(lines)
+
+
 def clear_steps(run_id: str | None = None) -> int:
     """Clear steps, optionally only for one run. Returns count removed."""
     with _lock():

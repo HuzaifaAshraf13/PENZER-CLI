@@ -96,9 +96,10 @@ class ActivityTimeline:
         running = sum(1 for event in events if event.get("status") == "running")
         success = sum(1 for event in events if event.get("status") == "success")
         failed = sum(1 for event in events if event.get("status") == "failed")
+        completed = sum(1 for event in events if event.get("status") != "running")
         lines: list[str] = ["[timeline drawer] Execution activity"]
         lines.append(
-            f"Total events: {len(events)}  |  running: {running}  success: {success}  failed: {failed}  |  Duration: {total_duration:.1f}s"
+            f"Total events: {len(events)}  |  completed: {completed}/{len(events)}  running: {running}  success: {success}  failed: {failed}  |  Duration: {total_duration:.1f}s"
         )
         lines.append("")
 

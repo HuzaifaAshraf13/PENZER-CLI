@@ -93,19 +93,20 @@ class LiveStatusView:
     def _render_activity_bubble(self) -> str:
         total_events = len(self.timeline.events)
         active_events = sum(1 for event in self.timeline.events if event.get("status") == "running")
+        completed_events = sum(1 for event in self.timeline.events if event.get("status") != "running")
         last_running = next((event for event in reversed(self.timeline.events) if event.get("status") == "running"), None)
         event = last_running or (self.timeline.events[-1] if self.timeline.events else None)
         if not event:
             return "[dim]No activity yet.[/]"
         status = event.get("status", "running")
         label = self._activity_label(event)
-        summary_suffix = f"  [dim]({active_events}/{total_events} active)[/]" if total_events > 1 else ""
+        progress_suffix = f"  [dim]({completed_events}/{total_events} completed, {active_events} running)[/]" if total_events > 1 else ""
         if status == "running":
-            bubble = f"[bold blue]●[/] [bold]{label}[/bold]{summary_suffix}"
+            bubble = f"[bold blue]●[/] [bold]{label}[/bold]{progress_suffix}"
             bubble += "  [dim](type 'activity' to expand)[/]"
             return bubble
         if status == "success":
-            return f"[bold green]✓ Completed[/bold green] in {self._compute_total_duration()}s  [dim]({total_events} events total)[/dim]  [dim](type 'activity' to reopen)[/]"
+            return f"[bold green]✓ Completed[/bold green] in {self._compute_total_duration()}s  [dim]({completed_events}/{total_events} completed)[/dim]  [dim](type 'activity' to reopen)[/]"
         if status == "failed":
             return f"[bold red]✗ Failed[/bold red] — {label}  [dim]({total_events} events total)[/dim]  [dim](type 'activity' to inspect)[/]"
         return f"[bold yellow]⚠[/bold yellow] {label}  [dim]({total_events} events total)[/dim]  [dim](type 'activity' to inspect)[/]"

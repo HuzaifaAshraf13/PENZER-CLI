@@ -349,6 +349,13 @@ class PenzerAgent:
     def _max_iter_for_complexity(self, score: float) -> int:
         return self.planner._max_iter_for_complexity(score)
 
+    def _has_pending_work(self) -> bool:
+        return (
+            self._active_execution_item is not None
+            or not self._execution_complete
+            or bool(self._milestones)
+        )
+
     def _transition(self, to: Phase, reason: str = "") -> None:
         return self.belief._transition(self, to, reason)
 
@@ -363,6 +370,12 @@ class PenzerAgent:
 
     def get_persisted_steps(self, run_id: str | None = None, n: int = 100) -> list[dict]:
         return self.memory.get_persisted_steps(self, run_id, n)
+
+    def replay_run_trace(self, n: int = 100) -> list[dict]:
+        return self.get_persisted_steps(self._run_id, n)
+
+    def render_run_trace(self, n: int = 100) -> str:
+        return self.memory.render_run_trace(self, self._run_id, n)
 
     def clear_run_steps(self, run_id: str | None = None) -> int:
         return self.memory.clear_run_steps(self, run_id)
@@ -730,6 +743,16 @@ class PenzerAgent:
     def _check_consistency(self) -> list[str]:
         return self.belief._check_consistency(self)
 
+    def _log_runtime_invariants(self) -> None:
+        violations = self._check_consistency()
+        if violations:
+            logger.warning("Runtime invariant violation(s): %s", "; ".join(violations))
+            self._record_step(
+                "invariant_violation",
+                f"Runtime invariant breach: {'; '.join(violations)}",
+                violations=violations,
+            )
+
     async def _evaluate_completion(self, goal: str, result: str) -> tuple[bool | None, str]:
         return await self.reflection._evaluate_completion(self, goal, result)
 
@@ -935,6 +958,7 @@ class PenzerAgent:
         if len(self.history) > TRIM_AT and not self._trimming:
             self._spawn_background(self._trim(), "trim")
         self._safe_status("Reasoning about next step…" if i == 0 else "Continuing…")
+        self._log_runtime_invariants()
         if self._active_execution_item is None:
             item = self._claim_next_execution_item()
             if item is not None:
@@ -1030,6 +1054,18 @@ class PenzerAgent:
         # is told to do next.
         self._orchestrate_skills()
 
+    def _looks_like_malformed_tool_payload(self, text: str) -> bool:
+        try:
+            data = json.loads(text)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        if any(key in data for key in ("tool", "tools", "tool_calls")):
+            if not data.get("answer") and not data.get("thought"):
+                return True
+        return False
+
     def _handle_empty_calls(self, text: str, empty: int) -> tuple[str | None, int]:
         """Handles a model turn that proposed no tool calls: either a
         final answer (closes out the run) or a non-actionable turn
@@ -1037,10 +1073,25 @@ class PenzerAgent:
         in a row). Returns (result, empty) — result is the string to
         return from _loop() when non-None; when None, the loop should
         `continue` with the updated empty counter."""
+        if text and self._looks_like_malformed_tool_payload(text):
+            self._record_step(
+                "trusted_data",
+                "Detected malformed tool payload instead of a final answer.",
+                reason="malformed_tool_payload",
+            )
+            self.history.append({
+                "role": "user",
+                "content": "The assistant response was not a valid final answer. Continue working on the task.",
+            })
+            return None, empty
         if text:
             self.history.append({"role": "assistant", "content": text})
             self._record_step("final_answer", text[:200])
-            unfinished = [] if self._execution_complete else self._execution_queue[self._execution_index:]
+            unfinished = []
+            if self._active_execution_item is not None:
+                unfinished.append(self._active_execution_item)
+            if not self._execution_complete:
+                unfinished.extend(self._execution_queue[self._execution_index:])
             if unfinished:
                 self._record_step(
                     "give_up",
@@ -1050,16 +1101,22 @@ class PenzerAgent:
                     pending_items=len(unfinished),
                     pending_titles=[i.get("title", "") for i in unfinished[:3]],
                 )
-                # Keep the run honest and resumable when the model gives a
-                # final answer before the queued execution work is actually
-                # drained. Transitioning to DONE here previously cleared the
-                # queue/milestones and made the run look fully complete even
-                # though pending work remained. Leave the run in BLOCKED so
-                # the next resume or recovery pass can continue from the
-                # existing plan instead of pretending the task finished.
                 self._transition(Phase.BLOCKED, reason="final answer given before queue drained")
                 self._execution_complete = False
-                return text, empty
+                note = (
+                    f"[NOTE: This is a partial answer. {len(unfinished)} pending item(s) remain. "
+                    "The task was not fully completed yet.]"
+                )
+                if empty < 1:
+                    self.history.append({
+                        "role": "user",
+                        "content": (
+                            f"Task still has {len(unfinished)} unclaimed planned item(s). "
+                            "Continue working until all steps are complete or explicitly explain why they are not needed."
+                        ),
+                    })
+                    return None, empty + 1
+                return f"{text} {note}", empty
             self._transition(Phase.DONE, reason="final answer given")
             if self._active_execution_item is not None:
                 self._complete_current_execution_item(success=True)
@@ -1115,14 +1172,23 @@ class PenzerAgent:
                 partial_candidates.append(result)
         if partial_candidates:
             result = partial_candidates[-1]
-            self._transition(Phase.DONE, reason="partial result surfaced as final output")
-            self._record_step(
-                "final_answer",
-                result[:200],
-                reason="partial_result",
-                partial_result=True,
-            )
-            self._persist_all()
+            if self._has_pending_work():
+                self._record_step(
+                    "give_up",
+                    "Partial result surfaced while execution work remains.",
+                    reason="partial_result_with_pending_work",
+                )
+                if self._phase != Phase.BLOCKED:
+                    self._transition(Phase.BLOCKED, reason="partial result surfaced before work complete")
+            else:
+                self._transition(Phase.DONE, reason="partial result surfaced as final output")
+                self._record_step(
+                    "final_answer",
+                    result[:200],
+                    reason="partial_result",
+                    partial_result=True,
+                )
+                self._persist_all()
             return result
 
         if self._failures >= MAX_FAILURES:
@@ -1293,6 +1359,33 @@ class PenzerAgent:
     # ------------------------------------------------------------------
     # LLM call wrapper
     # ------------------------------------------------------------------
+    def _normalize_tool_calls(self, tool_calls: Any) -> list[dict]:
+        if tool_calls is None:
+            return []
+        if not isinstance(tool_calls, list):
+            raise ValueError(f"LLM response 'tool_calls' was {type(tool_calls).__name__}, expected list")
+        normalized = []
+        for idx, call in enumerate(tool_calls, start=1):
+            if not isinstance(call, dict):
+                raise ValueError(
+                    f"LLM response tool call #{idx} was {type(call).__name__}, expected dict"
+                )
+            name = call.get("name") or call.get("tool")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"LLM response tool call #{idx} missing or invalid 'name'"
+                )
+            args = call.get("arguments") if "arguments" in call else call.get("args", {})
+            if not isinstance(args, dict):
+                raise ValueError(
+                    f"LLM response tool call #{idx} 'arguments' was {type(args).__name__}, expected dict"
+                )
+            call_id = call.get("id", f"tool_call_{idx}")
+            if not isinstance(call_id, str):
+                call_id = str(call_id)
+            normalized.append({"id": call_id, "name": name, "arguments": args})
+        return normalized
+
     def _validate_llm_response(self, r: Any) -> dict:
         """Normalizes/validates the raw LLM response shape. _loop does
         `r.get("tool_calls") or []` and `r.get("content", "").strip()`
@@ -1305,12 +1398,13 @@ class PenzerAgent:
         rather than an unhandled crash."""
         if not isinstance(r, dict):
             raise ValueError(f"LLM response was {type(r).__name__}, expected dict")
-        tool_calls = r.get("tool_calls")
-        if tool_calls is not None and not isinstance(tool_calls, list):
-            raise ValueError(f"LLM response 'tool_calls' was {type(tool_calls).__name__}, expected list")
         content = r.get("content")
         if content is not None and not isinstance(content, str):
             raise ValueError(f"LLM response 'content' was {type(content).__name__}, expected str")
+        normalized_calls = self._normalize_tool_calls(r.get("tool_calls"))
+        r["tool_calls"] = normalized_calls
+        if content is None:
+            r["content"] = ""
         return r
 
     async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
