@@ -1,8 +1,10 @@
 """
 tools/executor.py
+
 Unified safe executor — single entry point for all code/command execution.
 All terminal, bash, and python calls route through here.
 """
+
 import os
 import re
 import sys
@@ -18,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, field, asdict
+
 from config import get_profile_settings
 from agent.activity_timeline import emit_activity_event, update_activity_event
 
@@ -63,6 +66,7 @@ def set_live_hooks(pause, resume) -> None:
 DEFAULT_TIMEOUT   = 60       # seconds
 MAX_TIMEOUT       = 3600     # 1 hour hard cap
 MAX_OUTPUT        = 50_000   # chars
+MAX_STDERR_OUTPUT = 10_000   # chars
 MAX_MEMORY_MB     = 512      # MB RAM limit per process
 
 DANGEROUS_PATTERNS = [
@@ -79,6 +83,14 @@ SENSITIVE_PATTERNS = [
     "wget -qO-", "wget ", "git clone", "ssh ", "scp ", "rsync ",
     "http://", "https://",
 ]
+
+# NOTE: DANGEROUS_PATTERNS / SENSITIVE_PATTERNS are substring checks on
+# the raw command text. They are a UX nudge (surface a confirmation
+# prompt for common risky forms), NOT a security boundary — trivial
+# obfuscation (quoting, $IFS, base64 payloads, extra whitespace) can
+# bypass them silently. The actual control point is confirm_action()
+# plus whatever sandboxing/permissions the OS user account already has.
+# Do not treat an empty match here as "this command is safe."
 
 # ─────────────────────────────────────────
 # PRIVILEGE ESCALATION (sudo / su / pkexec / doas)
@@ -116,6 +128,10 @@ PRIVILEGE_PATTERN = re.compile(r'(?:^|[;&|\n]\s*)(sudo|su|pkexec|doas)\b', re.IG
 # that gets logged to _change_log/history/memory. Terminal inheritance
 # only protects a password the user types interactively at a real
 # prompt; it does nothing for one already embedded in the command.
+# NOTE: like the dangerous/sensitive lists above, this is a best-effort
+# detector for known forms (-S/--stdin/heredoc/pipe-from-echo), not an
+# exhaustive guarantee — e.g. SUDO_ASKPASS tricks or combined short
+# flags (-Sk) aren't matched. It catches the common, careless case.
 SUDO_PASSWORD_LEAK_PATTERN = re.compile(
     r'(sudo\s+(-S\b|--stdin\b)|\bsudo\b.*<<<|(echo|printf)\s+\S+\s*\|\s*sudo\b)',
     re.IGNORECASE,
@@ -125,6 +141,11 @@ SUDO_PASSWORD_LEAK_PATTERN = re.compile(
 # time it takes a human to notice the password prompt and type it. Much
 # longer than DEFAULT_TIMEOUT (60s) — that's sized for non-interactive
 # commands, not "human has to go find their password."
+#
+# This value (and only this value) is allowed to exceed MAX_TIMEOUT for
+# the privileged-interactive path specifically — see the timeout clamp
+# comment in execute() below. Every other execution path is hard-capped
+# at MAX_TIMEOUT regardless of what the caller passes in.
 SUDO_INTERACTIVE_TIMEOUT = 300
 
 
@@ -139,12 +160,32 @@ def has_sudo_password_leak_risk(command: str) -> bool:
     return bool(SUDO_PASSWORD_LEAK_PATTERN.search(command))
 
 
-_cwd = os.getcwd()
+# Captured once at import time — the process's real OS working directory
+# at startup. Used as the anchor for the approval-audit log path so that
+# audit records always land in the same place regardless of how the
+# *tracked* `_cwd` (which changes as the agent runs `cd`) drifts over
+# the session. Previously `_APPROVAL_AUDIT_PATH` was built from a bare
+# relative `Path("logs")`, which resolves against the process's actual
+# OS cwd at the moment `open()` is called — not against `_cwd` — so if
+# those two ever diverged, audit entries could silently end up in an
+# unexpected directory.
+_INITIAL_CWD = os.getcwd()
+
+_cwd = _INITIAL_CWD
 _change_log: list = []
 _exec_count: int = 0
 _exec_budget: int = 100  # max executions per session
 _execution_state: dict = {}
-_APPROVAL_AUDIT_PATH = Path("logs") / "approval_audit.jsonl"
+
+# Guards read-then-increment of _exec_count / _exec_budget so concurrent
+# execute() calls (e.g. from batched/parallel tool calls) can't both pass
+# the budget check before either has incremented, letting the session
+# run over budget. Separate from _confirm_lock / _running_lock since
+# this guards a different critical section (budget bookkeeping, not
+# stdin or the process registry).
+_budget_lock = threading.Lock()
+
+_APPROVAL_AUDIT_PATH = Path(_INITIAL_CWD) / "logs" / "approval_audit.jsonl"
 _APPROVAL_AUDIT_LOCK = threading.RLock()
 
 # ─────────────────────────────────────────
@@ -181,6 +222,7 @@ def kill_all_running() -> int:
     Forcibly terminate every command currently in flight. Kills the whole
     process group (not just the direct child) so tools that spawn their
     own subprocesses — nmap included — don't leave orphans behind.
+
     Returns the number of processes killed.
     """
     with _running_lock:
@@ -224,8 +266,9 @@ class ExecutionState:
 # SAFETY
 # ─────────────────────────────────────────
 def is_dangerous(command: str) -> tuple[bool, str]:
+    lowered = command.lower()
     for p in DANGEROUS_PATTERNS:
-        if p.lower() in command.lower():
+        if p.lower() in lowered:
             return True, p
     return False, ""
 
@@ -241,6 +284,7 @@ CONFIRM_TIMEOUT_DEFAULT = 120  # seconds — how long we wait for a yes/no
 def _read_line_with_timeout(prompt: str, timeout: Optional[float]):
     """
     Reads one line of input without blocking the caller indefinitely.
+
     Runs the actual input() call on a background thread and waits on it
     through a queue with a timeout — if nobody answers in time, this
     returns None and the CALLER stops waiting.
@@ -253,12 +297,23 @@ def _read_line_with_timeout(prompt: str, timeout: Optional[float]):
     this introduces; what changes is that the caller's decision is no
     longer held hostage to it — a timeout is treated as "not answered"
     and the run moves on instead of hanging.
+
+    Residual risk: if a NEW call to this function starts before an
+    earlier orphaned thread's input() has resolved, both threads are
+    technically reading from the same real stdin. _confirm_lock
+    serializes the prompts *shown* to the user, but it cannot cancel an
+    already-orphaned background thread, so in rare cases a stray
+    keystroke sequence could be consumed by the stale thread instead of
+    the active prompt. This is a known limitation of bounding a
+    blocking call this way in Python, not something fixable without
+    dropping input() for a cancellable I/O primitive.
     """
     if timeout is None:
         try:
             return input(prompt)
         except (EOFError, KeyboardInterrupt):
             return None
+
     q: "queue.Queue" = queue.Queue(maxsize=1)
 
     def _reader():
@@ -293,6 +348,7 @@ def _log_approval_decision(command: str, category: str, decision: str, reason: s
     no_response — into the audit trail, not just successful executions.
     Before this, declining a command (or a prompt timing out) left no
     trace anywhere; only successful runs ever got a _change_log entry.
+
     This is what "audit trail" means in AI-agent governance guidance
     (capture what was proposed and what was decided, even when the
     answer was no) — see the module-level research note above
@@ -341,6 +397,7 @@ def confirm_action(
         prompt = f"{reason}\n{prompt}"
     if timeout is not None:
         prompt = f"{prompt} (auto-declines in {int(timeout)}s if no response) "
+
     response = None
     with _confirm_lock:
         if _pause_live is not None:
@@ -356,14 +413,16 @@ def confirm_action(
                     _resume_live()
                 except Exception:
                     pass
+
     if response is None:
         return False
     return response.strip().lower() in {"y", "yes"}
 
 
 def is_sensitive(command: str) -> bool:
+    lowered = command.lower()
     for p in SENSITIVE_PATTERNS:
-        if p.lower() in command.lower():
+        if p.lower() in lowered:
             return True
     return False
 
@@ -375,8 +434,29 @@ def _set_limits():
     try:
         mem = MAX_MEMORY_MB * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_set_limits: failed to apply RLIMIT_AS: %s", exc)
+
+
+def _check_and_reserve_budget() -> bool:
+    """
+    Atomically checks the execution budget and, if there's room,
+    reserves a slot by incrementing _exec_count immediately — before
+    the caller does any actual work. Without this being atomic,
+    concurrent execute() calls (batched/parallel tool calls) could both
+    read _exec_count < _exec_budget as true before either had
+    incremented, letting the session run past budget by up to
+    (concurrency - 1) calls.
+
+    Returns True if a slot was reserved, False if the budget is
+    exhausted (nothing is incremented in that case).
+    """
+    global _exec_count
+    with _budget_lock:
+        if _exec_count >= _exec_budget:
+            return False
+        _exec_count += 1
+        return True
 
 
 # ─────────────────────────────────────────
@@ -399,18 +479,24 @@ def execute(
     Args:
         command: Bash command or Python code to run
         mode: "bash" or "python"
-        timeout: Seconds before kill (capped at MAX_TIMEOUT)
+        timeout: Seconds before kill (capped at MAX_TIMEOUT — except for
+            the privilege-escalation path, which is allowed to run up to
+            SUDO_INTERACTIVE_TIMEOUT to give a human time to type a
+            password; see the comment at that branch below)
         workdir: Working directory override
         force: Bypass dangerous command check. Does NOT bypass the
             privilege-escalation check below — see PRIVILEGE_PATTERN
             docstring for why that one is architectural, not a content
             filter `force` is meant to override.
         venv_path: Path to Python binary (for venv support)
+        state: Optional partial execution-state update, merged into the
+            existing tracked state (NOT a wholesale replacement — see
+            update_execution_state). Applied before the command runs.
 
     Returns:
         dict with stdout, stderr, exit_code, cwd, mode
     """
-    global _cwd, _change_log, _exec_count
+    global _cwd, _change_log
 
     if approval_required is None:
         approval_required = get_profile_settings().get("approval_required", True)
@@ -418,8 +504,21 @@ def execute(
     if not command or not command.strip():
         return _error("No command provided")
 
-    # Budget check
-    if _exec_count >= _exec_budget:
+    # Apply any caller-supplied state update up front via a MERGE, not a
+    # replace — update_execution_state() merges into the existing dict,
+    # so it can never silently discard needs_confirmation/
+    # confirmation_reason flags that safety checks below are about to
+    # set. (Previously this called set_execution_state(state), which
+    # replaces _execution_state wholesale and — if it ran after the
+    # dangerous/sensitive/privileged branches below had already flagged
+    # needs_confirmation=True — would wipe that flag back out before the
+    # caller ever saw it.)
+    if state:
+        update_execution_state(**state)
+
+    # Budget check — atomic reserve, not read-then-increment, so
+    # concurrent calls can't both slip through. See _check_and_reserve_budget.
+    if not _check_and_reserve_budget():
         return _error(f"Execution budget exhausted ({_exec_budget} calls). Reset session to continue.")
 
     # ── Privilege escalation check — ALWAYS enforced, first, independent
@@ -436,6 +535,7 @@ def execute(
                 "and memory. If you need to run this, do it directly in your "
                 "own terminal, not through Penzer."
             )
+
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
             # No real controlling terminal attached to this process (e.g.
             # headless, under a supervisor, no pty). Promising "your
@@ -450,6 +550,7 @@ def execute(
                 "safe for a password prompt to go. Run this yourself in "
                 f"your own terminal:\n\n  {command}"
             )
+
         # A command can be BOTH privileged AND match a dangerous/sensitive
         # pattern (e.g. `sudo rm -rf /important`). The privilege check
         # runs first and gates the whole thing either way, but the
@@ -494,8 +595,14 @@ def execute(
                         pass
                 _log_approval_decision(command, "privileged", "denied", audit_reason)
                 return _warn(f"{priv_tool} command not approved. Execution cancelled by user.")
+
             _log_approval_decision(command, "privileged", "approved", audit_reason)
             try:
+                # NOTE: intentionally NOT clamped to MAX_TIMEOUT — a human
+                # typing a password needs more room than the normal
+                # non-interactive cap allows. This is the one path where
+                # exceeding MAX_TIMEOUT is deliberate; every other branch
+                # below still clamps via min(timeout, MAX_TIMEOUT).
                 return _run_privileged_interactive(
                     command, cwd=workdir or _cwd, timeout=max(timeout, SUDO_INTERACTIVE_TIMEOUT)
                 )
@@ -550,13 +657,25 @@ def execute(
     if mode == "python":
         python_bin = venv_path or _find_venv_python(cwd) or "python3"
         cmd = [python_bin, "-c", command]
+        tracks_cwd = False
     else:
-        cmd = ["bash", "-c", command]
-
-    if state:
-        set_execution_state(state)
+        # cwd tracking: if the command looks like it might change directory,
+        # append a marker line that prints the shell's OWN final `pwd` onto
+        # the SAME invocation, instead of re-running the whole command a
+        # second time afterward just to ask where it ended up. Re-running
+        # was the previous approach and it silently double-executed any
+        # side effects in the command (e.g. `rm file && cd ..` would have
+        # deleted twice). Word-boundary matched so `echo "cd to the shop"`
+        # doesn't trigger the extra marker for no reason.
+        tracks_cwd = bool(re.search(r'(?:^|[;&|\n]\s*)cd(?:\s|$)', command))
+        if tracks_cwd:
+            shell_command = f'{command}\nprintf "\\n__EXECUTOR_PWD__%s\\n" "$(pwd)"'
+        else:
+            shell_command = command
+        cmd = ["bash", "-c", shell_command]
 
     logger.info(f"executor[{mode}][{cwd}]: {command[:150]}")
+
     activity_id = emit_activity_event(
         event_type="terminal",
         title="Terminal",
@@ -585,6 +704,7 @@ def execute(
             start_new_session=True,
         )
         pid_key = _register_proc(proc)
+
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -592,7 +712,6 @@ def execute(
             proc.wait(timeout=5)
             return _error(f"Timed out after {timeout}s")
 
-        _exec_count += 1
         _change_log.append({
             "mode": mode,
             "command": command[:200],
@@ -600,33 +719,39 @@ def execute(
             "cwd": cwd,
         })
 
-        # Update cwd if cd was used
-        if mode == "bash" and "cd " in command:
-            try:
-                result = subprocess.run(
-                    ["bash", "-c", f"{command} > /dev/null 2>&1; pwd"],
-                    capture_output=True, text=True, cwd=cwd, timeout=5,
-                )
-                new_cwd = result.stdout.strip().splitlines()[-1]
+        # Pull the marker line (appended to the single invocation above)
+        # back out of stdout, use it to update the tracked cwd, and strip
+        # it so the caller never sees our internal marker text.
+        if tracks_cwd:
+            marker_match = re.search(r'__EXECUTOR_PWD__(.*)', stdout)
+            if marker_match:
+                new_cwd = marker_match.group(1).strip()
+                stdout = stdout[:marker_match.start()].rstrip("\n")
                 if new_cwd and os.path.isdir(new_cwd):
                     _cwd = new_cwd
-            except Exception:
-                pass
 
         duration = round(time.time() - start, 2)
+
+        stdout_truncated = len(stdout) > MAX_OUTPUT
+        stderr_truncated = len(stderr) > MAX_STDERR_OUTPUT
+
         data = {
             "stdout":    stdout[:MAX_OUTPUT],
-            "stderr":    stderr[:10_000],
+            "stderr":    stderr[:MAX_STDERR_OUTPUT],
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
             "exit_code": proc.returncode,
             "cwd":       _cwd,
             "mode":      mode,
             "exec_count": _exec_count,
             "duration_sec": duration,
         }
+
         update_execution_state(
             needs_confirmation=False,
             confirmation_reason="",
         )
+
         if activity_id:
             update_activity_event(
                 activity_id,
@@ -641,7 +766,9 @@ def execute(
                     "stderr": stderr[:2000],
                 },
             )
+
         return _success(data) if proc.returncode == 0 else _warn_data(data, f"Exit code {proc.returncode}")
+
     except Exception as e:
         if proc is not None:
             _kill_proc_group(proc)
@@ -681,7 +808,7 @@ def _run_privileged_interactive(command: str, cwd: str, timeout: int) -> dict:
     a piped stderr is exactly the channel that would otherwise let the
     password prompt (or anything else the command prints) get logged.
     """
-    global _exec_count, _change_log
+    global _change_log
     proc = None
     pid_key = None
     try:
@@ -692,6 +819,7 @@ def _run_privileged_interactive(command: str, cwd: str, timeout: int) -> dict:
             start_new_session=True,
         )
         pid_key = _register_proc(proc)
+
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -699,7 +827,6 @@ def _run_privileged_interactive(command: str, cwd: str, timeout: int) -> dict:
             proc.wait(timeout=5)
             return _error(f"Timed out after {timeout}s waiting for the privileged command to finish.")
 
-        _exec_count += 1
         _change_log.append({
             "mode": "bash",
             "command": command[:200],
@@ -707,6 +834,7 @@ def _run_privileged_interactive(command: str, cwd: str, timeout: int) -> dict:
             "cwd": cwd,
             "privileged": True,
         })
+
         data = {
             "stdout": "(privileged command — output printed directly to your terminal, not captured)",
             "stderr": "",
@@ -735,13 +863,14 @@ def _kill_proc_group(proc: subprocess.Popen) -> None:
     except (ProcessLookupError, PermissionError):
         try:
             proc.kill()
-        except Exception:
-            pass
-    except Exception:
+        except Exception as exc:
+            logger.debug("_kill_proc_group: fallback kill() failed: %s", exc)
+    except Exception as exc:
+        logger.debug("_kill_proc_group: killpg failed (%s), falling back to kill()", exc)
         try:
             proc.kill()
-        except Exception:
-            pass
+        except Exception as exc2:
+            logger.debug("_kill_proc_group: fallback kill() also failed: %s", exc2)
 
 
 # ─────────────────────────────────────────
@@ -769,6 +898,12 @@ def set_exec_budget(budget: int) -> None:
 
 
 def reset() -> None:
+    """Reset session bookkeeping. Deliberately does NOT reset `_cwd` —
+    the tracked working directory persists across a `reset()` unless the
+    caller also passes a fresh workdir, since a "fresh session" doesn't
+    necessarily mean "go back to wherever the process originally
+    started." If you want the pre-session cwd back, pass
+    workdir=_INITIAL_CWD explicitly on the next execute() call."""
     global _change_log, _exec_count, _execution_state
     _change_log = []
     _exec_count = 0
@@ -776,6 +911,12 @@ def reset() -> None:
 
 
 def set_execution_state(state: dict) -> None:
+    """Replace the entire tracked execution-state dict wholesale.
+    Prefer update_execution_state(**updates) for partial updates —
+    this function intentionally clobbers everything, including any
+    needs_confirmation/confirmation_reason flags a safety check may
+    have just set, so only call it when you actually mean to discard
+    prior state (e.g. starting a brand-new plan)."""
     global _execution_state
     _execution_state = state
 
@@ -791,6 +932,7 @@ def format_execution_state() -> str:
     completed = state.get("completed_steps", []) or []
     blocked = state.get("blocked_steps", []) or []
     next_action = state.get("next_action", "") or ""
+
     lines = []
     if goal:
         lines.append(f"Goal: {goal}")
@@ -808,6 +950,11 @@ def format_execution_state() -> str:
 
 
 def update_execution_state(**updates) -> dict:
+    """Merge `updates` into the existing tracked state (partial update),
+    never replaces the whole dict — that's what set_execution_state is
+    for. This is what lets execute() apply a caller-supplied `state=`
+    argument and a safety check's needs_confirmation flag in the same
+    call without one silently overwriting the other."""
     global _execution_state
     state = _execution_state.setdefault("state", ExecutionState().to_dict())
     if not isinstance(state, dict):
