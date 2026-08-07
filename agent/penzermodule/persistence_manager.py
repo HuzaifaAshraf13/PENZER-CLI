@@ -1,4 +1,5 @@
 """PENZER — PersistenceManager
+
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -9,13 +10,18 @@ the agent needs to change.
 import logging
 from collections import defaultdict, deque
 from datetime import datetime
+
 from session.memory import (
     save_last_run, add_checkpoint,
 )
 from tools.executor import set_execution_state
 from agent.config import TRIM_AT, KEEP_LAST, MAX_CONSISTENCY_VIOLATIONS
+
 logger = logging.getLogger(__name__)
+
 from agent.penzermodule.belief_manager import Phase
+
+
 class PersistenceManager:
     def _coerce_belief(self, belief: object, fallback: dict) -> dict:
         if isinstance(belief, dict):
@@ -37,11 +43,35 @@ class PersistenceManager:
         logger.warning("Restore received malformed belief payload; using defaults")
         return dict(fallback)
 
+    def _rebuild_execution_queue_from_milestones(self, agent) -> list:
+        """Shared by both call sites below (initial malformed/missing
+        execution_queue recovery, and the DONE-with-pending-work
+        recovery) so the two rebuild code paths can't drift out of sync
+        with each other."""
+        queue = []
+        for milestone_idx, milestone in enumerate(agent._milestones):
+            milestone_name = str(milestone.get("milestone", "")).strip()
+            if milestone_name:
+                queue.append({
+                    "kind": "milestone",
+                    "title": milestone_name,
+                    "milestone_idx": milestone_idx,
+                    "step_index": None,
+                })
+            for step_idx, step in enumerate(milestone.get("steps", []) or []):
+                if step:
+                    queue.append({
+                        "kind": "step",
+                        "title": step,
+                        "milestone_idx": milestone_idx,
+                        "step_index": step_idx,
+                    })
+        return queue
+
     def _restore_snapshot(self, agent, snapshot: dict) -> None:
         if not isinstance(snapshot, dict):
             logger.warning("Restore received malformed snapshot payload of type %s; using defaults", type(snapshot).__name__)
             snapshot = {}
-
         agent._goal = snapshot.get("goal", agent._goal)
         agent._run_id = snapshot.get("run_id", agent._run_id)
         # Restoring iteration count lets a resumed run continue counting
@@ -70,35 +100,41 @@ class PersistenceManager:
             logger.warning("Restore received malformed execution_queue payload; resetting to empty")
             agent._execution_queue = []
         snapshot_execution_complete = snapshot.get("execution_complete", agent._execution_complete)
+        # Tracks whether the block below rebuilt _execution_queue from
+        # scratch. When it does, _active_execution_item is intentionally
+        # reset to None (the fresh queue has all-new indices that the old
+        # active item's milestone_idx/step_index can no longer be trusted
+        # to line up with). See the guard on the unconditional restore
+        # below — this flag is what makes that guard actually take effect.
+        rebuilt_queue_from_milestones = False
         if not agent._execution_queue and agent._milestones:
-            agent._execution_queue = []
+            agent._execution_queue = self._rebuild_execution_queue_from_milestones(agent)
             agent._execution_index = 0
             agent._active_execution_item = None
             agent._execution_complete = False
-            for milestone_idx, milestone in enumerate(agent._milestones):
-                milestone_name = str(milestone.get("milestone", "")).strip()
-                if milestone_name:
-                    agent._execution_queue.append({
-                        "kind": "milestone",
-                        "title": milestone_name,
-                        "milestone_idx": milestone_idx,
-                        "step_index": None,
-                    })
-                for step_idx, step in enumerate(milestone.get("steps", []) or []):
-                    if step:
-                        agent._execution_queue.append({
-                            "kind": "step",
-                            "title": step,
-                            "milestone_idx": milestone_idx,
-                            "step_index": step_idx,
-                        })
+            rebuilt_queue_from_milestones = True
         else:
             agent._execution_index = snapshot.get("execution_index", agent._execution_index)
             if agent._execution_queue and snapshot_execution_complete and agent._execution_index < len(agent._execution_queue):
                 agent._execution_complete = False
             else:
                 agent._execution_complete = snapshot_execution_complete
-        agent._active_execution_item = snapshot.get("active_execution_item", agent._active_execution_item)
+        # FIX: this used to run unconditionally right after the block
+        # above, which meant it silently clobbered the `= None` reset
+        # made two lines earlier whenever the rebuild branch ran. The
+        # snapshot's active_execution_item was captured against the OLD
+        # (missing/malformed) execution_queue — after a full rebuild from
+        # milestones, that reference no longer corresponds to anything
+        # real in the fresh queue's indices. Restoring it anyway left
+        # agent._active_execution_item non-None while _execution_index
+        # was reset to 0, which made _pre_iteration_tasks's
+        # "if agent._active_execution_item is None: claim next item"
+        # check skip claiming anything — the resumed run would sit
+        # believing a stale item was still in flight and never actually
+        # start working through the freshly rebuilt queue. Only restore
+        # the snapshot's value when we did NOT rebuild the queue.
+        if not rebuilt_queue_from_milestones:
+            agent._active_execution_item = snapshot.get("active_execution_item", agent._active_execution_item)
         agent._belief = self._coerce_belief(snapshot.get("belief", agent._belief), agent._belief)
         try:
             requested_phase = Phase(snapshot.get("phase", agent._phase.value))
@@ -113,24 +149,7 @@ class PersistenceManager:
             agent._active_execution_item = None
             if agent._milestones and not agent._execution_queue:
                 agent._execution_index = 0
-                agent._execution_queue = []
-                for milestone_idx, milestone in enumerate(agent._milestones):
-                    milestone_name = str(milestone.get("milestone", "")).strip()
-                    if milestone_name:
-                        agent._execution_queue.append({
-                            "kind": "milestone",
-                            "title": milestone_name,
-                            "milestone_idx": milestone_idx,
-                            "step_index": None,
-                        })
-                    for step_idx, step in enumerate(milestone.get("steps", []) or []):
-                        if step:
-                            agent._execution_queue.append({
-                                "kind": "step",
-                                "title": step,
-                                "milestone_idx": milestone_idx,
-                                "step_index": step_idx,
-                            })
+                agent._execution_queue = self._rebuild_execution_queue_from_milestones(agent)
         agent._transition(requested_phase, reason="restored snapshot")
         agent._complexity_score = snapshot.get("complexity_score", agent._complexity_score)
         agent._is_complex_task = snapshot.get("is_complex_task", agent._is_complex_task)
@@ -150,6 +169,16 @@ class PersistenceManager:
         agent._milestone_idx = snapshot.get("milestone_idx", agent._milestone_idx)
         agent._total_subtasks = snapshot.get("total_subtasks", agent._total_subtasks)
         agent._current_subtask = snapshot.get("current_subtask", agent._current_subtask)
+        # NOTE: this second DONE/pending-work check is effectively belt-
+        # and-suspenders on top of the one above — by this point
+        # agent._transition() has already run, so if the first check
+        # caught a stale DONE snapshot, agent._phase is already BLOCKED
+        # and this elif can't re-fire for that case. Left in place since
+        # it's a harmless no-op in the already-handled case and still
+        # covers the (narrower) "queue rebuilt to genuinely empty because
+        # every milestone had blank names/steps" edge case in the first
+        # branch. Kept using the shared rebuild helper so both paths stay
+        # in sync rather than duplicating the loop a third time.
         if not agent._execution_queue and agent._milestones:
             agent._execution_complete = False
         elif agent._phase == Phase.DONE and agent._has_pending_work():
@@ -160,25 +189,8 @@ class PersistenceManager:
             agent._execution_complete = False
             agent._active_execution_item = None
             if agent._milestones and not agent._execution_queue:
-                agent._execution_queue = []
                 agent._execution_index = 0
-                for milestone_idx, milestone in enumerate(agent._milestones):
-                    milestone_name = str(milestone.get("milestone", "")).strip()
-                    if milestone_name:
-                        agent._execution_queue.append({
-                            "kind": "milestone",
-                            "title": milestone_name,
-                            "milestone_idx": milestone_idx,
-                            "step_index": None,
-                        })
-                    for step_idx, step in enumerate(milestone.get("steps", []) or []):
-                        if step:
-                            agent._execution_queue.append({
-                                "kind": "step",
-                                "title": step,
-                                "milestone_idx": milestone_idx,
-                                "step_index": step_idx,
-                            })
+                agent._execution_queue = self._rebuild_execution_queue_from_milestones(agent)
         # Fix #5: the snapshot previously omitted these — on an agent
         # instance reused across multiple run()/resume_last_task() calls
         # (agent.py now also calls _reset() before restoring, as a second
@@ -206,6 +218,7 @@ class PersistenceManager:
         agent._steps = snapshot.get("steps", agent._steps)
         if agent._resume_state:
             set_execution_state({"state": agent._resume_state})
+
     def _persist_resume_snapshot(self, agent) -> None:
         try:
             save_last_run({
@@ -251,6 +264,7 @@ class PersistenceManager:
             })
         except Exception as e:
             logger.error("Persist snapshot: %s", e)
+
     async def _trim(self, agent) -> None:
         if agent._trimming or len(agent.history) <= TRIM_AT:
             return
@@ -262,6 +276,21 @@ class PersistenceManager:
         # the version will have moved on and we must not write back a
         # summary computed from history that's no longer current.
         version = agent._history_version
+        # FIX: also snapshot the current LENGTH of agent.history. This
+        # method runs as a fire-and-forget background task (see
+        # agent.py's _spawn_background) — the main loop does not wait for
+        # it and keeps appending ordinary messages (assistant turns, tool
+        # results, [ReflAct] injections) to agent.history for as long as
+        # this trim is awaiting the summarizer below. _history_version
+        # alone does NOT catch that: it only changes on a full _reset()
+        # (an entirely new run/resume), not on ordinary appends within
+        # the SAME run. Without this, the unconditional
+        # `agent.history = first + [...] + tail` write-back at the bottom
+        # silently discarded every message the main loop appended during
+        # the await — real, silent loss of recent conversational context
+        # mid-run, not just a missed optimization. snapshot_len lets us
+        # recover exactly what was appended since and keep it.
+        snapshot_len = len(agent.history)
         first, mid, tail = agent.history[:1], agent.history[1:-KEEP_LAST], agent.history[-KEEP_LAST:]
         if not mid:
             agent._trimming = False
@@ -288,10 +317,20 @@ class PersistenceManager:
                 "started) while this trim was still awaiting the summarizer."
             )
             return
+        # Recover anything the main loop appended to agent.history after
+        # we took our snapshot above, and keep it — see the fix comment
+        # on snapshot_len.
+        appended_since_snapshot = agent.history[snapshot_len:]
         if summary_content is not None:
-            agent.history = first + [{"role": "assistant", "content": f"[Summary] {summary_content}"}] + tail
+            agent.history = (
+                first
+                + [{"role": "assistant", "content": f"[Summary] {summary_content}"}]
+                + tail
+                + appended_since_snapshot
+            )
         else:
-            agent.history = first + tail
+            agent.history = first + tail + appended_since_snapshot
+
     async def _checkpoint(self, agent, iteration: int):
         try:
             violations = agent._check_consistency()

@@ -1,4 +1,5 @@
 """PENZER — ExecutionManager
+
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -6,7 +7,8 @@ behavior lives. PenzerAgent keeps every original method name as a thin
 delegate (e.g. `agent._transition(...)` still works), so nothing calling
 the agent needs to change.
 """
-import time, asyncio, inspect, json, re, hashlib, logging
+import time, asyncio, inspect, json, re, hashlib, logging, shlex
+
 from tools.plugins import create_plugin_tool, load_plugin_tools
 from tools.executor import requires_privilege_escalation, SUDO_INTERACTIVE_TIMEOUT
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
@@ -18,6 +20,7 @@ TOOL_LABELS = {
     "browser": "\U0001F310", "terminal": "\u26A1", "run_python": "\U0001F40D",
     "run_bash": "\U0001F4DC", "file_editor": "\U0001F4C1", "memory": "\U0001F9E0", "planning": "\U0001F4CB",
 }
+
 # file_editor deliberately has no fallback entry: its args (action/
 # filepath/content) don't map onto any other tool's schema. The old
 # "file_editor": "terminal" entry silently ran `terminal` with an empty
@@ -28,12 +31,22 @@ FALLBACKS = {
     "terminal": "run_bash", "run_bash": "run_python",
     "run_python": "terminal",
 }
+
 TOOL_TIMEOUT = 30
+
 # Mirrors tools/terminal.py's `timeout: int = 60` default. Used as the
 # fallback in _call_timeout when a terminal call omits `timeout` — using
 # the generic TOOL_TIMEOUT (30) here would silently disagree with what
 # the tool itself documents and actually passes to execute().
 TOOL_TERMINAL_DEFAULT_TIMEOUT = 60
+
+# Timeout applied to the raw subprocess.check_output() call embedded in
+# every auto-generated plugin (see _maybe_auto_create_plugin's code
+# template below). Deliberately the same value as
+# TOOL_TERMINAL_DEFAULT_TIMEOUT — a plugin is created FROM a terminal
+# command that already succeeded at least twice, so it's reasonable to
+# expect it to keep finishing in roughly the same time it did before.
+PLUGIN_SUBPROCESS_TIMEOUT = TOOL_TERMINAL_DEFAULT_TIMEOUT
 
 # Tools whose results depend on live, mutable state (filesystem, network,
 # running processes) and must never be served from the per-run result
@@ -52,7 +65,6 @@ _DANGEROUS_PLUGIN_PATTERNS = re.compile(
     r"|/etc/(passwd|shadow)|nc\s+-l|curl\s+[^\n]*-d\s+[^\n]*@",
     re.IGNORECASE,
 )
-
 
 # Absolute ceiling on the terminal tool's own `timeout` argument, so a
 # bad/malicious value (e.g. an LLM asked to justify an arbitrarily long
@@ -148,6 +160,7 @@ class ExecutionManager:
         """Runs exactly one tool call: memory short-circuit, availability
         check, status update, timeout wrapping. Shared by `_run_parallel`
         and `_run_race` so both stay in sync automatically.
+
         Catches unexpected exceptions (not just asyncio.TimeoutError) from
         the actual tool invocation and turns them into a reported error
         string instead of letting them propagate. Previously only timeouts
@@ -234,9 +247,29 @@ class ExecutionManager:
             for c in calls
         ):
             return await agent._run_parallel(calls)
+
         def get_target(c):
             args = c.get("arguments", {})
-            return args.get("filepath") or args.get("command", "")[:20]
+            # Previously only checked "filepath" and "command", so two
+            # `browser` calls hitting the SAME url (a genuinely dependent
+            # pair — e.g. "load page" then "click button on that page")
+            # both fell through to the empty-string default. Filtered out
+            # by the `if t` check below on both sides of the uniqueness
+            # comparison, two empty-string targets don't collide as far
+            # as that check is concerned — so a dependent pair of browser
+            # calls could get misclassified as independent and handed to
+            # _run_race, which cancels whichever one loses the race the
+            # instant its sibling succeeds. For a stateful multi-step
+            # browser interaction on the same page, that's a real
+            # correctness risk, not just a missed optimization. Checking
+            # "url" first closes that gap; the command-text fallback
+            # below is unchanged for terminal/run_bash.
+            return (
+                args.get("filepath")
+                or args.get("url")
+                or str(args.get("command", ""))[:20]
+            )
+
         targets = [get_target(c) for c in calls]
         unique  = len(set(t for t in targets if t)) == len([t for t in targets if t])
         if unique and all(c["name"] in ("browser", "terminal", "run_bash") for c in calls):
@@ -246,6 +279,7 @@ class ExecutionManager:
     async def _run_race(self, agent, calls: list) -> list[tuple[str, float]]:
         """Launch all calls; return as soon as one succeeds, or once every
         call has finished — whichever comes first.
+
         Previously this only woke up on a success signal (`done_event`),
         so when every call in the race failed — which typically happens
         fast — the function still sat blocked until the full TOOL_TIMEOUT
@@ -254,6 +288,7 @@ class ExecutionManager:
         moment either a success lands or nothing is left pending.
         """
         results = [("(cancelled)", 0.0)] * len(calls)
+
         async def run_and_report(idx: int, c: dict) -> bool:
             # _execute_single_tool already catches everything it
             # reasonably can, but this is defense-in-depth: if anything
@@ -268,6 +303,7 @@ class ExecutionManager:
                 raw, elapsed = f"Error: {e}", 0.0
             results[idx] = (raw, elapsed)
             return not agent._is_error(raw)
+
         tasks    = {asyncio.create_task(run_and_report(i, c)): (i, c) for i, c in enumerate(calls)}
         pending  = set(tasks)
         deadline = time.time() + max(_call_timeout(c["name"], c.get("arguments", {})) for c in calls)
@@ -303,6 +339,7 @@ class ExecutionManager:
         self, agent, call: dict, prior_result: tuple[str, float] | None = None
     ) -> tuple[str, float]:
         """Tries a fallback tool for a call that already failed.
+
         `prior_result` should be the (raw, elapsed) the caller already
         obtained for `call` — pass it whenever you have it, so this
         doesn't re-execute an already-failed tool a second time. That
@@ -393,7 +430,26 @@ class ExecutionManager:
         tool = agent.tools.get(name)
         if not tool:
             return f"Tool '{name}' not available"
-        for attempt in range(2):
+        # Non-idempotent tools (terminal/run_bash/run_python/browser) get
+        # exactly one attempt here, not two. The retry-on-exception below
+        # used to apply uniformly to every tool: if `fn(**kw)` raised for
+        # ANY reason (a transient network blip in the MCP transport, a
+        # serialization error turning the tool's own output into JSON,
+        # anything) attempt 2 blindly re-invoked the exact same call with
+        # the exact same args. For a read-only/idempotent tool that's a
+        # harmless free retry. For `terminal` specifically, an exception
+        # can surface AFTER the underlying command has already run and
+        # had real side effects (a file write, a state-changing request,
+        # a partially-applied migration) — the exception doesn't tell us
+        # whether the command's own action happened before or after it
+        # was raised. Silently re-running it risks executing the same
+        # side-effecting command twice, which is exactly the class of bug
+        # this codebase is otherwise careful to avoid (see e.g.
+        # tools/executor.py's single-invocation cwd-tracking fix). A
+        # single non-idempotent failure goes straight to the fallback/
+        # error path below instead of getting a blind second attempt.
+        max_attempts = 1 if name in NON_IDEMPOTENT_TOOLS else 2
+        for attempt in range(max_attempts):
             try:
                 fn = getattr(tool, "fn", tool)
                 if fn not in agent._fn_cache:
@@ -410,7 +466,7 @@ class ExecutionManager:
                 return s
             except Exception as e:
                 logger.debug("%s attempt %d: %s", name, attempt + 1, e)
-                if attempt == 1:
+                if attempt == max_attempts - 1:
                     fb = FALLBACKS.get(name)
                     cmd = args.get("command") or args.get("query") or args.get("code") or ""
                     if fb and fb in agent.tools and cmd:
@@ -447,6 +503,7 @@ class ExecutionManager:
     async def _maybe_auto_create_plugin(self, agent) -> bool:
         """Reuse an existing plugin when possible; otherwise create one
         for a repeated terminal workflow.
+
         Runs under agent._plugin_lock: without it, two qualifying
         terminal calls executed concurrently (e.g. in the same
         _run_speculative/_run_parallel batch) could both pass the
@@ -529,7 +586,6 @@ class ExecutionManager:
             # plugin creation entirely rather than falling back to
             # shell=True.
             try:
-                import shlex
                 shlex.split(command)
             except ValueError:
                 logger.info(
@@ -538,11 +594,36 @@ class ExecutionManager:
                     "widening to shell=True: %s", command[:120],
                 )
                 return False
+            # TIMEOUT FIX: this generated code previously called
+            # subprocess.check_output() with NO timeout at all — the
+            # default is timeout=None, meaning "wait forever." That
+            # defeats every bit of the careful timeout/cleanup machinery
+            # built for the main terminal path (see _call_timeout's
+            # docstring and tools/executor.py's TIMEOUT_MARGIN comment):
+            # this plugin body runs via asyncio.to_thread inside `_run`
+            # above, and _execute_single_tool's asyncio.wait_for(timeout=
+            # TOOL_TIMEOUT) around it can only abandon AWAITING the
+            # thread — it cannot kill the OS thread or the subprocess
+            # running inside it. A recurring command that happens to hang
+            # on one run (network stall, waiting on stdin, a changed
+            # remote endpoint) previously left both the worker thread and
+            # the underlying subprocess running unobserved indefinitely,
+            # silently consuming one slot in the default thread pool for
+            # the rest of the process's life. Adding an explicit timeout
+            # to check_output itself means the subprocess module's own
+            # internal cleanup (kill + wait) runs, and a clean
+            # TimeoutExpired is caught and reported instead of hanging.
             code = (
                 "import shlex, subprocess\n\n"
                 f"def {name}(**_ignored_kwargs):\n"
                 f"    {description!r}\n"
-                f"    return subprocess.check_output(shlex.split({command!r}), text=True)"
+                "    try:\n"
+                f"        return subprocess.check_output(\n"
+                f"            shlex.split({command!r}), text=True,\n"
+                f"            timeout={PLUGIN_SUBPROCESS_TIMEOUT}\n"
+                "        )\n"
+                "    except subprocess.TimeoutExpired:\n"
+                f"        return 'Timed out after {PLUGIN_SUBPROCESS_TIMEOUT}s'\n"
             )
             try:
                 create_plugin_tool(name=name, description=description, code=code)

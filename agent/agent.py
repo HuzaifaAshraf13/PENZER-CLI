@@ -1,5 +1,6 @@
 """
 PENZER — Research-Grade Agent (thin orchestrator)
+
 Research sources:
   ReflAct    (Kim 2025)       — belief-state injection, 27.7% improvement
   ExpeL      (Zhao AAAI 2024) — insight extraction, trajectory recall
@@ -12,6 +13,7 @@ import json, logging, inspect, asyncio, signal, time, psutil, random, re, iterto
 from typing import Any, Callable
 from datetime import datetime
 from collections import defaultdict, deque
+
 from agent.core import mcp
 from agent.llm import LLM
 from session.memory import (
@@ -97,6 +99,18 @@ MANAGER_REGISTRY: list[tuple[str, type]] = [
     ("reflection",  ReflectionManager),
     ("persistence", PersistenceManager),
 ]
+
+# Cap on how many entries resume_state["completed_steps"] /
+# ["blocked_steps"] retain. These lists were previously grown by one
+# unbounded append() per tool call for the entire lifetime of a run and
+# written to disk on every persist — for a long-running task (dozens to
+# hundreds of iterations) that snapshot grows without bound even though
+# nothing downstream ever reads more than the tail: format_execution_state()
+# only ever slices the last 3 entries for display. Keeping the full
+# history serves no purpose but bloats the on-disk snapshot and the
+# in-memory dict on every single tool call. Capped to a window that's
+# comfortably larger than anything actually consumed.
+RESUME_STATE_STEP_HISTORY_LIMIT = 25
 
 # Fix #9: signal.signal(SIGINT, ...) sets a single process-wide handler.
 # Registering it inside __init__ meant every new PenzerAgent silently
@@ -490,6 +504,7 @@ class PenzerAgent:
 
     async def _run_loop_safely(self) -> str:
         """Runs _loop() behind a top-level exception guard.
+
         Every known failure mode inside _loop already returns a clean
         string (timeouts, resource limits, rate limits, stuck-after-max-
         attempts, ...). This catches anything NOT already anticipated — a
@@ -686,11 +701,13 @@ class PenzerAgent:
     async def _finalize(self, user_input: str, result: str) -> str:
         """
         Shared post-loop wrap-up for both `run()` and `resume_last_task()`.
+
         A successfully-resumed task must still get recorded to episodic
         memory, go through the completion evaluator / post-mortem writer,
         and have `save_history` / `clear_last_run` called on it — skipping
         this after resume would leave a stale snapshot on disk even after
         the task had actually finished.
+
         The snapshot is only cleared when the task actually reached
         completion (`goal_progress == "complete"`), not unconditionally —
         clearing it after every _loop() return (including "Interrupted",
@@ -969,6 +986,18 @@ class PenzerAgent:
                 self._persist_all()
                 return f"Stopped: {reason}" if has_specific_reason else "Iteration limit reached"
         if self._shutdown:
+            # Unified with the other stop paths below: persist the resume
+            # snapshot/step log here too, not just save_history(). Every
+            # OTHER terminal branch in this method calls _persist_all()
+            # before returning; this one previously only called
+            # save_history(), which is harmless in the common case (the
+            # last completed iteration's _execute_tool_calls() already
+            # persisted), but leaves a real gap for a shutdown raised
+            # before any tool call has executed this run — e.g. via a
+            # host-triggered request_shutdown() racing the very first
+            # iteration. Calling _persist_all() here closes that gap and
+            # keeps every stop path behaving identically.
+            self._persist_all()
             save_history(self.history)
             return "Interrupted"
         try:
@@ -984,6 +1013,8 @@ class PenzerAgent:
             save_history(self.history)
             return f"Resource limit: Resource monitor unavailable ({exc})"
         if not ok:
+            # Same unification as the shutdown branch above.
+            self._persist_all()
             save_history(self.history)
             return f"Resource limit: {msg}"
         tokens_used = getattr(self.llm, "token_estimate", 0) - self._tokens_before_run
@@ -1057,6 +1088,7 @@ class PenzerAgent:
         be phrased in a way the filter doesn't recognize even though a
         listed skill (visible to the model in the system prompt
         regardless of the filter's guess) is clearly the right fit.
+
         Rather than relying solely on getting the filter right, the
         model can self-report which skill it's actually following via
         the optional "skill_used"/"skill" JSON field (see llm.py's
@@ -1064,6 +1096,7 @@ class PenzerAgent:
         core skill's summary every turn, and only once it names one does
         that skill's full agent_behavior get folded into the live
         SKILL PLAN for subsequent turns.
+
         No-op if skill_used is empty/None (the common case — most turns
         don't need to name a skill explicitly, they just follow the
         plan/hint already in place) or if it doesn't match any known
@@ -1200,7 +1233,6 @@ class PenzerAgent:
         self._failures += 1
         self._transition(Phase.REFLECTING, reason="stuck detected")
         self._record_step("recovery", f"Stuck detected (attempt {self._failures}/{MAX_FAILURES}) — looking for a way forward.")
-
         partial_candidates = []
         for entry in reversed(self._trace[-4:]):
             result = str(entry.get("result", "")).strip()
@@ -1221,7 +1253,14 @@ class PenzerAgent:
             if is_partial_signal:
                 partial_candidates.append(result)
         if partial_candidates:
-            result = partial_candidates[-1]
+            # `self._trace[-4:]` is chronological (oldest..newest); wrapping
+            # it in reversed() walks newest-first, so partial_candidates[0]
+            # is the MOST RECENT matching entry and partial_candidates[-1]
+            # is the OLDEST of up to four. This used to take [-1] — the
+            # oldest match — which is backwards: the whole point of this
+            # branch is to surface the freshest partial finding as the
+            # terminal answer, not a stale one from several tool calls ago.
+            result = partial_candidates[0]
             if self._has_pending_work():
                 self._record_step(
                     "give_up",
@@ -1245,7 +1284,6 @@ class PenzerAgent:
             )
             self._persist_all()
             return result
-
         if self._failures >= MAX_FAILURES:
             self._transition(Phase.FAILED, reason="max failures reached")
             self._record_step(
@@ -1367,7 +1405,14 @@ class PenzerAgent:
             })
             action_desc = self._fmt_action(name, c.get("arguments", {}))
             self._resume_state["current_step"] = action_desc
-            self._resume_state["completed_steps"] = self._resume_state.get("completed_steps", []) + [action_desc]
+            # Capped to RESUME_STATE_STEP_HISTORY_LIMIT — see the constant's
+            # module-level comment. Only the tail is ever read
+            # (format_execution_state() slices [-3:]), so letting these
+            # lists grow by one entry per tool call for the whole run just
+            # bloats the resume snapshot written to disk on every persist.
+            self._resume_state["completed_steps"] = (
+                self._resume_state.get("completed_steps", []) + [action_desc]
+            )[-RESUME_STATE_STEP_HISTORY_LIMIT:]
             self._resume_state["next_action"] = "Continue to the next step if needed"
             self._resume_state["execution_progress"] = {
                 "completed": self._execution_index,
@@ -1376,7 +1421,9 @@ class PenzerAgent:
             }
             self._update_execution_progress()
             if not ok:
-                self._resume_state["blocked_steps"] = self._resume_state.get("blocked_steps", []) + [action_desc]
+                self._resume_state["blocked_steps"] = (
+                    self._resume_state.get("blocked_steps", []) + [action_desc]
+                )[-RESUME_STATE_STEP_HISTORY_LIMIT:]
             if ok:
                 self._consec_errors[name] = 0
             else:
