@@ -1,4 +1,5 @@
 """PENZER — ReflectionManager
+
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -8,6 +9,7 @@ the agent needs to change.
 """
 import asyncio, json, re, time, logging
 from typing import Any
+
 from session.memory import remember_semantic, store_insight, store_post_mortem
 from agent.config import STUCK_MIN, ABSOLUTE_MAX_ITER, MAX_RUNTIME_SECONDS, MAX_TOKENS_PER_RUN
 
@@ -147,6 +149,7 @@ class ReflectionManager:
         repeating, or (b) the same tool+arguments signature repeating 3+
         times, within a small trailing window — plus a fallback of "the
         last STUCK_MIN trace entries all failed".
+
         The window is bounded by agent._resume_boundary_history_len (set
         alongside agent._resume_boundary_trace_len whenever a run is
         resumed) so this can't be fooled by stale pre-crash history.
@@ -259,7 +262,30 @@ class ReflectionManager:
             return False
         if getattr(agent.llm, "token_estimate", 0) - agent._tokens_before_run > MAX_TOKENS_PER_RUN:
             return False
-        resource_ok, _ = agent._monitor.check()
+        # FIX: agent._monitor.check() is documented elsewhere in this
+        # codebase (agent.py's _check_stop_conditions, a few lines after
+        # this method is called) as a call that CAN raise — that's
+        # exactly why that other call site wraps it in try/except and
+        # reports a specific "Resource limit: Resource monitor
+        # unavailable (...)" message. This call site called the same
+        # method completely unguarded. _can_extend_iterations() is itself
+        # called unguarded from _check_stop_conditions (there's no
+        # try/except around `if self._can_extend_iterations():`), so a
+        # transient monitor failure here — psutil losing track of a
+        # process, a permissions hiccup, whatever the other call site is
+        # defending against — would propagate all the way up through
+        # _loop() and only get caught by _run_loop_safely()'s generic
+        # top-level handler, ending the run with an opaque "Stopped:
+        # internal error (...)" instead of the same graceful, specific
+        # message the sibling call site already produces for this exact
+        # failure. Fail closed here too: if we can't confirm resources
+        # are OK, don't extend — the normal iteration-limit stop message
+        # fires cleanly instead of a raw exception derailing the run.
+        try:
+            resource_ok, _ = agent._monitor.check()
+        except Exception as exc:
+            logger.warning("Resource monitor check failed during extension check: %s", exc)
+            return False
         if not resource_ok:
             return False
         if not agent._trace:

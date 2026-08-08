@@ -1,4 +1,5 @@
 """PENZER — BeliefManager
+
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -8,7 +9,10 @@ the agent needs to change.
 """
 from enum import Enum
 import logging
+
 logger = logging.getLogger(__name__)
+
+
 class Phase(Enum):
     PLANNING   = "planning"    # building/replanning milestones, no tool calls yet
     EXECUTING  = "executing"   # normal steady state — calling tools, making progress
@@ -16,13 +20,37 @@ class Phase(Enum):
     BLOCKED    = "blocked"     # last tool call failed, not yet recovered
     DONE       = "done"        # final answer given
     FAILED     = "failed"      # gave up (max failures / resource limit)
+
+
 PHASE_TRANSITIONS: dict[Phase, set[Phase]] = {
     # PLANNING -> DONE: covers a narrow crash-recovery window in run() —
     # _persist_resume_snapshot() is called while phase is still PLANNING,
     # just before the transition to EXECUTING. If the process crashes in
     # that window, a resumed run can land straight on a final answer
     # (no tool calls) with phase still PLANNING.
-    Phase.PLANNING:   {Phase.EXECUTING, Phase.FAILED, Phase.DONE},
+    #
+    # PLANNING -> BLOCKED: added alongside DONE for the same reason BLOCKED
+    # was added to every other phase's set below — see the BLOCKED comment
+    # under EXECUTING. _transition()'s own DONE-refusal logic
+    # ("Refusing transition to DONE while execution work remains; staying
+    # in BLOCKED instead.") can redirect ANY incoming `to=DONE` request to
+    # `to=BLOCKED`, regardless of which phase is making that request — the
+    # check that triggers the redirect doesn't look at agent._phase at
+    # all, only at agent._has_pending_work(). That means the redirect's
+    # landing zone (BLOCKED) has to be a valid destination from EVERY
+    # phase that can legally request DONE — which includes PLANNING, per
+    # the crash-recovery comment right above. Without this entry, that
+    # exact redirect (still fully correct, intended defensive behavior)
+    # tripped a SECOND, spurious "Invalid phase transition planning ->
+    # blocked" warning on top of the intended "Refusing transition to
+    # DONE..." one — two warnings logged for one situation the code
+    # already handled correctly, which is exactly the kind of noise that
+    # could send someone chasing a coordination bug that doesn't exist
+    # (the docstring below explicitly frames an invalid-transition warning
+    # as meaning "two parts of the agent disagree about what's
+    # happening" — that framing shouldn't fire for the state machine's
+    # own defensive fallback disagreeing with its own transition table).
+    Phase.PLANNING:   {Phase.EXECUTING, Phase.BLOCKED, Phase.FAILED, Phase.DONE},
     Phase.EXECUTING:  {Phase.REFLECTING, Phase.BLOCKED, Phase.DONE, Phase.FAILED},
     # BLOCKED -> DONE: _update_belief() sets BLOCKED on ANY single tool
     # failure, not just after _stuck() confirms a repeated pattern. It's
@@ -49,6 +77,7 @@ PHASE_TRANSITIONS: dict[Phase, set[Phase]] = {
     # to be legal, not just the success case.
     Phase.FAILED:     {Phase.EXECUTING, Phase.BLOCKED, Phase.DONE},
 }
+
 # Mirrors Phase into the existing free-form belief string so every
 # pre-existing reader of self._belief["goal_progress"] (prompt text,
 # _finalize()'s completion check, get_metrics()) keeps working unchanged.
@@ -60,6 +89,8 @@ PHASE_TO_GOAL_PROGRESS = {
     Phase.DONE:       "complete",
     Phase.FAILED:     "failed",
 }
+
+
 class BeliefManager:
     def _transition(self, agent, to: Phase, reason: str = "") -> None:
         """
@@ -88,6 +119,7 @@ class BeliefManager:
             logger.warning(msg)
         agent._phase = to
         agent._belief["goal_progress"] = PHASE_TO_GOAL_PROGRESS[to]
+
     def _update_belief(self, agent, tool: str, args: dict, result: str, ok: bool) -> None:
         agent._belief["last_action"]  = f"{tool}({agent._fmt_action(tool, args)})"
         agent._belief["last_outcome"] = "ok" if ok else f"failed: {result[:60]}"
@@ -101,6 +133,7 @@ class BeliefManager:
         else:
             if agent._phase != Phase.BLOCKED:
                 agent._transition(Phase.BLOCKED, reason=f"{tool} failed: {result[:60]}")
+
     def _belief_summary(self, agent) -> str:
         b     = agent._belief
         lines = [f"BELIEF: {b['goal_progress'].upper()}"]
@@ -113,6 +146,7 @@ class BeliefManager:
         if b["last_action"]:
             lines.append(f"  Last: {b['last_action']} -> {b['last_outcome']}")
         return "\n".join(lines)
+
     def _check_consistency(self, agent) -> list[str]:
         """
         Cross-checks phase against the two other structures that track

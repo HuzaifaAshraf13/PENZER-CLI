@@ -1,4 +1,5 @@
 """PENZER — Planner
+
 Extracted from the monolithic agent.py. Methods here take an explicit
 `agent` (the owning PenzerAgent) as their second parameter and read/write
 its state directly — state ownership did not change, only where the
@@ -8,6 +9,7 @@ the agent needs to change.
 """
 import logging
 import asyncio, re
+
 from session.memory import get_relevant_kv_facts
 from agent.config import ITER_BY_COMPLEXITY
 from agent.system_prompts import _tokenize, _skill_token_set
@@ -44,6 +46,7 @@ class Planner:
     def _match_core_skills(self, agent, user_input: str) -> list:
         """
         A skill is activated by one of two signals, weighted differently:
+
           - STRONG: any overlap with the skill's `keywords` list. Keywords
             are curated specifically to signal "this task is in my
             domain" — a single hit there is a deliberate, meaningful
@@ -63,6 +66,7 @@ class Planner:
             and Plugin Tool Creator alongside Terminal Executor and
             balloon into 16 LLM calls / ~75k tokens for work that should
             have taken 2-3 calls.
+
           Requiring 2+ words for the weak signal keeps the description-
           based matching (added specifically to fix RECALL — real
           matches that keyword lists alone were missing) while cutting
@@ -212,6 +216,7 @@ class Planner:
         Splices newly-replanned steps for `milestone_idx` into the live
         execution queue at the current position, so _claim_next_execution_item
         actually serves them on the next turn.
+
         Previously a successful replan only wrote to agent._subtasks /
         agent._subtask_idx, which nothing in the claim path reads —
         _claim_next_execution_item re-derives _subtasks wholesale from
@@ -228,6 +233,7 @@ class Planner:
         work complete. Give final answer." even though the last step had
         just failed, and cleared agent._milestones, silently disabling
         milestone-based replanning for the rest of the run.
+
         This method fixes the root cause by actually inserting the new
         steps into agent._execution_queue (and keeping agent._milestones'
         own step list in sync, since that's what re-derives _subtasks
@@ -242,6 +248,23 @@ class Planner:
         ]
         agent._execution_queue[agent._execution_index:agent._execution_index] = new_items
         agent._execution_complete = False
+        # FIX: a milestone being replanned is, by definition, not
+        # finished — its previous step allocation just got fully resolved
+        # (successfully or via exhausted retries, see
+        # _complete_current_execution_item) and is now being replaced
+        # with a fresh attempt. If this milestone_idx had already been
+        # recorded as "completed" (see the premature-completion fix in
+        # _complete_current_execution_item below — the OLD per-step
+        # exhaustion counter could reach the old step total right as the
+        # last old step gets resolved, right before this replan runs),
+        # that record needs to be cleared along with its resolved-step
+        # counter, or the progress readout would keep reporting this
+        # milestone as done while it's actually being reattempted with
+        # new steps.
+        agent._completed_milestone_indices.discard(milestone_idx)
+        counts = getattr(agent, "_milestone_resolved_step_counts", None)
+        if counts is not None:
+            counts[milestone_idx] = 0
         agent._update_execution_progress()
 
     def _build_execution_queue(self, agent) -> None:
@@ -250,6 +273,10 @@ class Planner:
         agent._active_execution_item = None
         agent._execution_complete = False
         agent._completed_milestone_indices = set()
+        # Fresh counters for the premature-milestone-completion fix below
+        # — a brand-new execution queue means no steps have resolved yet
+        # for any milestone.
+        agent._milestone_resolved_step_counts = {}
         if not agent._milestones:
             agent._execution_complete = True
             agent._update_execution_progress()
@@ -319,7 +346,44 @@ class Planner:
             # stops a permanently-broken step from looping forever.
         milestone_idx = item.get("milestone_idx")
         if item.get("kind") == "step" and milestone_idx is not None:
-            agent._completed_milestone_indices.add(milestone_idx)
+            # FIX: previously this called
+            # agent._completed_milestone_indices.add(milestone_idx)
+            # unconditionally here — i.e. the instant ANY ONE step
+            # belonging to a milestone resolved (success, or failure with
+            # retries exhausted), the WHOLE milestone was marked complete
+            # in _completed_milestone_indices, which agent.py's
+            # _update_execution_progress uses as the numerator for the
+            # "X/Y milestones completed" progress readout. Since set.add()
+            # is idempotent, a 3-step milestone was reported "done" the
+            # moment its first step resolved, and the count never
+            # meaningfully tracked real completion after that — verified
+            # by simulation: after step 1 of 3, the old code already
+            # reported 1/1 milestones complete.
+            #
+            # Fix: track how many of this milestone's steps have resolved
+            # (success or exhausted-failure — same "resolved" semantics
+            # the original code used, just counted instead of assumed),
+            # and only mark the milestone complete once that count reaches
+            # its CURRENT total step count. Reading the total live from
+            # agent._milestones[milestone_idx]["steps"] (rather than
+            # caching it once) means this stays correct across a mid-run
+            # replan, which can change a milestone's step count via
+            # _requeue_milestone_steps — that method also resets this
+            # counter and un-marks the milestone as completed when it
+            # reopens it with new steps, so a replanned milestone can't
+            # stay stuck showing as "done" from its pre-replan attempt.
+            counts = getattr(agent, "_milestone_resolved_step_counts", None)
+            if counts is None:
+                counts = {}
+                agent._milestone_resolved_step_counts = counts
+            counts[milestone_idx] = counts.get(milestone_idx, 0) + 1
+            total_steps = 0
+            if agent._milestones and milestone_idx < len(agent._milestones):
+                total_steps = len([
+                    s for s in (agent._milestones[milestone_idx].get("steps") or []) if s
+                ])
+            if total_steps and counts[milestone_idx] >= total_steps:
+                agent._completed_milestone_indices.add(milestone_idx)
         agent._execution_complete = agent._execution_index >= len(agent._execution_queue)
         agent._update_execution_progress()
         if agent._execution_complete:
