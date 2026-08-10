@@ -5,7 +5,7 @@ Penzer is a local AI terminal assistant that can reason through tasks, use tools
 
 It is designed for users who want an interactive shell agent that can help with coding, automation, investigation, and repeatable terminal workflows.
 
-> Local-first, agentic, and surprisingly capable.
+> Local-first,Terminal agent.
 
 ---
 
