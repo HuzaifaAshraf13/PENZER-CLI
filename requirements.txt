@@ -14,11 +14,13 @@ build==1.4.0
 cachetools==6.2.1
 certifi==2026.5.20
 cffi==2.0.0
+chardet==7.5.1
 charset-normalizer==3.4.4
 chromadb==1.4.1
 click==8.3.0
 coloredlogs==15.0.1
 cryptography==46.0.3
+cssselect==1.5.0
 cyclopts==4.2.1
 dashscope==1.25.9
 diskcache==5.6.3
@@ -65,6 +67,7 @@ hyperframe==6.1.0
 idna==3.11
 importlib_metadata==8.7.1
 importlib_resources==6.5.2
+iniconfig==2.3.0
 jaraco.classes==3.4.0
 jaraco.context==6.0.1
 jaraco.functools==4.3.0
@@ -79,6 +82,8 @@ kubernetes==35.0.0
 litellm==1.81.3
 llama_cpp_python==0.2.82
 loguru==0.7.3
+lxml==6.1.1
+lxml_html_clean==0.4.5
 markdown-it-py==4.0.0
 MarkupSafe==3.0.3
 mcp==1.21.0
@@ -107,9 +112,11 @@ pandas==3.0.0
 pathable==0.4.4
 pathspec==1.0.3
 pathvalidate==3.3.1
+-e git+https://github.com/HuzaifaAshraf13/PENZER-CLI.git@77c18fc0e7110038cbe80e9f525eac51df25e253#egg=penzer_cli
 pgvector==0.4.2
 pillow==12.2.0
 platformdirs==4.5.0
+pluggy==1.6.0
 portalocker==3.2.0
 posthog==5.4.0
 propcache==0.4.1
@@ -140,6 +147,7 @@ pyproject_hooks==1.2.0
 PyRect==0.2.0
 PyScreeze==1.0.1
 PySocks==1.7.1
+pytest==9.1.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.1
 python-multipart==0.0.20
@@ -148,6 +156,7 @@ python3-xlib==0.15
 pytweening==1.2.0
 PyYAML==6.0.3
 qdrant-client==1.16.2
+readability-lxml==0.8.4.1
 referencing==0.36.2
 regex==2026.1.15
 requests==2.32.5
