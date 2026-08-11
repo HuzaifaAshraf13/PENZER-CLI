@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <title>Active kernel releases</title>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<link rel="icon" type="image/png" href="https://www.kernel.org/theme/images/logos/favicon.png" />
+        <link rel="stylesheet" href="https://www.kernel.org/theme/css/main.css" type="text/css" />
+        <link href="https://www.kernel.org/feeds/all.atom.xml" type="application/atom+xml" rel="alternate" title="The Linux Kernel Archives Atom Feed" />
+
+        <link href="https://www.kernel.org/feeds/kdist.xml" type="application/atom+xml" rel="alternate" title="Latest Linux Kernel Releases" />
+
+        <!--[if IE]>
+                <script src="https://html5shiv.googlecode.com/svn/trunk/html5.js"></script><![endif]-->
+
+        <!--[if lte IE 7]>
+                <link rel="stylesheet" type="text/css" media="all" href="https://www.kernel.org/css/ie.css"/>
+                <script src="https://www.kernel.org/js/IE8.js" type="text/javascript"></script><![endif]-->
+
+        <!--[if lt IE 7]>
+                <link rel="stylesheet" type="text/css" media="all" href="https://www.kernel.org/css/ie6.css"/><![endif]-->
+
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+	        <div id="tux-gear"></div>
+                <h1><a href="https://www.kernel.org/">The Linux Kernel Archives </a></h1>
+                <nav><ul>
+                    <li ><a href="https://www.kernel.org/category/about.html">About</a></li>
+                    <li ><a href="https://www.kernel.org/category/contact-us.html">Contact us</a></li>
+                    <li ><a href="https://www.kernel.org/category/faq.html">FAQ</a></li>
+                    <li class="active"><a href="https://www.kernel.org/category/releases.html">Releases</a></li>
+                    <li ><a href="https://www.kernel.org/category/signatures.html">Signatures</a></li>
+                    <li ><a href="https://www.kernel.org/category/site-news.html">Site news</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+        <header id="mobile-banner" class="body">
+                <div id="mobile-tux-gear"></div>
+                <h1 class="mobile-site-title"><a href="https://www.kernel.org/">The Linux Kernel Archives</a></h1>
+                <input type="checkbox" id="mobile-nav-toggle" class="mobile-nav-checkbox" aria-label="Navigation menu" />
+                <label for="mobile-nav-toggle" class="hamburger-btn" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#2C1D00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+                </label>
+
+                <label for="mobile-nav-toggle" class="nav-overlay" aria-hidden="true"></label>
+
+                <nav id="mobile-drawer" role="navigation" aria-label="Mobile navigation">
+                <label for="mobile-nav-toggle" class="close-btn" aria-hidden="true">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#2C1D00" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </label>
+                <ul>
+                    <li><a href="https://www.kernel.org/category/about.html">About</a></li>
+                    <li><a href="https://www.kernel.org/category/contact-us.html">Contact us</a></li>
+                    <li><a href="https://www.kernel.org/category/faq.html">FAQ</a></li>
+                    <li><a href="https://www.kernel.org/category/releases.html">Releases</a></li>
+                    <li><a href="https://www.kernel.org/category/signatures.html">Signatures</a></li>
+                    <li><a href="https://www.kernel.org/category/site-news.html">Site news</a></li>
+                </ul>
+                <a href="https://www.kernel.org/"><div id="drawer-tux"></div></a>
+                </nav><!-- /#mobile-drawer -->
+        </header><!-- /#mobile-banner -->
+<section id="content" class="body">
+  <article>
+    <header>
+      <h1 class="entry-title">
+        <a href="https://www.kernel.org/releases.html" rel="bookmark"
+           title="Permalink to Active kernel releases">Active kernel releases</a></h1>
+    </header>
+
+    <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2026-02-25T18:15:52.039445+00:00">
+                2026-02-25
+        </abbr>
+
+<p>In <a href="https://www.kernel.org/category/releases.html">Releases</a>. </p>
+
+</footer><!-- /.post-info -->      <p>There are several main categories into which kernel releases may fall:</p>
+<dl class="docutils">
+<dt>Prepatch</dt>
+<dd>Prepatch or &quot;RC&quot; kernels are mainline kernel pre-releases that are
+mostly aimed at other kernel developers and Linux enthusiasts. They
+must be compiled from source and usually contain new features that
+must be tested before they can be put into a stable release.
+Prepatch kernels are maintained and released by Linus Torvalds.</dd>
+<dt>Mainline</dt>
+<dd>Mainline tree is maintained by Linus Torvalds. It's the tree where
+all new features are introduced and where all the exciting new
+development happens. New mainline kernels are released every 9-10
+weeks.</dd>
+<dt>Stable</dt>
+<dd>After each mainline kernel is released, it is considered &quot;stable.&quot;
+Any bug fixes for a stable kernel are backported from the mainline
+tree and applied by a designated stable kernel maintainer. There are
+usually only a few bugfix kernel releases until next mainline kernel
+becomes available -- unless it is designated a &quot;longterm maintenance
+kernel.&quot; Stable kernel updates are released on as-needed basis,
+usually once a week.</dd>
+<dt>Longterm</dt>
+<dd>There are usually several &quot;longterm maintenance&quot; kernel releases
+provided for the purposes of backporting bugfixes for older kernel
+trees. Only important bugfixes are applied to such kernels and they
+don't usually see very frequent releases, especially for older
+trees.</dd>
+</dl>
+<table border="1" class="docutils">
+<caption>Longterm release kernels</caption>
+<colgroup>
+<col width="11%" />
+<col width="46%" />
+<col width="17%" />
+<col width="26%" />
+</colgroup>
+<thead valign="bottom">
+<tr><th class="head">Version</th>
+<th class="head">Maintainer</th>
+<th class="head">Released</th>
+<th class="head">Projected EOL</th>
+</tr>
+</thead>
+<tbody valign="top">
+<tr><td>6.18</td>
+<td>Greg Kroah-Hartman &amp; Sasha Levin</td>
+<td>2025-11-30</td>
+<td>Dec, 2028</td>
+</tr>
+<tr><td>6.12</td>
+<td>Greg Kroah-Hartman &amp; Sasha Levin</td>
+<td>2024-11-17</td>
+<td>Dec, 2028</td>
+</tr>
+<tr><td>6.6</td>
+<td>Greg Kroah-Hartman &amp; Sasha Levin</td>
+<td>2023-10-29</td>
+<td>Dec, 2027</td>
+</tr>
+<tr><td>6.1</td>
+<td>Greg Kroah-Hartman &amp; Sasha Levin</td>
+<td>2022-12-11</td>
+<td>Dec, 2027</td>
+</tr>
+<tr><td>5.15</td>
+<td>Greg Kroah-Hartman &amp; Sasha Levin</td>
+<td>2021-10-31</td>
+<td>Dec, 2026</td>
+</tr>
+<tr><td>5.10</td>
+<td>Greg Kroah-Hartman &amp; Sasha Levin</td>
+<td>2020-12-13</td>
+<td>Dec, 2026</td>
+</tr>
+</tbody>
+</table>
+<div class="section" id="distribution-kernels">
+<h2>Distribution kernels</h2>
+<p>Many Linux distributions provide their own &quot;longterm maintenance&quot;
+kernels that may or may not be based on those maintained by kernel
+developers. These kernel releases are not hosted at kernel.org and
+kernel developers can provide no support for them.</p>
+<p>It is easy to tell if you are running a distribution kernel. Unless you
+downloaded, compiled and installed your own version of kernel from
+kernel.org, you are running a distribution kernel. To find out the
+version of your kernel, run <cite>uname -r</cite>:</p>
+<pre class="literal-block">
+# uname -r
+5.6.19-300.fc32.x86_64
+</pre>
+<p>If you see anything at all after the dash, you are running a distribution
+kernel. Please use the support channels offered by your distribution
+vendor to obtain kernel support.</p>
+</div>
+<div class="section" id="releases-faq">
+<h2>Releases FAQ</h2>
+<p>Here are some questions we routinely receive about kernel release
+versions. See also the main &quot;FAQ&quot; section for some other topics.</p>
+<div class="section" id="when-is-the-next-mainline-kernel-version-going-to-be-released">
+<h3>When is the next mainline kernel version going to be released?</h3>
+<p>Linux kernel follows a simple release cadence:</p>
+<ul class="simple">
+<li>after each mainline release, there is a 2-week &quot;merge window&quot; period
+during which new major features are introduced into the kernel</li>
+<li>after the merge window closes, there is a 7-week bugfix and
+stabilization period with weekly &quot;release candidate&quot; snapshots</li>
+<li>rc7 is usually the last release candidate, though occasionally there
+may be additional rc8+ releases if that is deemed necessary</li>
+</ul>
+<p>So, to find the approximate date of the next mainline kernel release,
+take the date of the previous mainline release and add 9-10 weeks.</p>
+<p>You can also subscribe to the releases calendar that forecasts key
+development dates for the upcoming kernels:</p>
+<ul class="simple">
+<li><a class="reference external" href="https://www.kernel.org/releases-calendar.ics">https://www.kernel.org/releases-calendar.ics</a></li>
+</ul>
+</div>
+<div class="section" id="what-is-the-next-longterm-release-going-to-be">
+<h3>What is the next longterm release going to be?</h3>
+<p>Longterm kernels are picked based on various factors -- major new
+features, popular commercial distribution needs, device manufacturer
+demand, maintainer workload and availability, etc. You can roughly
+estimate when the new longterm version will become available based on
+how much time has elapsed since the last longterm version was chosen.</p>
+</div>
+<div class="section" id="why-are-some-longterm-versions-supported-longer-than-others">
+<h3>Why are some longterm versions supported longer than others?</h3>
+<p>The &quot;projected EOL&quot; dates are not set in stone. Each new longterm kernel
+usually starts with only a 2-year projected EOL that can be extended
+further if there is enough interest from the industry at large to help
+support it for a longer period of time.</p>
+</div>
+<div class="section" id="does-the-major-version-number-4-x-vs-5-x-mean-anything">
+<h3>Does the major version number (4.x vs 5.x) mean anything?</h3>
+<p>No. The major version number is incremented when the number after the
+dot starts looking &quot;too big.&quot; There is literally no other reason.</p>
+</div>
+<div class="section" id="does-the-odd-even-number-still-mean-anything">
+<h3>Does the odd-even number still mean anything?</h3>
+<p>A long time ago Linux used a system where odd numbers after the first
+dot indicated pre-release, development kernels (e.g. 2.1, 2.3, 2.5).
+This scheme was abandoned after the release of kernel 2.6 and these days
+pre-release kernels are indicated with &quot;-rc&quot;.</p>
+</div>
+</div>
+
+    </div><!-- /.entry-content -->
+
+  </article>
+</section>
+        <section id="extras" class="body">
+                <div class="blogroll">
+                        <h2>Other resources</h2>
+                        <ul>
+                            <li><a href="https://git.kernel.org/">Git Trees</a></li>
+                            <li><a href="https://docs.kernel.org/">Documentation</a></li>
+                            <li><a href="https://lore.kernel.org/">Kernel Mailing Lists</a></li>
+                            <li><a href="https://patchwork.kernel.org/">Patchwork</a></li>
+                            <li><a href="https://www.wiki.kernel.org/">Wikis</a></li>
+                            <li><a href="https://bugzilla.kernel.org/">Bugzilla</a></li>
+                            <li><a href="https://mirrors.kernel.org/">Mirrors</a></li>
+                            <li><a href="https://www.linux.com/">Linux.com</a></li>
+                            <li><a href="https://www.linuxfoundation.org/">Linux Foundation</a></li>
+                        </ul>
+                </div><!-- /.blogroll -->
+                <div class="social">
+                        <h2>Social</h2>
+                        <ul>
+                            <li><a href="https://www.kernel.org/feeds/all.atom.xml" type="application/atom+xml" rel="alternate">Site Atom feed</a></li>
+                            <li><a href="https://www.kernel.org/feeds/kdist.xml" type="application/atom+xml" rel="alternate">Releases Atom Feed</a></li>
+
+                            <li><a href="https://planet.kernel.org/">Kernel Planet</a></li>
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                    This site is operated by the Linux Kernel Organization, a <a href="https://www.kernel.org/nonprofit.html">501(c)3 nonprofit corporation</a>, with support from the following sponsors.
+                </address><!-- /#about -->
+
+                <address id="donors">
+                  <a href="https://www.akamai.com/"><img src="https://www.kernel.org/theme/images/logos/akamai.png"
+                  alt="Akamai" height="55" width="135" id="logo-akamai"/></a>
+                  &nbsp;
+                  <a href="https://www.constellix.com/"><img src="https://www.kernel.org/theme/images/logos/constellix-green-logo.png"
+                  alt="Constellix" width="193" height="21" id="logo-constellix" /></a>
+                  &nbsp;
+                  <a href="https://www.fastly.com/"><img src="https://www.kernel.org/theme/images/logos/fastly-logo.png"
+                  alt="Fastly" width="91" height="35" id="logo-fastly" /></a>
+                  &nbsp;
+                  <a href="https://servers.com/"><img src="https://www.kernel.org/theme/images/logos/serverscom.svg"
+                  alt="servers.com" width="195" height="40" id="logo-serverscom" /></a>
+                  <br />
+                  <a href="https://www.google.com/"><img src="https://www.kernel.org/theme/images/logos/google.png"
+                  alt="Google" height="42" width="128" id="logo-google" /></a>
+                  &nbsp;
+                  <a href="https://www.redhat.com/"><img src="https://www.kernel.org/theme/images/logos/redhat-community.png"
+                  alt="Red Hat" height="36" width="150" id="logo-redhat" /></a>
+                  <br/>&nbsp;<br/>
+                  <a href="https://www.linuxfoundation.org/"><img src="https://www.kernel.org/theme/images/logos/thelinuxfoundation.png"
+                  alt="The Linux Foundation" width="137" height="45" id="logo-lf" /></a>
+                </address><!-- /#about -->
+        </footer><!-- /#contentinfo -->
+
+</body>
+</html>
