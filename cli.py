@@ -8,7 +8,17 @@ import logging
 import subprocess
 import os
 import signal
+import warnings
 from pathlib import Path
+
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning
+except Exception:
+    AuthlibDeprecationWarning = DeprecationWarning
+
+warnings.filterwarnings("ignore", category=AuthlibDeprecationWarning)
+warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*", category=Warning)
+warnings.filterwarnings("ignore", category=Warning, module="requests")
 from typing import Any, Callable
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -17,6 +27,10 @@ from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state, kill_all_running, set_live_hooks
 from config import PROFILE_OPTIONS, get_profile_settings, validate_config
 from agent.activity_timeline import ActivityTimeline, set_activity_timeline, get_activity_timeline
+
+warnings.filterwarnings("ignore", message=".*authlib.*deprecated.*", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*", category=Warning)
+warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*", category=DeprecationWarning)
 
 logger = get_logger("cli")
 
@@ -383,6 +397,63 @@ def _mask_key(key: str) -> str:
     return key if len(key) <= 8 else f"{key[:4]}...{key[-4:]}"
 
 
+def _has_llm_config() -> bool:
+    env = _read_env()
+    local_server = (env.get("LOCAL_SERVER_URL") or env.get("LLM_LOCAL_SERVER_URL") or "").strip()
+    api_key = (env.get("LLM_API_KEY") or env.get("API_KEY") or "").strip()
+    api_url = (env.get("LLM_API_URL") or env.get("URL") or "").strip()
+    return bool(local_server or (api_key and api_url))
+
+
+def prompt_for_llm_credentials() -> dict[str, str]:
+    while True:
+        console.print("\n[bold yellow]LLM configuration required.[/bold yellow]")
+        console.print("Choose how you want to configure Penzer:")
+        console.print("  [cyan]1[/cyan] Use a local server URL")
+        console.print("  [cyan]2[/cyan] Enter API key and API URL")
+        console.print("  [cyan]3[/cyan] Exit")
+
+        try:
+            choice = console.input("[bold cyan]Select option [1-3]: [/bold cyan]").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("LLM configuration is required to start Penzer.")
+
+        if choice in {"1", "local", "server"}:
+            while True:
+                try:
+                    local_url = console.input("Enter LOCAL_SERVER_URL: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    raise SystemExit("LLM configuration is required to start Penzer.")
+                if local_url:
+                    _write_env({"LOCAL_SERVER_URL": local_url, "LLM_LOCAL_SERVER_URL": local_url})
+                    console.print(f"[green]Saved LOCAL_SERVER_URL={local_url}[/green]")
+                    return {"LOCAL_SERVER_URL": local_url}
+                console.print("[red]LOCAL_SERVER_URL cannot be empty.[/red]")
+
+        if choice in {"2", "api", "apikey"}:
+            while True:
+                try:
+                    api_key = console.input("Enter LLM_API_KEY: ").strip()
+                    api_url = console.input("Enter LLM_API_URL (for example https://api.openai.com/v1): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    raise SystemExit("LLM configuration is required to start Penzer.")
+                if api_key and api_url:
+                    _write_env({
+                        "LLM_API_KEY": api_key,
+                        "API_KEY": api_key,
+                        "LLM_API_URL": api_url,
+                        "URL": api_url,
+                    })
+                    console.print("[green]Saved API credentials to .env[/green]")
+                    return {"LLM_API_KEY": api_key, "LLM_API_URL": api_url}
+                console.print("[red]Both LLM_API_KEY and LLM_API_URL are required.[/red]")
+
+        if choice in {"3", "exit", "quit", "q"}:
+            raise SystemExit("LLM configuration is required to start Penzer.")
+
+        console.print("[red]Please choose 1, 2, or 3.[/red]")
+
+
 def _handle_apikey_command(user_input: str) -> None:
     tokens = user_input.split()
     if len(tokens) == 1 or tokens[1] in ("help", "show"):
@@ -566,6 +637,8 @@ async def main():
     global _current_task
     try:
         display_banner()
+        if not _has_llm_config():
+            prompt_for_llm_credentials()
         logging.getLogger("penzer.server").setLevel(logging.CRITICAL)
         server_thread = threading.Thread(target=start_server, daemon=True)
         server_thread.start()

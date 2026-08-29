@@ -4,6 +4,17 @@ Handles FastMCP server setup.
 """
 
 import logging
+import warnings
+
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning
+except Exception:
+    AuthlibDeprecationWarning = DeprecationWarning
+
+warnings.filterwarnings("ignore", category=AuthlibDeprecationWarning)
+warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*", category=Warning)
+warnings.filterwarnings("ignore", category=Warning, module="requests")
+
 from fastmcp import FastMCP
 
 logger = logging.getLogger("penzer.core")
