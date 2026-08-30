@@ -347,8 +347,11 @@ def maybe_notify_update() -> None:
         pass
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
 def _env_path() -> Path:
-    return Path(".env")
+    return PROJECT_ROOT / ".env"
 
 
 def _read_env() -> dict[str, str]:
