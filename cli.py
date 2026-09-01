@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 import os
+import sys
 import signal
 import warnings
 from pathlib import Path
@@ -55,21 +56,40 @@ def compose_summary_lines(matched: list[str] | None = None, trace: list | None =
 
 class LiveStatusView:
     def __init__(self) -> None:
-        self.current = "[dim]Starting…[/]"
+        self.current = "Starting…"
         self.events: list[str] = []
         self._lock = threading.Lock()
         self.current_skill = ""
         self.timeline = ActivityTimeline()
         set_activity_timeline(self.timeline)
 
+    def _clean(self, text: str) -> str:
+        text = str(text or "").strip()
+        text = re.sub(r"\[(?:/?[A-Za-z0-9_]+|/?)\]", "", text)
+        text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+        text = " ".join(text.split())
+        if not text:
+            return "Working…"
+
+        m = re.search(r"([A-Za-z0-9_\- ]+?)\s+(done|failed|warning|running|success)\b", text, flags=re.I)
+        if m:
+            return f"{m.group(1).strip()} {m.group(2).lower()}"
+
+        if re.search(r"Sensitive or install-related command detected\.|Approve this command\?|Command:\s*", text, flags=re.I):
+            return "Approving command…"
+
+        if len(text) > 90:
+            text = text[:87] + "..."
+        return text
+
     def update_skill(self, skill_name: str) -> None:
         with self._lock:
-            self.current_skill = f"[bold green]Using:[/] [cyan]{skill_name}[/]"
+            self.current_skill = self._clean(skill_name)
 
     def update(self, message: str) -> None:
         if not message:
             return
-        message = str(message).strip()
+        message = self._clean(message)
         with self._lock:
             if message == self.current and self.events and self.events[-1] == message:
                 return
@@ -79,35 +99,13 @@ class LiveStatusView:
 
     def render(self) -> str:
         with self._lock:
-            lines = []
+            current = self.current
             if self.current_skill:
-                lines.append(self.current_skill)
-            lines.append(f"[bold]●[/] {self.current}")
-            state = format_execution_state()
-            if state and state != "No execution state yet.":
-                first_state = state.splitlines()[0]
-                lines.append(f"  [dim]↳[/] {first_state}")
-            if self.timeline.events:
-                total_events = len(self.timeline.events)
-                active_events = sum(1 for event in self.timeline.events if event.get("status") == "running")
-                lines.append(f"[dim]{active_events}/{total_events} active activities[/dim]")
-                activity_text = self._render_activity_bubble()
-                if activity_text:
-                    lines.append("\n" + activity_text)
-            return "\n".join(lines)
+                return f"{self.current_skill} · {current}"
+            return f"● {current}"
 
     def status_line(self) -> str:
-        with self._lock:
-            # Keep status text minimal: a single line only. The full timeline
-            # and activity rendering are useful for debugging but noisy for the
-            # user-facing terminal and should not be left behind after the task
-            # completes.
-            if self.current_skill:
-                return f"{self.current_skill} · {self.current}"
-            return f"[bold]●[/] {self.current}"
-
-    def render(self) -> str:
-        return self.status_line()
+        return self.render()
 
     def _render_activity_bubble(self) -> str:
         total_events = len(self.timeline.events)
@@ -867,11 +865,27 @@ async def main():
             # finishes (the gap before the next prompt) takes the idle
             # path instead of trying to cancel a task that's already done.
             try:
-                # Do not use a live spinner at all. The task-progress status is kept
-                # in memory only and never rendered to the terminal in a way that can
-                # linger after completion.
+                # Real agent CLIs keep the user informed with one short status line
+                # that updates in place. No spinner, no noisy timeline, no internal
+                # logger spam.
+                last_rendered = ""
+
                 def _on_status(msg: str) -> None:
+                    nonlocal last_rendered
+                    if not msg:
+                        return
                     status_view.update(msg)
+                    rendered = status_view.status_line()
+                    if rendered == last_rendered:
+                        return
+                    last_rendered = rendered
+                    try:
+                        sys.stdout.write("\r\033[2K")
+                        sys.stdout.write(rendered)
+                        sys.stdout.write("\r")
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
 
                 agent.on_status = _on_status
                 set_live_hooks(None, None)
@@ -903,11 +917,10 @@ async def main():
             finally:
                 _current_task = None
                 set_live_hooks(None, None)
-                # Clear the remaining status line before printing the final answer,
-                # so progress logs don't linger after the task is complete.
+                # Clear the progress line before printing the final answer.
                 try:
-                    console.file.write("\r\033[2K\r")
-                    console.file.flush()
+                    sys.stdout.write("\r\033[2K\r")
+                    sys.stdout.flush()
                 except Exception:
                     pass
                 console.show_cursor(True)
@@ -918,8 +931,8 @@ async def main():
             if response and response.strip():
                 # Clears any transient working indicator before printing the final output.
                 try:
-                    console.file.write("\r\033[2K\r")
-                    console.file.flush()
+                    sys.stdout.write("\r\033[2K\r")
+                    sys.stdout.flush()
                 except Exception:
                     pass
                 console.print()
