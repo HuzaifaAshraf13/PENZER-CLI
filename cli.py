@@ -7,7 +7,6 @@ import json
 import logging
 import subprocess
 import os
-import sys
 import signal
 import warnings
 from pathlib import Path
@@ -96,6 +95,19 @@ class LiveStatusView:
                 if activity_text:
                     lines.append("\n" + activity_text)
             return "\n".join(lines)
+
+    def status_line(self) -> str:
+        with self._lock:
+            # Keep status text minimal: a single line only. The full timeline
+            # and activity rendering are useful for debugging but noisy for the
+            # user-facing terminal and should not be left behind after the task
+            # completes.
+            if self.current_skill:
+                return f"{self.current_skill} · {self.current}"
+            return f"[bold]●[/] {self.current}"
+
+    def render(self) -> str:
+        return self.status_line()
 
     def _render_activity_bubble(self) -> str:
         total_events = len(self.timeline.events)
@@ -639,8 +651,8 @@ async def main():
         server_thread = threading.Thread(target=start_server, daemon=True)
         server_thread.start()
         await asyncio.sleep(0.5)
-        with console.status("[red bold]Loading agent...[/red bold]", spinner="dots"):
-            agent = await PenzerAgent().async_init()
+        console.print("[red bold]Loading agent...[/red bold]")
+        agent = await PenzerAgent().async_init()
         console.print("[bold green]✓ Ready[/bold green]")
         console.print("[dim]Type a task or run [cyan]help[/cyan] for commands.[/dim]\n")
         maybe_notify_update()
@@ -855,17 +867,12 @@ async def main():
             # finishes (the gap before the next prompt) takes the idle
             # path instead of trying to cancel a task that's already done.
             try:
+                # Do not use a live spinner at all. The task-progress status is kept
+                # in memory only and never rendered to the terminal in a way that can
+                # linger after completion.
                 def _on_status(msg: str) -> None:
                     status_view.update(msg)
-                    # Print status updates directly instead of using console.status()
-                    # which was causing spinner frames to persist on screen
-                    rendered = status_view.render()
-                    if rendered:
-                        # Clear line and print the status
-                        sys.stdout.write('\r' + ' ' * 160 + '\r')
-                        sys.stdout.write(rendered + '\n')
-                        sys.stdout.flush()
-                
+
                 agent.on_status = _on_status
                 set_live_hooks(None, None)
                 _current_task = asyncio.ensure_future(agent.run(user_input))
@@ -896,15 +903,25 @@ async def main():
             finally:
                 _current_task = None
                 set_live_hooks(None, None)
-                # Erase the spinner line by writing spaces over it, then return to start of line
-                sys.stdout.write('\r' + ' ' * 120 + '\r')
-                sys.stdout.flush()
+                # Clear the remaining status line before printing the final answer,
+                # so progress logs don't linger after the task is complete.
+                try:
+                    console.file.write("\r\033[2K\r")
+                    console.file.flush()
+                except Exception:
+                    pass
                 console.show_cursor(True)
                 console.file.flush()
             calls_used  = getattr(agent.llm, "call_count", 0) - calls_before
             tokens_used = getattr(agent.llm, "token_estimate", 0) - tokens_before
             response = clean_response(response or "No response.")
             if response and response.strip():
+                # Clears any transient working indicator before printing the final output.
+                try:
+                    console.file.write("\r\033[2K\r")
+                    console.file.flush()
+                except Exception:
+                    pass
                 console.print()
                 console.print(Markdown(response))
             matched = getattr(agent, "_matched_skills", [])

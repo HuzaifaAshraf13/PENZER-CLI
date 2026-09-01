@@ -24,7 +24,8 @@ DATA_DIR.mkdir(exist_ok=True)
 # ============================================================================
 # LOGGING
 # ============================================================================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR")
+LOG_TO_CONSOLE = os.getenv("LOG_TO_CONSOLE", "false").lower() in {"1", "true", "yes", "on"}
 LOG_FILE = LOGS_DIR / "penzer.log"
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 

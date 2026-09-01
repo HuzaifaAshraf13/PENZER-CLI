@@ -4,7 +4,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from rich.console import Console
 from rich.logging import RichHandler
-from config import LOG_LEVEL, LOG_FILE, LOG_FORMAT, LOGS_DIR
+from config import LOG_LEVEL, LOG_FILE, LOG_FORMAT, LOGS_DIR, LOG_TO_CONSOLE
 
 # Shared with cli.py — see module docstring above.
 console = Console(force_terminal=True, width=100)
@@ -20,22 +20,22 @@ def setup_logging() -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
 
-    console_level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+    console_level = getattr(logging, LOG_LEVEL.upper(), logging.ERROR)
 
-    # Rich-aware console handler — see module docstring for why this
-    # replaced a plain StreamHandler(sys.stdout). markup is left off
-    # (default) since arbitrary log text (exception messages, tool
-    # output, etc.) can contain literal square brackets that would
-    # otherwise get misread as Rich markup and either error or render
-    # wrong.
-    console_handler = RichHandler(
-        console=console,
-        level=console_level,
-        show_time=False,
-        show_path=False,
-        rich_tracebacks=True,
-    )
-    root_logger.addHandler(console_handler)
+    # Default interactive CLI behavior: keep logs in the file, not on the
+    # terminal. User-facing status is handled by the CLI itself, not by a
+    # logger handler that writes noise like "Completion evaluator timed out"
+    # or "Continuing…" directly into the session. Enable console logging only
+    # when explicitly requested via LOG_TO_CONSOLE=true.
+    if LOG_TO_CONSOLE:
+        console_handler = RichHandler(
+            console=console,
+            level=console_level,
+            show_time=False,
+            show_path=False,
+            rich_tracebacks=True,
+        )
+        root_logger.addHandler(console_handler)
 
     # File handler with rotation — unchanged, this side was never the problem.
     file_handler = RotatingFileHandler(
