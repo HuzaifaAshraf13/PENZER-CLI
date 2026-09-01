@@ -17,6 +17,102 @@ Fixes:
      already treats them as possibly-missing (`getattr(s, "priority",
      0.5)`) instead of accessing them directly and risking an
      AttributeError on a skill object that lacks one.
+
+CORRECTION NOTE: an earlier pass at this file rewrote the "OUTPUT FORMAT"
+/ "Tool syntax" sections, believing agent.py's native `tool_calls`
+handling meant the LLM used structured function-calling. That was wrong
+— confirmed against agent/llm.py, whose `chat()` parses the model's raw
+text as JSON (`{"answer": "..."}` / `{"tool": "...", "args": {...}}`)
+and only then reshapes it into the `{"content", "tool_calls"}` dict
+agent.py consumes. The JSON-in-text protocol below is correct and
+matches llm.py's `_extract_json` exactly; it has been restored verbatim.
+
+PLUGIN TOOL VISIBILITY FIX: `plugin_tool` didn't appear anywhere in
+AVAILABLE TOOLS or the Tool syntax examples, and there was no way for a
+currently-loaded plugin (auto-created from a repeated command, or
+explicitly created by the model) to ever be listed for the model to see
+— `list_plugin_tools()` in agent.py had zero call sites. Added
+`plugin_tool` to the documented tool list, and a new `plugin_tools`
+param to `build_system_prompt()` that renders a `## AVAILABLE PLUGIN
+TOOLS` block from whatever's currently loaded, via
+`{{PLUGIN_TOOLS_BLOCK}}`.
+
+BELIEF STATE COMPLETION: `assumptions`/`unknowns` were described here as
+part of the belief state, but there was no JSON key the model could
+actually use to report them, `agent/llm.py`'s `chat()` never read any
+such key, and `agent.py` never displayed them even if populated —
+ReflAct's belief-state mechanism was running at half capacity. Added the
+actual keys to the JSON examples here, matching the corresponding fix in
+`agent/llm.py` and `agent.py`.
+
+TERMINAL POLICY CONSOLIDATION FIX: the standalone "LONG-RUNNING COMMANDS"
+section here duplicated guidance that now lives in more detail in the
+core.terminal skill's agent_behavior (STEP 1b) — two sources of truth
+for the same timeout/background/session_id syntax, guaranteed to drift
+the next time one is edited and not the other. That section has been
+removed from this file; the Tool syntax block keeps a single compact
+example showing the params exist, and points to the skill for full
+policy.
+
+More seriously: SAFETY here never mentioned sudo/privilege escalation at
+all — that rule lived ONLY inside core.terminal's agent_behavior. Skills
+are surfaced through `_rank()`, which keeps only the top 12 by
+goal-token overlap; if a task's wording doesn't score core.terminal into
+that top 12 (or if core_skills ever grows past 12 entries with terminal
+losing the tiebreak), the model never sees the password-handling rule at
+all and falls back to whatever's in this static SAFETY block — which had
+nothing. That's a silent gap in exactly the one rule that most needs to
+be unconditional: never see/store/pass a sudo password. SAFETY has been
+rewritten below to state that rule directly, so it's guaranteed present
+every turn regardless of skill ranking, independent of and in addition
+to core.terminal's own (now-consistent) STEP 2 walkthrough.
+
+SKILL-MATCH ADVISORY FIX (this pass): the pre-filter that decides which
+skills get called out as "SKILLS MATCHED" (agent.py's `_match_core_skills`
+— token overlap between the goal's wording and each skill's
+name/description/keywords) is a best-effort GUESS, not a guarantee.
+Previously the hint text this function builds was phrased as a hard
+binary — "SKILLS MATCHED: X" (implying only X applies) or "NO SKILLS
+MATCHED — proceed" (implying nothing here applies) — even though the
+SKILLS_BLOCK below it renders the FULL text of every top-ranked core
+skill regardless of whether the pre-filter matched it. That mismatch
+caused a real bug: a task worded in a way the filter didn't recognize
+(e.g. "look at the network I'm connected to" not overlapping with
+core.terminal's then-narrower keyword list) got told "NO SKILLS
+MATCHED", and the model treated that as license to skip straight to
+generating an answer from general knowledge — fabricating plausible-
+looking fake network data — instead of noticing core.terminal's full
+agent_behavior was sitting right there in the skills block above it and
+using it anyway. The hint below is now explicitly advisory ("best-guess
+suggestion, not a restriction") and paired with a "skill_used" JSON
+field (see OUTPUT FORMAT below) that lets the model self-report which
+skill it is actually following, overriding the filter's guess when it's
+wrong — progressive disclosure with a real correction path, instead of a
+pre-filter whose only failure mode was silent.
+
+LOOP-REWRITE SYNC (this pass): the agent loop dropped its Phase state
+machine (PLANNING/EXECUTING/REFLECTING/BLOCKED/DONE/FAILED) for two
+plain booleans (`agent._done` / `agent._failed`), with `goal_progress`
+kept only as a display string. That string can now land on "failed"
+(set when the loop gives up — iteration/time/token limit, or stuck after
+max retries) as well as the four values already documented here. Belief
+state below updated to list all five. No other change needed — this
+file never read Phase directly and the JSON contract with the model
+(`assumptions`/`unknowns`/`skill_used`) is unchanged by the loop rewrite.
+
+KNOWN OPEN ISSUES (not fixed in this pass, flagged for follow-up):
+  - `mcp_tools` on core.terminal lists `run_bash`/`run_python`, but
+    those names never appear in AVAILABLE TOOLS below — only `terminal`
+    does. Unclear whether these are stale leftovers or real dispatch
+    targets invisible to the model; check agent.py's tool table.
+  - `_rank()`'s top-12 truncation can still drop core.terminal (or any
+    future core skill) out of {{SKILLS_BLOCK}} on low-overlap goals.
+    The sudo/password rule is now safe regardless (see SAFETY above),
+    but the rest of core.terminal's behavior (risk self-assessment,
+    timeout/background guidance, built-in cheatsheet) has no such
+    backstop and simply won't render on some tasks. Consider forcing
+    all `core: true` skills into the rendered list unconditionally,
+    ahead of/independent from the top-12 ranked cutoff.
 """
 import json
 import logging
@@ -46,13 +142,13 @@ OUTPUT FORMAT — single JSON object only
 Final answer  →  {"answer": "..."}
 Tool call     →  {"tool": "...", "args": {...}}
 
-Optional on any turn — which skill (by exact name, from CORE SKILLS or
-LEARNED PATTERNS below) you're actually following:
+Optional on any turn — which core skill (by exact name) you're actually
+following:
   {"tool": "...", "args": {...}, "skill_used": "Terminal Executor"}
 Only needed when you're following a skill OTHER than the one(s) named in
 the "Suggested skills" hint below (see SKILL PROTOCOL) — that hint is a
-best-guess suggestion, not a restriction, and you can act on any skill
-listed in CORE SKILLS / LEARNED PATTERNS even if it wasn't suggested.
+best-guess suggestion, not a restriction, and you can act on any core
+skill listed here even if it wasn't suggested.
 When you do, report it via skill_used so the plan/tracking catches up.
 Omit it on turns where you're following the suggested skill(s), or when
 no skill applies at all.
@@ -162,13 +258,13 @@ relevant fact, use it before asking the user again.
 ════════════════════════════════════════════════════════
 SKILL PROTOCOL — MANDATORY before any tool call
 ════════════════════════════════════════════════════════
-STEP 1: Check the FULL CORE SKILLS / LEARNED PATTERNS list below — not
-  just the "Suggested skills" hint. The hint is generated by matching
-  the task's wording against each skill's name/description/keywords; it
-  is a best-effort GUESS meant to save you time, not an exhaustive or
-  authoritative answer. It can miss a skill that's clearly the right
-  fit just because the task happened to be phrased differently than
-  that skill's listed keywords anticipated.
+STEP 1: Check the FULL CORE SKILLS list below — not just the "Suggested
+  skills" hint. The hint is generated by matching the task's wording
+  against each skill's name/description/keywords; it is a best-effort
+  GUESS meant to save you time, not an exhaustive or authoritative answer.
+  It can miss a core skill that's clearly the right fit just because the
+  task happened to be phrased differently than that skill's listed
+  keywords anticipated.
 
   A skill below (suggested or not) genuinely matches?
                             → follow its agent_behavior exactly. If it
@@ -178,11 +274,21 @@ STEP 1: Check the FULL CORE SKILLS / LEARNED PATTERNS list below — not
                               generation catches up with what you're
                               actually doing.
   Multiple skills match?   → follow MULTI-SKILL PLAN shown in [ReflAct]
-  Nothing in the list matches at all → proceed, generate a skill after
-                              if 3+ tools were used.
+  Nothing in the list matches at all → proceed with the best core skill,
+                              or choose a new approach without inventing
+                              unsupported facts.
 
 STEP 2: Execute following the skill steps in order
 STEP 3: Record outcome — success improves skill priority over time
+
+A skill's agent_behavior tells you HOW to use a tool to get the user's
+actual answer — it is never itself the answer. If a matched skill turns
+out not to fit what the user literally asked (the "Suggested skills"
+hint is a guess — see above), do not follow its steps anyway just
+because it was suggested. Never describe, define, or explain what a
+tool/skill IS as your final {"answer": ...} — that is never a valid
+response to a real request. Your final answer must be built from actual
+tool results that address the user's literal question.
 
 ════════════════════════════════════════════════════════
 MULTI-SKILL EXECUTION
@@ -386,33 +492,6 @@ def _fmt_core_skill(skill) -> str:
     )
 
 
-def _fmt_generated_skill(skill) -> str:
-    lines       = [l.strip() for l in (skill.agent_behavior or "").splitlines() if l.strip()]
-    step1       = lines[0] if lines else "(no steps)"
-    description = getattr(skill, "description", "")
-    priority    = getattr(skill, "priority", 0.5)
-    version     = getattr(skill, "version", "1.0")
-    success     = getattr(skill, "success_count", 0)
-    failure     = getattr(skill, "failure_count", 0)
-    total       = success + failure
-    rate        = (success / total * 100) if total > 0 else 0
-    if total >= 10 and rate > 80:   status = "\U0001F525 VERY HOT"
-    elif total >= 5 and rate > 75:  status = "\U0001F7E0 HOT"
-    elif total >= 1 and rate >= 50: status = "\U0001F7E1 WARMING"
-    elif total == 0:                status = "\u2744\uFE0F UNTESTED"
-    else:                           status = "\U0001F535 COOL"
-    failure_modes = getattr(skill, "failure_modes", "") or ""
-    failure_line  = f"  Avoid  : {failure_modes[:100]}\n" if failure_modes else ""
-    return (
-        f"- **{skill.name}** {status}\n"
-        f"  {description}\n"
-        f"  {success}\u2713 {failure}\u2717 ({int(rate)}%) | "
-        f"Priority: {priority} v{version}\n"
-        f"  Step 1: {step1}\n"
-        f"{failure_line}"
-    )
-
-
 def _enrich(skills: List) -> None:
     """Load real metrics from storage into each skill object."""
     for skill in skills:
@@ -504,18 +583,7 @@ def build_system_prompt(
             skills_lines.append("")
         for skill in ranked[:12]:
             skills_lines.append(_fmt_core_skill(skill))
-    if generated_skills:
-        _enrich(generated_skills)
-        ranked = _rank(generated_skills, goal)
-        skills_lines += [
-            "## LEARNED PATTERNS",
-            "Skills generated from past runs. Capture exact winning sequences.",
-            "\U0001F525 HOT = proven multiple times. Prioritize these.",
-            "",
-        ]
-        for skill in ranked[:12]:
-            skills_lines.append(_fmt_generated_skill(skill))
-    block  = "\n".join(skills_lines).strip()
+    block = "\n".join(skills_lines).strip()
     prompt = MAIN_SYSTEM_PROMPT.replace("{{SKILLS_BLOCK}}", block)
     prompt = prompt.replace("{{PLUGIN_TOOLS_BLOCK}}", _fmt_plugin_tools_block(plugin_tools))
     if memory_context:

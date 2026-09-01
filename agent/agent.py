@@ -35,12 +35,11 @@ from session.memory import (
     score_complexity, should_consolidate, consolidate_memory,
     update_skill_metric, get_storage_summary,
     save_last_run, load_last_run, clear_last_run, estimate_iterations_needed,
-    get_relevant_kv_facts,
     append_steps as _append_steps_to_disk, get_steps as _get_persisted_steps,
     clear_steps as _clear_persisted_steps,
 )
 from agent.system_prompts import build_system_prompt, _tokenize
-from agent.skills import load_all_skills, search_generated_skills, build_context_from_history
+from agent.skills import load_all_skills, build_context_from_history
 from tools.plugins import load_plugin_tools
 from tools.executor import set_execution_state
 from agent.activity_timeline import emit_activity_event, update_activity_event, get_activity_timeline
@@ -122,7 +121,8 @@ class PenzerAgent:
         self._fn_cache: dict = {}
         self._reset()
         data = load_all_skills()
-        self.core_skills, self.gen_skills = data["core"], data["generated"]
+        self.core_skills = data["core"]
+        self.gen_skills = []
         self._monitor       = ResourceMonitor()
         self._shutdown      = False
         self._backoff       = 1.0
@@ -328,7 +328,6 @@ class PenzerAgent:
         lowered = user_input.lower()
         goal_tokens = _tokenize(user_input)
         matched = []
-        facts = get_relevant_kv_facts(user_input, n=3)
         for skill in self.core_skills:
             skill_name = (skill.name or "").lower()
             keyword_tokens = set()
@@ -338,7 +337,7 @@ class PenzerAgent:
             weak_overlap = goal_tokens & (name_desc_tokens - keyword_tokens)
             if (goal_tokens & keyword_tokens) or len(weak_overlap) >= 2:
                 matched.append(skill)
-            elif "memory" in skill_name and (facts or self._looks_like_memory_query(lowered)):
+            elif "memory" in skill_name and self._looks_like_memory_query(lowered):
                 matched.append(skill)
         return matched
 
@@ -385,7 +384,7 @@ class PenzerAgent:
         initial keyword match missed it."""
         if not skill_used or skill_used in self._matched_skills:
             return
-        by_name = {s.name: s for s in list(self.core_skills) + list(self.gen_skills)}
+        by_name = {s.name: s for s in self.core_skills}
         skill = by_name.get(skill_used)
         if skill is None:
             return
@@ -456,18 +455,6 @@ class PenzerAgent:
                 remember_semantic(pattern=f"For '{goal[:40]}': {worked}", confidence=0.7)
         except Exception as e:
             logger.debug("Post-mortem: %s", e)
-
-    def _inject_meta_skill_reminder(self):
-        winning = " -> ".join(f"{t['tool']}({self._fmt_action(t['tool'], t['args'])})" for t in self._trace if t["success"])
-        self.history.append({"role": "user", "content": (
-            "[Skill evolution] Complex novel task solved. "
-            f"Winning sequence: {winning}\n"
-            "Before final answer:\n"
-            "1. List agent/skills/generated/ — similar skill exists?\n"
-            "2. If not: write .skill.md with exact sequence + failure_modes.\n"
-            "3. Include: name, description, keywords, agent_behavior, failure_modes, mcp_tools.\n"
-            "Then give your final answer."
-        )})
 
     def _stuck(self) -> bool:
         """Same tool result repeating, or the same tool+args signature 3+
@@ -675,7 +662,7 @@ class PenzerAgent:
         self._reset()
         self._restore_snapshot(snapshot)
         if self._matched_skills:
-            by_name = {s.name: s for s in list(self.core_skills) + list(self.gen_skills)}
+            by_name = {s.name: s for s in self.core_skills}
             self._active_skills = [by_name[n] for n in self._matched_skills if n in by_name]
             if self._active_skills:
                 self._orchestrate_skills()
@@ -730,17 +717,14 @@ class PenzerAgent:
                       "insights": len(self._task_insights), "trajectories": len(self._past_trajectories),
                       "episode_replay": bool(episode_replay)},
         )
-        matched_gen = search_generated_skills(user_input, self.gen_skills, context=build_context_from_history(self.history))
-        self._emit_activity("search", "Skill search", message=f"Matched {len(matched_gen)} generated skills.",
-                             status="success", details={"generated_skills": [s.name for s in matched_gen], "query": user_input[:120]})
         matched_core = self._match_core_skills(user_input)
-        self._active_skills  = matched_core + list(matched_gen)
+        self._active_skills = matched_core
         self._matched_skills = [s.name for s in self._active_skills]
         self._emit_activity(
             "skill", "Skill matching",
             message="Matched at least one skill." if self._matched_skills else "No skills matched initially.",
             status="success",
-            details={"matched_skills": self._matched_skills, "matched_core": [s.name for s in matched_core], "matched_generated": [s.name for s in matched_gen]},
+            details={"matched_skills": self._matched_skills, "matched_core": [s.name for s in matched_core]},
         )
         self._last_matched_skills = self._matched_skills
         self._novel_task          = not bool(self._matched_skills)
@@ -748,12 +732,11 @@ class PenzerAgent:
             self._orchestrate_skills()
         skills_hint = (
             f"Suggested skills (best-guess from task wording, not exhaustive): {', '.join(self._matched_skills)}\n"
-            "Follow their merged SKILL PLAN if they fit. If a different skill in CORE SKILLS/LEARNED PATTERNS "
-            "below is actually the better match, use that instead and report it via \"skill_used\".\n"
+            "Follow their merged SKILL PLAN if they fit. If a different core skill below is actually the better match, "
+            "use that instead and report it via \"skill_used\".\n"
         ) if self._matched_skills else (
-            "No skill was suggested by the initial match — check the full CORE SKILLS/LEARNED PATTERNS list "
-            "yourself before assuming none apply; report any skill you use via \"skill_used\". If genuinely "
-            "nothing applies, proceed and generate a skill after if 3+ tools were used.\n"
+            "No skill was suggested by the initial match — check the full CORE SKILLS list yourself before assuming none apply; "
+            "report any skill you use via \"skill_used\".\n"
         )
         insight_hint = ""
         if self._task_insights:
@@ -767,7 +750,7 @@ class PenzerAgent:
             mortem_hint = "\n## Past Experience\n" + "".join(
                 f"  [{pm['task_type']}] Worked: {pm['what_worked']} | Failed: {pm['what_failed']} | Next: {pm['next_time']}\n" for pm in past_mortems)
         self._system_prompt = build_system_prompt(
-            core_skills=self.core_skills, generated_skills=self.gen_skills, memory_context=past_memory,
+            core_skills=self.core_skills, memory_context=past_memory,
             extra=skills_hint + insight_hint + mortem_hint, goal=user_input, plugin_tools=self.get_plugin_tool_descriptions(),
         )
         self._resume_state = {
@@ -790,7 +773,8 @@ class PenzerAgent:
         try:
             if self._skills_dirty:
                 data = load_all_skills()
-                self.core_skills, self.gen_skills = data["core"], data["generated"]
+                self.core_skills = data["core"]
+                self.gen_skills = []
             if self._trace:
                 tool_seq = " -> ".join(t["tool"] for t in self._trace)
                 outcome  = "success" if any(t["success"] for t in self._trace) else "failure"
@@ -804,13 +788,30 @@ class PenzerAgent:
                     message="Completed successfully." if self._done else "Run finished with partial progress.",
                     status="success",
                     details={"iterations": self._iteration + 1, "tools_used": len(self._trace), "skills_matched": len(self._matched_skills)})
-            if len(self._trace) >= COMPLEX_THRESHOLD:
+            # Evaluate completion whenever any tool ran at all — not just
+            # past COMPLEX_THRESHOLD. A single-tool bad answer (e.g. the
+            # model reciting a matched skill's own step description
+            # instead of using the tool result) deserves the same honest
+            # "[Note: incomplete]" flag a multi-tool one gets; gating this
+            # on trace length let short-but-wrong answers through silently.
+            if self._trace:
+                self._safe_status("Double-checking the answer…")
                 completed, eval_reason = await self._evaluate_completion(user_input, result)
                 if completed is False:
                     result = f"{result} [Note: incomplete — {eval_reason}]"
                 elif completed is None:
                     logger.debug("Completion evaluator unavailable (%s) — leaving result unannotated", eval_reason)
-                await self._write_post_mortem_and_insights(user_input, result)
+                # Post-mortem/insight extraction is bookkeeping for FUTURE
+                # runs — nothing in it changes what's returned here. It
+                # used to block the return on a second real LLM call for
+                # no benefit to this response; backgrounding it (same
+                # pattern as consolidate_memory below) means the user
+                # gets their answer immediately instead of the spinner
+                # freezing on stale text through a call that doesn't
+                # affect what they're about to see.
+                self._spawn_background(
+                    self._write_post_mortem_and_insights(user_input, result), "post_mortem"
+                )
             if should_consolidate():
                 self._spawn_background(consolidate_memory(self.llm), "consolidate_memory")
             save_history(self.history)
@@ -854,7 +855,9 @@ class PenzerAgent:
             if not filtered_calls:
                 self.history.append({"role": "user", "content": "All proposed tools had low confidence. Rethink approach."})
                 continue
-            await self._execute_tool_calls(filtered_calls, i)
+            direct_result = await self._execute_tool_calls(filtered_calls, i)
+            if direct_result is not None:
+                return direct_result
         return "Stopped: internal error (loop exited without a result)"
 
     def _llm_failure_result(self) -> str | None:
@@ -866,8 +869,16 @@ class PenzerAgent:
         return "Rate limit exceeded. Try again in a moment."
 
     def _append_assistant_turn(self, text: str, calls: list) -> None:
+        """Always emits a clean human-readable status this iteration —
+        even with no reasoning text — so a status consumer never has to
+        fall back to displaying the raw assistant JSON payload (which
+        doesn't go through the same overwrite/spinner path and ends up
+        printing a new stuck line every frame instead of updating one)."""
         if text:
             self._record_step("reasoning", text[:200])
+        else:
+            preview = ", ".join(c.get("name", "?") for c in calls) or "next step"
+            self._safe_status(f"Running: {preview}")
         self.history.append({"role": "assistant", "content": json.dumps({
             "reasoning": text, "tools": [{"tool": c.get("name", ""), "args": c.get("arguments", {})} for c in calls],
         })})
@@ -930,7 +941,7 @@ class PenzerAgent:
         self._safe_status("Reasoning about next step…" if i == 0 else "Continuing…")
         if (i + 1) % 5 == 0:
             self._system_prompt = build_system_prompt(
-                core_skills=self.core_skills, generated_skills=self.gen_skills,
+                core_skills=self.core_skills,
                 memory_context=get_relevant_memories(self._goal, n=3, deep=self._is_complex_task),
                 goal=self._goal, plugin_tools=self.get_plugin_tool_descriptions(),
             )
@@ -946,11 +957,45 @@ class PenzerAgent:
             self._belief["unknowns"] = [str(u)[:120] for u in r["unknowns"]][:5]
 
     def _looks_like_malformed_tool_payload(self, text: str) -> bool:
-        try:
-            data = json.loads(text)
-        except Exception:
+        stripped = text.strip()
+        if not stripped.startswith("{"):
             return False
-        return isinstance(data, dict) and any(k in data for k in ("tool", "tools", "tool_calls")) and not data.get("answer") and not data.get("thought")
+
+        try:
+            data = json.loads(stripped)
+        except Exception:
+            # A response can be genuinely truncated mid-generation (e.g.
+            # cut off before the closing braces) and still be
+            # unmistakably a tool-call envelope, not a real answer.
+            return bool(re.match(r'^\{\s*"(reasoning|tool|tools|tool_calls)"\s*:', stripped))
+
+        if not isinstance(data, dict):
+            return False
+        if data.get("answer") or data.get("thought"):
+            return False
+        if not any(k in data for k in ("tool", "tools", "tool_calls")):
+            return False
+
+        def _valid_tool_entry(entry: Any) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            name = str(entry.get("tool") or entry.get("name") or "").strip()
+            if not name:
+                return False
+            args = entry.get("args") if "args" in entry else entry.get("arguments", {})
+            return isinstance(args, dict)
+
+        if "tool" in data:
+            args = data.get("args") if "args" in data else data.get("arguments", {})
+            return not (str(data.get("tool") or "").strip() and isinstance(args, dict))
+
+        if "tools" in data and isinstance(data["tools"], list):
+            return not any(_valid_tool_entry(entry) for entry in data["tools"])
+
+        if "tool_calls" in data and isinstance(data["tool_calls"], list):
+            return not any(_valid_tool_entry(entry) for entry in data["tool_calls"])
+
+        return True
 
     def _handle_empty_calls(self, text: str, empty: int) -> tuple[str | None, int]:
         """No tool calls this turn: either a final answer, or a nudge to
@@ -1006,7 +1051,20 @@ class PenzerAgent:
                 filtered.append(c)
         return filtered
 
-    async def _execute_tool_calls(self, filtered_calls: list, i: int) -> None:
+    def _extract_ip_answer(self, user_input: str, result: str) -> str | None:
+        q = (user_input or "").lower()
+        if not any(key in q for key in ("ip address", "ip adress", "my ip", "public ip", "what is my ip")):
+            return None
+        matches = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", str(result or ""))
+        if not matches:
+            return None
+        candidates = [m for m in matches if not m.startswith(("127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.", "169.254."))]
+        if not candidates:
+            candidates = matches
+        ip = candidates[0]
+        return f"Your IP address is {ip}."
+
+    async def _execute_tool_calls(self, filtered_calls: list, i: int) -> str | None:
         for c in filtered_calls:
             self._record_step("tool_call", f"{c['name']} {self._fmt_action(c['name'], c.get('arguments', {}))}",
                                tool=c["name"], args=c.get("arguments", {}))
@@ -1050,16 +1108,21 @@ class PenzerAgent:
                 self.history.append({"role": "user", "content": "[Auto-plugin] Repeated terminal workflow detected; created a reusable plugin tool."})
             self.history.append({"role": "tool", "tool_call_id": c.get("id", name),
                                   "content": self._fmt_tool_output(name, c.get("arguments", {}), raw, ok, elapsed)})
-            if name == "file_editor":
-                fp = str(c.get("arguments", {}).get("filepath", ""))
-                if "skills/generated" in fp and fp.endswith(".skill.md"):
-                    self._skills_dirty = True
             self._record_step("tool_result", f"{name} {'done' if ok else 'failed'} ({elapsed}s): {self._brief(raw)[:100]}",
                                tool=name, success=ok, elapsed_sec=elapsed)
+
+            if ok and name == "terminal":
+                direct_answer = self._extract_ip_answer(self._goal, str(raw))
+                if direct_answer:
+                    self._done = True
+                    self._belief["goal_progress"] = "complete"
+                    self.history.append({"role": "assistant", "content": direct_answer})
+                    self._record_step("final_answer", direct_answer[:200], reason="direct_answer_from_tool_output")
+                    self._persist_all()
+                    return direct_answer
+
         self._persist_all()
-        if self._novel_task and len(self._trace) >= COMPLEX_THRESHOLD and any(t["success"] for t in self._trace) and not self._meta_skill_triggered:
-            self._meta_skill_triggered = True
-            self._inject_meta_skill_reminder()
+        return None
 
     # ------------------------------------------------------------------
     # LLM call wrapper
@@ -1095,7 +1158,14 @@ class PenzerAgent:
         return r
 
     async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
-        delay = RATE_LIMIT_BASE
+        """Backoff persists across iterations via self._backoff — it's the
+        starting delay for this call's retries, not just a value tracked
+        and never read. Without that, every new iteration silently reset
+        to RATE_LIMIT_BASE regardless of how much the run had already
+        been rate-limited, so a persistently-throttled API got hammered
+        at full speed every single iteration instead of actually backing
+        off harder over time."""
+        delay = self._backoff
         for attempt in range(max_attempts):
             try:
                 r = await asyncio.wait_for(self.llm.chat(system=self._system_prompt, messages=self._msgs(step)), timeout=45)
@@ -1103,7 +1173,7 @@ class PenzerAgent:
                 self._backoff, self._rate_attempts, self._last_llm_error = max(1.0, self._backoff * 0.9), 0, ""
                 return r
             except asyncio.TimeoutError:
-                self._backoff = min(3.0, self._backoff * 1.5)
+                self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
                 self.history.append({"role": "user", "content": "Timeout. Continue or give final answer."})
                 self._last_llm_error = "timeout"
                 return None
@@ -1112,6 +1182,7 @@ class PenzerAgent:
                 if any(x in err for x in ("rate", "429", "quota", "limit")):
                     self._rate_attempts += 1
                     wait = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + random.uniform(0, RATE_LIMIT_JITTER))
+                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
                     self._record_step("rate_limit", f"Rate limited — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
                     await asyncio.sleep(wait)
                     continue
@@ -1203,11 +1274,26 @@ class PenzerAgent:
         if not ok:
             return f"{hdr}\nError: {self._brief(raw)}"
         if name == "terminal":
-            lines = str(raw).strip().splitlines()
+            # Line-count cap alone doesn't bound size: minified/single-
+            # line output (e.g. curl'd HTML) has ~0 newlines, so
+            # lines[:5] can still be the ENTIRE multi-KB/MB blob. That
+            # bloats every subsequent LLM call's context with it,
+            # ballooning latency/tokens for the rest of the run. Cap by
+            # characters too, same 250-char budget _brief() already uses
+            # for every other tool.
+            raw_str = str(raw).strip()
+            lines = raw_str.splitlines()
             if not lines:
                 return f"{hdr}\n(no output)"
-            preview = "\n".join(lines[:5])
-            tail = f"\n… ({len(lines)-5} more)" if len(lines) > 5 else ""
+            preview = "\n".join(lines[:5])[:250]
+            omitted_lines = len(lines) - 5
+            omitted_chars = len(raw_str) - len(preview)
+            tail_parts = []
+            if omitted_lines > 0:
+                tail_parts.append(f"{omitted_lines} more lines")
+            if omitted_chars > 0:
+                tail_parts.append(f"{omitted_chars} more chars")
+            tail = f"\n… ({', '.join(tail_parts)})" if tail_parts else ""
             return f"{hdr}\n{preview}{tail}"
         if name in ("file_editor", "memory") and args.get("action") in ("write", "create", "delete", "replace", "store"):
             return f"{hdr}\nDone"

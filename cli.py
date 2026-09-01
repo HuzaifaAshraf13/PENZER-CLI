@@ -7,6 +7,7 @@ import json
 import logging
 import subprocess
 import os
+import sys
 import signal
 import warnings
 from pathlib import Path
@@ -47,18 +48,10 @@ for _log in [
 
 
 def compose_summary_lines(matched: list[str] | None = None, trace: list | None = None, calls_used: int = 0, tokens_used: int = 0) -> list[str]:
-    """Generate formatted status lines with rich formatting."""
-    lines = []
-    if matched:
-        skill_text = "[bold cyan]Skills:[/] " + "[dim]·[/] ".join(f"[green]{s}[/]" for s in matched)
-        lines.append(skill_text)
-    if trace:
-        tools_text = "[bold cyan]Tools:[/] " + "[dim]·[/] ".join(f"[yellow]{t}[/]" for t in dict.fromkeys(trace))
-        lines.append(tools_text)
-    if calls_used or tokens_used:
-        llm_text = f"[bold cyan]LLM:[/] [magenta]{calls_used}[/] calls [dim]·[/] ~[magenta]{tokens_used}[/] tokens"
-        lines.append(llm_text)
-    return lines
+    """Generate the final task summary with only the token count."""
+    if not tokens_used:
+        return []
+    return [f"[bold cyan]LLM:[/] ~[magenta]{tokens_used}[/] tokens"]
 
 
 class LiveStatusView:
@@ -862,14 +855,21 @@ async def main():
             # finishes (the gap before the next prompt) takes the idle
             # path instead of trying to cancel a task that's already done.
             try:
-                with console.status("[cyan]Working…[/cyan]", spinner="dots") as status:
-                    def _on_status(msg: str) -> None:
-                        status_view.update(msg)
-                        status.update(status_view.render())
-                    agent.on_status = _on_status
-                    set_live_hooks(status.stop, status.start)
-                    _current_task = asyncio.ensure_future(agent.run(user_input))
-                    response = await _current_task
+                def _on_status(msg: str) -> None:
+                    status_view.update(msg)
+                    # Print status updates directly instead of using console.status()
+                    # which was causing spinner frames to persist on screen
+                    rendered = status_view.render()
+                    if rendered:
+                        # Clear line and print the status
+                        sys.stdout.write('\r' + ' ' * 160 + '\r')
+                        sys.stdout.write(rendered + '\n')
+                        sys.stdout.flush()
+                
+                agent.on_status = _on_status
+                set_live_hooks(None, None)
+                _current_task = asyncio.ensure_future(agent.run(user_input))
+                response = await _current_task
             except asyncio.CancelledError:
                 # Reached when _sigint_handler cancelled _current_task
                 # above. The handler already called kill_all_running()
@@ -896,6 +896,9 @@ async def main():
             finally:
                 _current_task = None
                 set_live_hooks(None, None)
+                # Erase the spinner line by writing spaces over it, then return to start of line
+                sys.stdout.write('\r' + ' ' * 120 + '\r')
+                sys.stdout.flush()
                 console.show_cursor(True)
                 console.file.flush()
             calls_used  = getattr(agent.llm, "call_count", 0) - calls_before

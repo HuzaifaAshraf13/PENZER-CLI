@@ -392,7 +392,7 @@ def confirm_action(
     _resume_live() itself once the whole interactive sequence is done
     (see _run_privileged_interactive's caller in execute()).
     """
-    prompt = "Approve this command? [y/N]: "
+    prompt = f"Command: {command}\nApprove this command? [y/N]: "
     if reason:
         prompt = f"{reason}\n{prompt}"
     if timeout is not None:

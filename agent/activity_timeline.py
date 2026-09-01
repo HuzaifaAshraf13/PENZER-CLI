@@ -257,8 +257,6 @@ def _render_search_details(details: dict[str, Any], compact: bool) -> list[str]:
         lines.append(f"    • query: {_short_text(query, DETAIL_LIMIT_COMPACT)}")
     if details.get("result_count") is not None:
         lines.append(f"    • results: {details.get('result_count')}")
-    if details.get("generated_skills"):
-        lines.append(f"    • matched skills: {len(details.get('generated_skills'))}")
     return lines
 
 
@@ -275,7 +273,7 @@ def _render_memory_details(details: dict[str, Any], compact: bool) -> list[str]:
 
 def _render_skill_details(details: dict[str, Any], compact: bool) -> list[str]:
     lines: list[str] = []
-    matched = details.get("matched_skills") or details.get("matched_core") or details.get("matched_generated")
+    matched = details.get("matched_skills") or details.get("matched_core")
     if matched:
         if isinstance(matched, (list, tuple)):
             lines.append(f"    • matched: {', '.join(str(item) for item in matched[:5])}")

@@ -1,6 +1,7 @@
 """
-Skill search — only used for generated skills.
-Core skills are always shown to the agent, no search needed.
+Skill search — DEPRECATED. Generated skills are disabled in the runtime.
+
+This module is kept for backward compatibility only.
 """
 from typing import List, Dict, Tuple
 from agent.skills.base import Skill
