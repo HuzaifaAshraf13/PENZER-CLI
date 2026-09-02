@@ -173,6 +173,7 @@ class PenzerAgent:
         self._failed: bool = False
         self._steps:         list = []
         self._pending_steps: list = []
+        self._plan:          list = []
         self._run_id:        str  = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
         self._last_llm_error:      str   = ""
         if hasattr(self, "_monitor"):
@@ -695,6 +696,7 @@ class PenzerAgent:
     async def run(self, user_input: str) -> str:
         self._reset()
         self._goal             = user_input
+        self._bootstrap_plan(user_input)
         self._complexity_score = score_complexity(user_input)
         self._is_complex_task  = self._complexity_score >= 0.4
         self._max_iter         = self._max_iter_for_complexity(self._complexity_score)
@@ -997,6 +999,46 @@ class PenzerAgent:
 
         return True
 
+    def _bootstrap_plan(self, goal: str) -> None:
+        """Create a lightweight explicit plan so the loop can distinguish
+        active work from completion or recovery without adding a second
+        manager class."""
+        action_words = [w for w in str(goal).split() if len(w) > 3][:6]
+        steps = [
+            {"id": "understand_goal", "title": "Understand the goal", "status": "pending", "reason": ""},
+            {"id": "choose_method", "title": "Choose the next tool or answer path", "status": "pending", "reason": ""},
+            {"id": "execute", "title": "Execute the targeted action", "status": "pending", "reason": ""},
+            {"id": "verify", "title": "Verify evidence before completion", "status": "pending", "reason": ""},
+            {"id": "finalize", "title": "Return result", "status": "pending", "reason": ""},
+        ]
+        if action_words:
+            steps[0]["title"] = f"Understand: {' '.join(action_words)}"
+        self._plan = steps
+
+    def _mark_plan_step(self, step_id: str, status: str, reason: str = "") -> None:
+        for step in self._plan:
+            if step.get("id") == step_id:
+                step["status"] = status
+                step["reason"] = reason
+                break
+
+    def _requires_verification(self, tool_name: str, args: dict | None) -> bool:
+        args = args or {}
+        if tool_name == "file_editor":
+            action = str(args.get("action", "")).lower()
+            return action in {"write", "create", "replace", "delete", "move", "rename"}
+        if tool_name == "terminal":
+            command = str(args.get("command", "")).lower()
+            mutation_tokens = [" > ", " >> ", "tee ", "mv ", "rm ", "cp ", "mkdir ", "touch ", "chmod ", "chown ", "sed -i", "perl -pi", "python -c", "pip install", "apt install", "curl ", "wget "]
+            return any(token in command for token in mutation_tokens)
+        if tool_name == "memory":
+            return str(args.get("action", "")).lower() in {"store", "write", "delete", "update"}
+        return False
+
+    def _track_recovery_step(self, detail: str, reason: str) -> None:
+        self._plan.append({"id": f"recovery_{len(self._plan)}", "title": detail[:120], "status": "blocked", "reason": reason})
+        self._record_step("recovery", detail[:200], reason=reason)
+
     def _handle_empty_calls(self, text: str, empty: int) -> tuple[str | None, int]:
         """No tool calls this turn: either a final answer, or a nudge to
         continue (gives up after two empty turns in a row)."""
@@ -1007,6 +1049,7 @@ class PenzerAgent:
         if text:
             self.history.append({"role": "assistant", "content": text})
             self._record_step("final_answer", text[:200])
+            self._mark_plan_step("finalize", "done", "final_answer")
             self._done = True
             self._belief["goal_progress"] = "complete"
             return text, empty
@@ -1021,6 +1064,7 @@ class PenzerAgent:
         """Stuck confirmed: surface a partial finding if one exists, else
         ask the model to diagnose+redirect and inject that into context."""
         self._failures += 1
+        self._mark_plan_step("choose_method", "blocked", "stuck")
         self._record_step("recovery", f"Stuck detected (attempt {self._failures}/{MAX_FAILURES}) — looking for a way forward.")
         partial = self._find_partial_result()
         if partial:
@@ -1032,12 +1076,12 @@ class PenzerAgent:
         if self._failures >= MAX_FAILURES:
             self._failed = True
             self._belief["goal_progress"] = "failed"
-            self._record_step("give_up", "Giving up after max failed attempts.", reason="max_failures", failure_count=self._failures)
+            self._track_recovery_step("Giving up after max failed attempts.", "max_failures")
             self._persist_all()
             return "Stuck after max attempts"
         diagnosis = await self._reflect()
         self.history.append({"role": "user", "content": f"[Recovery] {diagnosis}"})
-        self._record_step("recovery", diagnosis[:200], reason="reflect_recovery", diagnosis=diagnosis[:200])
+        self._track_recovery_step(diagnosis[:200], "reflect_recovery")
         return None
 
     def _filter_by_confidence(self, calls: list) -> list:
@@ -1068,6 +1112,8 @@ class PenzerAgent:
         for c in filtered_calls:
             self._record_step("tool_call", f"{c['name']} {self._fmt_action(c['name'], c.get('arguments', {}))}",
                                tool=c["name"], args=c.get("arguments", {}))
+            if self._requires_verification(c["name"], c.get("arguments", {})):
+                self._mark_plan_step("execute", "running", f"mutating_tool:{c['name']}")
         results = await execution.run_speculative(self, filtered_calls)
         if any(self._is_error(raw) and not self._is_timeout(raw) for raw, _ in results):
             fallback_results = []
@@ -1102,6 +1148,8 @@ class PenzerAgent:
                 update_skill_metric(skill.name, ok)
             self._update_belief(name, c.get("arguments", {}), str(raw), ok)
             self._update_working_memory(name, str(raw), ok)
+            if ok and self._requires_verification(name, c.get("arguments", {})):
+                self._mark_plan_step("verify", "running", f"verify:{name}")
             if ok and self._skill_plan:
                 self._mark_skill_step_done(name)
             if ok and name == "terminal" and await execution.maybe_auto_create_plugin(self):

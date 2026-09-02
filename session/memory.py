@@ -40,6 +40,7 @@ real data-loss bug (it could silently overwrite semantic.json with a
 stale snapshot, wiping out patterns remember_semantic() had just
 written in the same run).
 """
+import json
 import logging
 from datetime import datetime
 
@@ -106,6 +107,117 @@ logger = logging.getLogger(__name__)
 
 MAX_CHECKPOINTS = 5
 MAX_STEPS       = 500  # persisted step log, across all runs (see append_steps/get_steps)
+
+
+class MemoryManager:
+    """Frontier-style memory interface for the agent.
+
+    This keeps the existing storage layer intact while exposing a single,
+    consistent API for the agent to think in terms of: events, facts, and
+    semantic patterns, all retrieved through one context-builder.
+    """
+
+    def __init__(self):
+        self._last_query = ""
+
+    def remember_event(self, event: str, outcome: str, *, importance: float = 0.5,
+                       task_type: str = "", iterations_used: int | None = None) -> dict:
+        remember_episodic(event, outcome, importance=importance, task_type=task_type,
+                          iterations_used=iterations_used)
+        return {"event": event, "outcome": outcome, "task_type": task_type, "importance": importance}
+
+    def remember_fact(self, key: str, value: object) -> dict:
+        if not key:
+            raise ValueError("Memory fact key cannot be empty")
+        kv_store(str(key), value)
+        return {"key": str(key), "value": value}
+
+    def remember_semantic(self, pattern: str, confidence: float = 0.6) -> dict:
+        remember_semantic(pattern, confidence=confidence)
+        return {"pattern": pattern, "confidence": confidence}
+
+    def remember_user_facts(self, text: str) -> list[dict]:
+        return remember_user_facts(text)
+
+    def search(self, query: str, n: int = 5) -> list[dict]:
+        results = []
+        for fact in get_relevant_kv_facts(query, n=n):
+            results.append({"kind": "fact", "key": fact.get("key"), "value": fact.get("value")})
+        for item in semantic_search(query, n=n):
+            results.append({"kind": "semantic", "pattern": item.get("pattern"), "confidence": item.get("confidence")})
+        for ep in get_relevant_memories(query, n=n, deep=False).splitlines():
+            if ep.strip():
+                results.append({"kind": "episodic", "text": ep.strip()})
+        return self._dedupe(results)
+
+    @staticmethod
+    def _dedupe(items: list[dict]) -> list[dict]:
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for item in items:
+            marker = json.dumps(item, sort_keys=True, default=str)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(item)
+        return deduped
+
+    def get_context(self, query: str, n: int = 5, deep: bool = False) -> str:
+        if not query:
+            return ""
+        self._last_query = query
+        blocks: list[str] = []
+
+        kv_facts = get_relevant_kv_facts(query, n=max(2, n))
+        recent_facts = kv_list()
+        fact_entries = self._dedupe([
+            {"key": f.get("key"), "value": f.get("value")} for f in kv_facts
+        ] + [{"key": k, "value": v} for k, v in recent_facts.items()])
+        if fact_entries:
+            lines = []
+            for fact in fact_entries[:n]:
+                lines.append(f"- {fact.get('key')}: {fact.get('value')}")
+            blocks.append("## Stored Facts\n" + "\n".join(lines))
+
+        semantic_hits = semantic_search(query, n=max(2, n))
+        if semantic_hits:
+            lines = []
+            for item in self._dedupe(semantic_hits)[:n]:
+                text = item.get("pattern") or item.get("event") or "related memory"
+                lines.append(f"- {text}")
+            blocks.append("## Semantic Memory\n" + "\n".join(lines))
+
+        memories = get_relevant_memories(query, n=n, deep=deep)
+        if memories and memories.strip():
+            blocks.append("## Relevant Memories\n" + memories.strip())
+
+        return "\n\n".join(blocks)
+
+    def get_summary(self) -> dict:
+        data = _load()
+        return {
+            "episodic": len(data["episodic"]),
+            "semantic": len(data["semantic"]),
+            "facts": len(data["kv"]),
+            "graph_edges": len(data["graph_edges"]),
+            "steps": len(data["steps"]),
+        }
+
+    def clear(self) -> None:
+        with _lock():
+            data = _load()
+            data["episodic"] = []
+            data["semantic"] = []
+            data["insights"] = []
+            data["post_mortem"] = []
+            data["kv"] = {}
+            data["history"] = []
+            data["checkpoints"] = []
+            data["graph_nodes"] = {}
+            data["graph_edges"] = []
+            data["steps"] = []
+            data["consolidation"] = {"count": 0, "last_run": ""}
+            _save(data)
 
 
 # -- Skill metrics -------------------------------------------------------

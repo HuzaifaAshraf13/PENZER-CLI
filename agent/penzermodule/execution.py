@@ -120,11 +120,15 @@ async def execute_single_tool(agent, call: dict) -> tuple[str, float]:
 
 
 async def run_speculative(agent, calls: list) -> list[tuple[str, float]]:
-    """Independent calls race (first success wins); calls sharing a
-    target (file/url/command prefix) run sequentially via parallel path;
-    otherwise run in parallel. A batch containing a privilege-escalation
-    terminal call never races — a live sudo prompt must never be
-    cancelled out from under it by a sibling finishing first."""
+    """Keep the execution path deliberately simple: when a batch is
+    intentionally parallel, execute it in parallel without hidden
+    "first-success" race heuristics. The agent loop decides which answer
+    to trust; this layer stays a transport boundary.
+
+    We intentionally avoid racing browser/terminal-like calls because it
+    adds opaque cancellation, extra scheduling complexity, and makes the
+    loop harder to reason about than the gains justify.
+    """
     if len(calls) <= 1:
         return await run_parallel(agent, calls)
     if any(
@@ -136,15 +140,6 @@ async def run_speculative(agent, calls: list) -> list[tuple[str, float]]:
         for c in calls
     ):
         return await run_parallel(agent, calls)
-
-    def get_target(c):
-        args = c.get("arguments", {})
-        return args.get("filepath") or args.get("url") or str(args.get("command", ""))[:20]
-
-    targets = [get_target(c) for c in calls]
-    unique  = len(set(t for t in targets if t)) == len([t for t in targets if t])
-    if unique and all(c["name"] in ("browser", "terminal", "run_bash") for c in calls):
-        return await run_race(agent, calls)
     return await run_parallel(agent, calls)
 
 

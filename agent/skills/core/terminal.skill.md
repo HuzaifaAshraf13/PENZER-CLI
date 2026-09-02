@@ -11,7 +11,7 @@ keywords: [terminal, bash, shell, command, execute, run, script, python, timeout
            download, upload, curl, wget, npm, pip, apt, brew, yarn, cron, schedule, backup, archive,
            compress, extract, zip, tar, secret, secrets, token, credentials, platform, os, linux,
            macos, windows, dry-run, cleanup, temp, tmp]
-mcp_tools: [terminal, terminal_check_job, run_bash, run_python]
+mcp_tools: [terminal, terminal_check_job, terminal_kill, run_bash, run_python]
 agent_behavior: |
   STEP 0 — SELF-ASSESS RISK (before picking anything)
     Before calling terminal, silently rate what you're about to run:
@@ -65,12 +65,14 @@ agent_behavior: |
     Inline Python code      → terminal(code=...)
     Reuse a working context → terminal(..., session_id="name")
     Check a backgrounded job → terminal_check_job(job_id=...)
+    Stop a stuck job        → terminal_kill(job_id=...)
     Tool call shapes:
       {"tool": "terminal", "args": {"command": "ls -la"}}
       {"tool": "terminal", "args": {"command": "...", "timeout": 600}}
-      {"tool": "terminal", "args": {"command": "...", "background": true}}
+      {"tool": "terminal", "args": {"command": "...", "background": true, "workflow": "testing"}}
       {"tool": "terminal", "args": {"command": "...", "session_id": "build"}}
       {"tool": "terminal_check_job", "args": {"job_id": "..."}}
+      {"tool": "terminal_kill", "args": {"job_id": "..."}}
   STEP 1b — DURATION CHECK (long-running commands)
     terminal defaults to a 60s timeout. Anything that legitimately runs
     longer — package installs, git clone of a large repo, docker build,
@@ -90,6 +92,12 @@ agent_behavior: |
          the job real time to progress between checks. Background jobs
          capture output to a log file, so there's always something to
          retrieve when you check back.
+    If a long-running process is clearly stuck, hung, or no longer
+    relevant to the current goal, stop it explicitly instead of leaving
+    it alive in the background:
+           {"tool": "terminal_kill", "args": {"job_id": "..."}}
+    Use kill only for jobs you started or control; do not terminate
+    unrelated system services without explicit user intent.
     If a command times out, that means it needed more time, not that
     something is broken. Re-running it with the SAME short timeout just
     repeats the same failure — raise the timeout or move it to the
@@ -165,6 +173,9 @@ agent_behavior: |
                          actually reflects the intended outcome (see
                          note below), then report cleanly
       exit_code ≠ 0   → read stderr, diagnose the actual error, then retry differently
+      background job   → check status via terminal_check_job(job_id=...) before
+                         assuming it finished or failed; if it is stuck,
+                         stop it with terminal_kill(job_id=...)
     Use inline Python to create files, write scripts, inspect directories, and generate content.
     Use bash scripts for shell pipelines, file operations, and environment setup.
     Exit code 0 means the command didn't crash — it does not by itself
@@ -240,4 +251,4 @@ core: true
 version: "5.0"
 ---
 # Terminal Executor
-Self-assess risk → establish context (cwd, platform, tool availability, session continuity) → pick tool (raise timeout / background long jobs, poll via terminal_check_job) → shape large output before dumping it → privilege check (sudo → explicit approval, never handle the password) → safety check (flag both privilege AND destructiveness together when both apply; prefer dry-run for HIGH-risk ops when available) → ask before installing (after checking it isn't already present) → run → verify the output actually matches the goal, not just exit_code == 0 → handle failures (timeouts get a longer timeout/background, not a blind retry) → never expose secrets in output → clean up temporary artifacts once done. Never report specific system/environment facts (file contents, versions, resource usage, paths, config values) without having actually run a command to get them this turn.
+Self-assess risk → establish context (cwd, platform, tool availability, session continuity) → pick tool (raise timeout / background long jobs, poll via terminal_check_job, kill stuck jobs via terminal_kill when required) → shape large output before dumping it → privilege check (sudo → explicit approval, never handle the password) → safety check (flag both privilege AND destructiveness together when both apply; prefer dry-run for HIGH-risk ops when available) → ask before installing (after checking it isn't already present) → run → verify the output actually matches the goal, not just exit_code == 0 → handle failures (timeouts get a longer timeout/background, not a blind retry) → stop stuck jobs instead of letting them keep running in the background → never expose secrets in output → clean up temporary artifacts once done. Never report specific system/environment facts (file contents, versions, resource usage, paths, config values) without having actually run a command to get them this turn.

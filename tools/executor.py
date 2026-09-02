@@ -44,13 +44,11 @@ _resume_live = None
 
 # Serializes every confirm_action() call — dangerous, sensitive, AND
 # privileged confirmations all go through this same lock. Without it,
-# two confirmations firing concurrently (e.g. _run_parallel running two
-# batched sudo calls at once — see the module note on PRIVILEGE_PATTERN
-# and _run_speculative in execution_manager.py) would both call input()
-# on the same real stdin at the same time: two prompts interleaved on
-# screen, keystrokes meant for one prompt landing in the other. This
-# makes concurrent confirmations queue instead of collide — the second
-# caller's prompt simply waits its turn.
+# two confirmations firing concurrently (e.g. batched sudo calls at once)
+# would both call input() on the same real stdin at the same time: two
+# prompts interleaved on screen, keystrokes meant for one prompt landing
+# in the other. This makes concurrent confirmations queue instead of
+# collide — the second caller's prompt simply waits its turn.
 _confirm_lock = threading.RLock()
 
 

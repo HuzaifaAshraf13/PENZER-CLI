@@ -9,12 +9,14 @@ Individual tools are in separate files:
 """
 
 # Import all tools to register them with MCP
-from tools.terminal_tool import terminal
+from tools.terminal_tool import terminal, terminal_check_job, terminal_kill
 from tools.browser_tool import browser
 from tools.file_editor_tool import file_editor
 
 __all__ = [
     "terminal",
+    "terminal_check_job",
+    "terminal_kill",
     "browser",
     "ui",
     "file_editor",
