@@ -14,6 +14,10 @@ class ActivityTimeline:
         self.events: list[dict[str, Any]] = []
         self._stream_handler = stream_handler
 
+    def set_stream_handler(self, handler: Callable[[dict], None] | None) -> None:
+        """Replace the optional consumer used by interactive renderers."""
+        self._stream_handler = handler
+
     def add_event(self, event: dict[str, Any]) -> str:
         event = dict(event)
         if not event.get("id"):
@@ -24,7 +28,7 @@ class ActivityTimeline:
         event["details"] = dict(event.get("details") or {})
         self.events.append(event)
         if self._stream_handler is not None:
-            self._stream_handler(event)
+            self._stream_handler(dict(event, details=dict(event["details"])))
         return event["id"]
 
     def update_event(self, event_id: str, **updates: Any) -> dict[str, Any] | None:
@@ -33,7 +37,7 @@ class ActivityTimeline:
                 continue
             event.update(updates)
             if self._stream_handler is not None:
-                self._stream_handler(event)
+                self._stream_handler(dict(event, details=dict(event.get("details") or {})))
             return event
         return None
 

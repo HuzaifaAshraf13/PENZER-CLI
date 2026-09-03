@@ -7,4 +7,5 @@ PyYAML==6.0.3
 readability-lxml==0.8.4.1
 requests==2.32.5
 rich==14.2.0
+prompt-toolkit==3.0.52
 selenium==4.44.0

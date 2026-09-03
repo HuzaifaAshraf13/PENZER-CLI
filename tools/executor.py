@@ -390,12 +390,13 @@ def confirm_action(
     _resume_live() itself once the whole interactive sequence is done
     (see _run_privileged_interactive's caller in execute()).
     """
-    prompt = f"\nCommand: {command}\n"
+    prompt = "\n! Approval required\n"
     if reason:
-        prompt += f"{reason}\n"
-    prompt += "Approve this command? [y/N]: "
+        prompt += f"  {reason}\n"
+    prompt += f"  $ {command}\n"
+    prompt += "  Allow? [y/N]: "
     if timeout is not None:
-        prompt += f"(auto-decline {int(timeout)}s) "
+        prompt += f"(auto-deny in {int(timeout)}s) "
 
     response = None
     with _confirm_lock:

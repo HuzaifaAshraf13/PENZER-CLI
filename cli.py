@@ -28,6 +28,7 @@ from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state, kill_all_running, set_live_hooks
 from config import PROFILE_OPTIONS, get_profile_settings, validate_config
 from agent.activity_timeline import ActivityTimeline, set_activity_timeline, get_activity_timeline
+from ui.terminal import InteractiveTerminal, normalize_command
 
 warnings.filterwarnings("ignore", message=".*authlib.*deprecated.*", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*", category=Warning)
@@ -48,10 +49,23 @@ for _log in [
 
 
 def compose_summary_lines(matched: list[str] | None = None, trace: list | None = None, calls_used: int = 0, tokens_used: int = 0) -> list[str]:
-    """Generate the final task summary with only the token count."""
-    if not tokens_used:
-        return []
-    return [f"[bold cyan]LLM:[/] ~[magenta]{tokens_used}[/] tokens"]
+    """Generate compact execution metadata without dumping tool output."""
+    lines: list[str] = []
+    if trace:
+        executed: list[str] = []
+        for entry in trace:
+            if isinstance(entry, dict):
+                name = str(entry.get("tool") or "tool")
+                args = entry.get("args") or {}
+                command = args.get("command") if isinstance(args, dict) else None
+                label = f"{name}: {command}" if command else name
+            else:
+                label = str(entry)
+            executed.append(label if len(label) <= 80 else label[:77] + "...")
+        lines.append("[dim]Executed:[/] " + " · ".join(executed))
+    if tokens_used:
+        lines.append(f"[dim]LLM:[/] ~{tokens_used} tokens")
+    return lines
 
 
 class LiveStatusView:
@@ -274,6 +288,7 @@ def build_help_text() -> str:
         "• [cyan]doctor[/cyan]    Show startup health diagnostics",
         "• [cyan]update[/cyan]    Check for updates",
         "• [cyan]state[/cyan]     Show current execution state",
+        "• [cyan]plan[/cyan]      Show the current execution plan",
         "• [cyan]memory[/cyan]    Show saved facts and memory state",
         "• [cyan]checkpoints[/cyan] Show saved checkpoints",
         "• [cyan]activity[/cyan]  Show the execution activity drawer",
@@ -639,9 +654,24 @@ def _sigint_handler(signum, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
+def _render_activity_event(terminal_ui: InteractiveTerminal, event: dict[str, Any]) -> None:
+    """Render low-frequency lifecycle events while a task is executing."""
+    rendered = terminal_ui.format_event(event)
+    if not rendered:
+        return
+    terminal_ui.set_status(terminal_ui.event_status(event))
+    try:
+        sys.stdout.write("\r\033[2K\r")
+        sys.stdout.write(rendered)
+        sys.stdout.flush()
+    except Exception:
+        logger.debug("Unable to render activity event", exc_info=True)
+
+
 async def main():
     global _current_task
     try:
+        terminal_ui = InteractiveTerminal(cwd=PROJECT_ROOT)
         display_banner()
         if not _has_llm_config():
             prompt_for_llm_credentials()
@@ -656,13 +686,14 @@ async def main():
         maybe_notify_update()
         while True:
             try:
-                user_input = console.input("[bold cyan]▸ [/bold cyan]").strip()
+                user_input = (await terminal_ui.get_input()).strip()
             except (EOFError, KeyboardInterrupt):
                 agent.clear_session()
                 console.print("\n[dim]Session cleared. Memory retained.[/dim]")
                 break
             if not user_input:
                 continue
+            user_input = normalize_command(user_input)
             if user_input.lower() in ("exit", "quit"):
                 agent.clear_session()
                 console.print("[dim]Session cleared. Memory retained.[/dim]")
@@ -703,12 +734,20 @@ async def main():
             if user_input.lower() == "update":
                 try:
                     result = perform_update()
-                    console.print("[green]" + result.get("message", "Update complete") + "[/green]")
+                    style = "green" if result.get("success") else "red"
+                    console.print(f"[{style}]{result.get('message', 'Update finished')}[/{style}]")
                 except Exception as exc:
                     console.print(f"[red]Update failed: {exc}[/red]")
                 continue
             if user_input.lower() == "state":
                 console.print(Panel(format_execution_state(), title="Execution State", border_style="yellow"))
+                continue
+            if user_input.lower() == "plan":
+                plan = getattr(agent, "get_plan", lambda: [])()
+                console.print(Panel(
+                    InteractiveTerminal.format_plan(plan) if plan else "No plan created yet.",
+                    title="Execution Plan", border_style="cyan",
+                ))
                 continue
             if user_input.lower() in ("activity", "drawer"):
                 timeline = get_activity_timeline()
@@ -845,10 +884,13 @@ async def main():
                     border_style="cyan",
                 ))
                 continue
-            console.print()
             calls_before  = getattr(agent.llm, "call_count", 0)
             tokens_before = getattr(agent.llm, "token_estimate", 0)
             status_view = LiveStatusView()
+            terminal_ui.set_status("RUNNING")
+            status_view.timeline.set_stream_handler(
+                lambda event: _render_activity_event(terminal_ui, event)
+            )
             # FIX 1: console.status() hides the cursor and takes over
             # terminal rendering while active. On long-running tool calls
             # (e.g. an nmap network scan run via asyncio.to_thread), the
@@ -917,6 +959,7 @@ async def main():
             finally:
                 _current_task = None
                 set_live_hooks(None, None)
+                terminal_ui.set_status("IDLE")
                 # Clear the progress line before printing the final answer.
                 try:
                     sys.stdout.write("\r\033[2K\r")
@@ -941,7 +984,7 @@ async def main():
             trace = getattr(agent, "_trace", [])
             summary_lines = compose_summary_lines(
                 matched=matched,
-                trace=[t["tool"] for t in trace],
+                trace=trace,
                 calls_used=calls_used,
                 tokens_used=tokens_used,
             )

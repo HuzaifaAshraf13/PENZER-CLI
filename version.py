@@ -3,6 +3,7 @@
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -74,13 +75,40 @@ def check_for_update() -> dict:
 
 
 def perform_update() -> dict:
-    """Perform a simple git pull-based update when the repo is a git checkout."""
+    """Update Penzer and reinstall the active environment."""
     repo_root = Path(__file__).resolve().parent
-    if not (repo_root / ".git").exists():
-        return {"success": False, "message": "This installation is not a git checkout."}
+    try:
+        git_root = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        git_root = ""
+
+    if git_root:
+        try:
+            pulled = subprocess.run(
+                ["git", "-C", git_root, "pull", "--ff-only"],
+                check=True, capture_output=True, text=True,
+            )
+            install = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-e", git_root],
+                check=True, capture_output=True, text=True,
+            )
+            output = "\n".join(part for part in (pulled.stdout, install.stdout) if part.strip())
+            return {"success": True, "message": "Update completed successfully. Restart Penzer to use the new version.", "output": output[-1000:]}
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            return {"success": False, "message": f"Update failed: {detail}"}
 
     try:
-        subprocess.run(["git", "-C", str(repo_root), "pull", "--ff-only"], check=True, capture_output=True, text=True)
-        return {"success": True, "message": "Update completed successfully. Restart Penzer to use the new version."}
+        install = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "penzer-cli"],
+            check=True, capture_output=True, text=True,
+        )
+        return {"success": True, "message": "Penzer updated successfully. Restart Penzer to use the new version.", "output": install.stdout[-1000:]}
     except subprocess.CalledProcessError as exc:
-        return {"success": False, "message": f"Update failed: {exc.stderr.strip() or exc.stdout.strip() or str(exc)}"}
+        detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+        return {"success": False, "message": f"Update failed: {detail}"}
+    except FileNotFoundError:
+        return {"success": False, "message": "Update unavailable: pip is not installed in the active environment."}

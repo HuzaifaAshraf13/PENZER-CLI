@@ -118,6 +118,7 @@ class PenzerAgent:
         self.tools    = {}
         self.history  = load_history()
         self.on_status: Callable[[str], None] = lambda m: None
+        self.on_plan: Callable[[list[dict]], None] = lambda plan: None
         self._fn_cache: dict = {}
         self._reset()
         data = load_all_skills()
@@ -171,6 +172,7 @@ class PenzerAgent:
         # Single source of truth for loop control.
         self._done:   bool = False
         self._failed: bool = False
+        self._direct_tool_answer: bool = False
         self._steps:         list = []
         self._pending_steps: list = []
         self._plan:          list = []
@@ -679,7 +681,13 @@ class PenzerAgent:
     # ------------------------------------------------------------------
     async def _run_loop_safely(self) -> str:
         try:
-            return await self._loop()
+            try:
+                result = await self._loop()
+            except asyncio.CancelledError:
+                self._shutdown = True
+                self._persist_all()
+                raise
+            return result
         except Exception as e:
             logger.exception("Unhandled exception in _loop")
             self._failed = True
@@ -697,6 +705,7 @@ class PenzerAgent:
         self._reset()
         self._goal             = user_input
         self._bootstrap_plan(user_input)
+        self._mark_plan_step("understand_goal", "running", "collecting context")
         self._complexity_score = score_complexity(user_input)
         self._is_complex_task  = self._complexity_score >= 0.4
         self._max_iter         = self._max_iter_for_complexity(self._complexity_score)
@@ -705,6 +714,7 @@ class PenzerAgent:
         if historical_estimate and historical_estimate > self._max_iter:
             self._max_iter = historical_estimate
         self.history.append({"role": "user", "content": user_input})
+        self._safe_status("Memory: retrieving relevant context…")
         remember_user_facts(user_input)
         past_memory  = get_relevant_memories(user_input, n=5, deep=self._is_complex_task)
         past_mortems = get_post_mortems(user_input, n=2)
@@ -719,6 +729,7 @@ class PenzerAgent:
                       "insights": len(self._task_insights), "trajectories": len(self._past_trajectories),
                       "episode_replay": bool(episode_replay)},
         )
+        self._safe_status("Skills: matching available capabilities…")
         matched_core = self._match_core_skills(user_input)
         self._active_skills = matched_core
         self._matched_skills = [s.name for s in self._active_skills]
@@ -730,6 +741,8 @@ class PenzerAgent:
         )
         self._last_matched_skills = self._matched_skills
         self._novel_task          = not bool(self._matched_skills)
+        self._mark_plan_step("understand_goal", "done", "context collected")
+        self._mark_plan_step("choose_method", "running", "selecting next action")
         if self._active_skills:
             self._orchestrate_skills()
         skills_hint = (
@@ -796,8 +809,8 @@ class PenzerAgent:
             # instead of using the tool result) deserves the same honest
             # "[Note: incomplete]" flag a multi-tool one gets; gating this
             # on trace length let short-but-wrong answers through silently.
-            if self._trace:
-                self._safe_status("Double-checking the answer…")
+            if self._trace and not self._direct_tool_answer:
+                self._safe_status("Verification: checking tool results…")
                 completed, eval_reason = await self._evaluate_completion(user_input, result)
                 if completed is False:
                     result = f"{result} [Note: incomplete — {eval_reason}]"
@@ -877,10 +890,12 @@ class PenzerAgent:
         doesn't go through the same overwrite/spinner path and ends up
         printing a new stuck line every frame instead of updating one)."""
         if text:
-            self._record_step("reasoning", text[:200])
+            self._safe_status("Preparing response…")
         else:
             preview = ", ".join(c.get("name", "?") for c in calls) or "next step"
             self._safe_status(f"Running: {preview}")
+        self._mark_plan_step("choose_method", "done", "action selected")
+        self._mark_plan_step("execute", "running", "tool execution")
         self.history.append({"role": "assistant", "content": json.dumps({
             "reasoning": text, "tools": [{"tool": c.get("name", ""), "args": c.get("arguments", {})} for c in calls],
         })})
@@ -940,7 +955,7 @@ class PenzerAgent:
     async def _pre_iteration_tasks(self, i: int) -> None:
         if len(self.history) > TRIM_AT and not self._trimming:
             self._spawn_background(self._trim(), "trim")
-        self._safe_status("Reasoning about next step…" if i == 0 else "Continuing…")
+        self._safe_status("Planning next action…" if i == 0 else "Choosing next action…")
         if (i + 1) % 5 == 0:
             self._system_prompt = build_system_prompt(
                 core_skills=self.core_skills,
@@ -1014,12 +1029,23 @@ class PenzerAgent:
         if action_words:
             steps[0]["title"] = f"Understand: {' '.join(action_words)}"
         self._plan = steps
+        self._safe_plan()
+
+    def _safe_plan(self) -> None:
+        try:
+            self.on_plan([dict(step) for step in self._plan])
+        except Exception:
+            logger.exception("on_plan callback raised")
+
+    def get_plan(self) -> list[dict]:
+        return [dict(step) for step in self._plan]
 
     def _mark_plan_step(self, step_id: str, status: str, reason: str = "") -> None:
         for step in self._plan:
             if step.get("id") == step_id:
                 step["status"] = status
                 step["reason"] = reason
+                self._safe_plan()
                 break
 
     def _requires_verification(self, tool_name: str, args: dict | None) -> bool:
@@ -1148,8 +1174,11 @@ class PenzerAgent:
                 update_skill_metric(skill.name, ok)
             self._update_belief(name, c.get("arguments", {}), str(raw), ok)
             self._update_working_memory(name, str(raw), ok)
+            self._mark_plan_step("execute", "done" if ok else "blocked", f"{name}:{'success' if ok else 'failed'}")
             if ok and self._requires_verification(name, c.get("arguments", {})):
                 self._mark_plan_step("verify", "running", f"verify:{name}")
+            elif ok:
+                self._mark_plan_step("verify", "done", "not required")
             if ok and self._skill_plan:
                 self._mark_skill_step_done(name)
             if ok and name == "terminal" and await execution.maybe_auto_create_plugin(self):
@@ -1163,6 +1192,7 @@ class PenzerAgent:
                 direct_answer = self._extract_ip_answer(self._goal, str(raw))
                 if direct_answer:
                     self._done = True
+                    self._direct_tool_answer = True
                     self._belief["goal_progress"] = "complete"
                     self.history.append({"role": "assistant", "content": direct_answer})
                     self._record_step("final_answer", direct_answer[:200], reason="direct_answer_from_tool_output")
@@ -1205,6 +1235,29 @@ class PenzerAgent:
             r["content"] = ""
         return r
 
+    async def _chat_with_progress(self, step: int) -> dict:
+        """Keep the interactive UI informed while the model is silent."""
+        provider = str(getattr(self.llm, "provider", "LLM"))
+        model = str(getattr(self.llm, "model_name", "model"))
+        model_label = model if len(model) <= 48 else model[:45] + "..."
+        request = asyncio.create_task(self.llm.chat(
+            system=self._system_prompt,
+            messages=self._msgs(step),
+        ))
+        started = time.monotonic()
+        self._safe_status(f"LLM request: {provider} / {model_label}")
+        try:
+            while not request.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(request), timeout=1.0)
+                except asyncio.TimeoutError:
+                    elapsed = int(time.monotonic() - started)
+                    self._safe_status(f"LLM request active: {provider} · {elapsed}s")
+            return request.result()
+        except asyncio.CancelledError:
+            request.cancel()
+            raise
+
     async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
         """Backoff persists across iterations via self._backoff — it's the
         starting delay for this call's retries, not just a value tracked
@@ -1216,7 +1269,7 @@ class PenzerAgent:
         delay = self._backoff
         for attempt in range(max_attempts):
             try:
-                r = await asyncio.wait_for(self.llm.chat(system=self._system_prompt, messages=self._msgs(step)), timeout=45)
+                r = await asyncio.wait_for(self._chat_with_progress(step), timeout=45)
                 r = self._validate_llm_response(r)
                 self._backoff, self._rate_attempts, self._last_llm_error = max(1.0, self._backoff * 0.9), 0, ""
                 return r
@@ -1231,8 +1284,15 @@ class PenzerAgent:
                     self._rate_attempts += 1
                     wait = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + random.uniform(0, RATE_LIMIT_JITTER))
                     self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
+                    retry_id = self._emit_activity(
+                        "retry", "Retrying LLM",
+                        message=f"Attempt {attempt + 2}/{max_attempts} after rate limit",
+                        status="running", details={"attempt": attempt + 2, "max_attempts": max_attempts},
+                    )
                     self._record_step("rate_limit", f"Rate limited — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
                     await asyncio.sleep(wait)
+                    if retry_id:
+                        self._update_activity(retry_id, status="success", message="Retry scheduled")
                     continue
                 logger.error("LLM error: %s", e)
                 self._last_llm_error = "error"
