@@ -10,6 +10,9 @@ import os
 import sys
 import signal
 import warnings
+import argparse
+import contextlib
+import io
 from pathlib import Path
 
 try:
@@ -668,9 +671,59 @@ def _render_activity_event(terminal_ui: InteractiveTerminal, event: dict[str, An
         logger.debug("Unable to render activity event", exc_info=True)
 
 
-async def main():
+async def run_noninteractive(task: str, json_mode: bool = False) -> int:
+    """Run one task without the prompt UI for scripts and CI."""
+    if not _has_llm_config():
+        message = "LLM configuration is missing. Configure .env before using non-interactive mode."
+        if json_mode:
+            print(json.dumps({"event": "error", "message": message}))
+        else:
+            console.print(f"[red]{message}[/red]")
+        return 2
+
+    timeline = ActivityTimeline()
+    set_activity_timeline(timeline)
+
+    def emit(event: dict) -> None:
+        if json_mode:
+            print(json.dumps(event, ensure_ascii=True), flush=True)
+        else:
+            title = event.get("title") or event.get("event_type", "activity")
+            status = event.get("status", "running")
+            print(f"[{status}] {title}", flush=True)
+
+    timeline.set_stream_handler(emit)
+    logging.getLogger("penzer.server").setLevel(logging.CRITICAL)
+    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread.start()
+    await asyncio.sleep(0.5)
+    # LLM initialization has a legacy informational print; keep JSON stdout pure.
+    with contextlib.redirect_stdout(io.StringIO()) if json_mode else contextlib.nullcontext():
+        agent = await PenzerAgent().async_init()
+    try:
+        response = await agent.run(task)
+    except asyncio.CancelledError:
+        message = "Task cancelled."
+        if json_mode:
+            print(json.dumps({"event": "cancelled", "message": message}))
+        else:
+            print(message)
+        return 130
+    cleaned = clean_response(response or "No response.")
+    failed = bool(getattr(agent, "_failed", False))
+    result = {"event": "final_result", "result": cleaned, "status": "failed" if failed else "success"}
+    if json_mode:
+        print(json.dumps(result, ensure_ascii=True), flush=True)
+    else:
+        print(cleaned)
+    return 1 if failed else 0
+
+
+async def main(task: str | None = None, json_mode: bool = False):
     global _current_task
     try:
+        if task:
+            return await run_noninteractive(task, json_mode=json_mode)
         terminal_ui = InteractiveTerminal(cwd=PROJECT_ROOT)
         display_banner()
         if not _has_llm_config():
@@ -930,7 +983,12 @@ async def main():
                         pass
 
                 agent.on_status = _on_status
-                set_live_hooks(None, None)
+
+                def _on_output(label: str, line: str) -> None:
+                    if line.strip():
+                        _on_status(f"Terminal {label}: {line.strip()[:100]}")
+
+                set_live_hooks(None, None, _on_output)
                 _current_task = asyncio.ensure_future(agent.run(user_input))
                 response = await _current_task
             except asyncio.CancelledError:
@@ -958,7 +1016,7 @@ async def main():
                 continue
             finally:
                 _current_task = None
-                set_live_hooks(None, None)
+                set_live_hooks(None, None, None)
                 terminal_ui.set_status("IDLE")
                 # Clear the progress line before printing the final answer.
                 try:
@@ -1000,8 +1058,14 @@ async def main():
 
 
 def main_entrypoint():
+    parser = argparse.ArgumentParser(description="PENZER autonomous terminal agent")
+    parser.add_argument("--json", action="store_true", dest="json_mode", help="emit structured JSON events")
+    parser.add_argument("task", nargs="?", help="run one task without the interactive prompt")
+    args = parser.parse_args()
     try:
-        asyncio.run(main())
+        exit_code = asyncio.run(main(task=args.task, json_mode=args.json_mode))
+        if exit_code is not None:
+            return exit_code
     except KeyboardInterrupt:
         # Reached when Ctrl+C fires while idle (no task running for
         # _sigint_handler to cancel, so it re-raised KeyboardInterrupt

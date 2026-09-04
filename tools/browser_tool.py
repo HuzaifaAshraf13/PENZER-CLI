@@ -35,6 +35,22 @@ _session.mount("http://", _adapter)
 _session.mount("https://", _adapter)
 
 
+class SessionManager:
+    """Track lightweight browser navigation state for one agent session."""
+
+    _sessions: dict[str, dict] = {}
+
+    @classmethod
+    def get(cls, session_id: str) -> dict:
+        return cls._sessions.setdefault(session_id, {"id": session_id, "current_url": "", "history": []})
+
+    @classmethod
+    def record(cls, session_id: str, url: str) -> None:
+        state = cls.get(session_id)
+        state["current_url"] = url
+        state["history"].append(url)
+
+
 def _fetch_html(url: str, timeout: int = 15) -> tuple[Optional[str], Optional[str]]:
     """
     Fetch HTML content from a URL.
@@ -122,7 +138,8 @@ def browser(action: str,
             query: str = None,
             url: str = None,
             timeout: int = 15,
-            max_results: int = 5) -> dict:
+            max_results: int = 5,
+            session_id: str | None = None) -> dict:
     """
     A minimal browser tool for web search, navigation, and content extraction.
     Single search provider (DuckDuckGo). No optional dependencies.
@@ -150,11 +167,14 @@ def browser(action: str,
             results = _search_duckduckgo(query, max_results=max_results)
             if not results:
                 return error(f"No results found for: {query}")
+            if session_id:
+                SessionManager.record(session_id, results[0]["url"])
             
             return success(data={
                 "action": "search",
                 "query": query,
-                "results": results
+                "results": results,
+                "top_result": results[0],
             })
         
         elif action == "open":
@@ -169,6 +189,8 @@ def browser(action: str,
             # Truncate to reasonable length
             if len(content) > 5000:
                 content = content[:5000] + "... [truncated]"
+            if session_id:
+                SessionManager.record(session_id, url)
             return success(data={
                 "action": "open",
                 "url": url,
@@ -221,3 +243,14 @@ def browser(action: str,
     except Exception as e:
         logger.exception("Browser tool error")
         return error(f"Browser tool error: {str(e)}")
+
+
+@mcp.tool()
+def browser_info(session_id: str) -> dict:
+    """Return the current URL and navigation history for a browser session."""
+    state = SessionManager.get(session_id)
+    return success(data={
+        "id": state["id"],
+        "current_url": state["current_url"],
+        "history": list(state["history"]),
+    })

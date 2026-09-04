@@ -83,6 +83,7 @@ logs/
 # User-generated plugin tools (runtime-only, never commit)
 tools/plugins/*.py
 !tools/plugins/__init__.py
+!tools/plugins/runner.py
 
 # Plugin registry and runtime state (local only)
 .penzer/

@@ -7,6 +7,7 @@ orchestration code — as more managers/modules get added, this stays the
 one place to look for "what number controls X".
 """
 from typing import Callable
+import env_config as _env_config
 
 # ---------------------------------------------------------------------
 # Iteration / runtime budgets

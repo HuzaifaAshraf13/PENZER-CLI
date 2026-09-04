@@ -7,7 +7,8 @@ its own abstraction layer.
 """
 import time, asyncio, inspect, json, re, hashlib, logging, shlex
 
-from tools.plugins import create_plugin_tool, load_plugin_tools
+from tools.plugins import create_plugin_tool, load_plugin_tools, validate_plugin_source
+from tools.executor import confirm_action
 from tools.executor import requires_privilege_escalation, SUDO_INTERACTIVE_TIMEOUT
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
 from agent.activity_timeline import emit_activity_event, update_activity_event
@@ -378,6 +379,17 @@ async def run_plugin_tool(agent, args: dict) -> str:
     if _DANGEROUS_PLUGIN_PATTERNS.search(code):
         logger.warning("Refusing explicit plugin creation — code matched a denylisted pattern")
         return "Plugin creation declined — code matched a denylisted dangerous pattern"
+    try:
+        validate_plugin_source(code)
+    except ValueError as exc:
+        return f"Plugin creation declined — {exc}"
+    if not await asyncio.to_thread(
+        confirm_action,
+        f"create plugin '{name}' from model-generated Python code",
+        "A model-generated plugin will be written to disk and imported.",
+        timeout=120,
+    ):
+        return "Plugin creation cancelled by user."
     activity_id = emit_activity_event("plugin", "Plugin creation", message=f"Creating plugin '{name}'",
                                        status="running", details={"name": name, "description": description})
     async with agent._plugin_lock:

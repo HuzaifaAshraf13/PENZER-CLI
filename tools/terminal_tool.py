@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from agent.core import mcp
-from tools.executor import execute, get_change_log
+from tools.executor import approve_background_command, execute, get_change_log
 from tools.standards import success, error, warning
 from config import get_profile_settings
 
@@ -156,6 +156,13 @@ async def _terminal_impl(
 
     # Background process
     if background or timeout == 0:
+        approved, reason = await asyncio.to_thread(
+            approve_background_command,
+            payload,
+            get_profile_settings().get("approval_required", True),
+        )
+        if not approved:
+            return warning(message=reason)
         result = _start_background_job(payload, effective_workdir, mode, workflow, session_id)
         if result.get("status") == "success":
             result["data"]["mode"] = "background"

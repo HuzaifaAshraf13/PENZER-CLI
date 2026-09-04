@@ -56,6 +56,7 @@ from agent.config import (
 logger = logging.getLogger(__name__)
 
 _MAX_IN_MEMORY_STEPS = 500  # caps step-log growth; disk copy is unbounded via _flush_steps
+_MAX_LLM_HISTORY_MESSAGES = 12
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)  # strips a ``` / ```json code fence
 
@@ -878,9 +879,17 @@ class PenzerAgent:
     def _llm_failure_result(self) -> str | None:
         reason = self._last_llm_error or "rate_limit"
         if reason == "timeout":
-            return None
+            return "⏱️ LLM request timed out. No tool was executed."
         if reason == "error":
             return "LLM request failed. Try again in a moment."
+        if reason == "connection":
+            return "🌐 LLM connection failed. Check your network and try again."
+        if reason == "authentication":
+            return "🔐 LLM authentication failed. Check your API key."
+        if reason == "authorization":
+            return "🔑 LLM access denied. Check your credentials."
+        if reason == "service_unavailable":
+            return "🔌 LLM service unavailable. Try again later."
         return "Rate limit exceeded. Try again in a moment."
 
     def _append_assistant_turn(self, text: str, calls: list) -> None:
@@ -1270,6 +1279,11 @@ class PenzerAgent:
         for attempt in range(max_attempts):
             try:
                 r = await asyncio.wait_for(self._chat_with_progress(step), timeout=45)
+                if r.get("error"):
+                    self._last_llm_error = str(r.get("error_type") or "llm_error")
+                    self._failed = True
+                    self._persist_all()
+                    return None
                 r = self._validate_llm_response(r)
                 self._backoff, self._rate_attempts, self._last_llm_error = max(1.0, self._backoff * 0.9), 0, ""
                 return r
@@ -1302,7 +1316,7 @@ class PenzerAgent:
 
     def _msgs(self, step: int) -> list[dict]:
         if step == 0 or not self._trace:
-            return self.history
+            return self._bounded_history()
         t = self._trace[-1]
         recent = " -> ".join(f"{s['tool']}({'ok' if s['success'] else 'x'})" for s in self._trace[-5:])
         skills_line = f"ACTIVE SKILLS: {', '.join(self._matched_skills)}\n" if self._matched_skills else ""
@@ -1316,7 +1330,15 @@ class PenzerAgent:
             f"LAST: {t['tool']} -> {status} ({t['elapsed_sec']}s) | {t['result'][:100]}\n"
             f"RECENT: {recent}\n\nGiven belief state, working memory, and skill plan — execute next pending step."
         )
-        return self.history + [{"role": "user", "content": inj}]
+        return self._bounded_history() + [{"role": "user", "content": inj}]
+
+    def _bounded_history(self) -> list[dict]:
+        """Keep model prompts bounded without deleting persisted conversation history."""
+        if len(self.history) <= _MAX_LLM_HISTORY_MESSAGES:
+            return self.history
+        first_user = next((message for message in self.history if message.get("role") == "user"), None)
+        recent = self.history[-_MAX_LLM_HISTORY_MESSAGES:]
+        return ([first_user] if first_user and first_user not in recent else []) + recent
 
     # ------------------------------------------------------------------
     # Tool dispatch delegates -> execution.py (kept out of this file

@@ -11,6 +11,7 @@ import httpx
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
+import env_config
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ class LLMModel:
         self.provider = _detect_provider(url)
         self.model_name = model_name or os.getenv("LLM_MODEL", os.getenv("MODEL_NAME", self.provider))
         self._client: Optional[httpx.AsyncClient] = None
+        self.last_usage: dict[str, int] | None = None
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -60,6 +62,7 @@ class LLMModel:
     async def create_chat_completion(
         self, messages: List[Dict[str, str]], max_tokens: int = 2048, temperature: float = 0.7
     ) -> str:
+        self.last_usage = None
         if self.provider == "gemini":
             return await self._call_gemini(messages, max_tokens, temperature)
         elif self.provider == "anthropic":
@@ -89,7 +92,9 @@ class LLMModel:
             json=payload,
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        payload = r.json()
+        self.last_usage = payload.get("usage")
+        return payload["choices"][0]["message"]["content"]
 
     async def _call_gemini(
         self, messages: List[Dict[str, str]], max_tokens: int, temperature: float
@@ -109,7 +114,14 @@ class LLMModel:
             },
         )
         r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        payload = r.json()
+        metadata = payload.get("usageMetadata") or {}
+        self.last_usage = {
+            "prompt_tokens": metadata.get("promptTokenCount", 0),
+            "completion_tokens": metadata.get("candidatesTokenCount", 0),
+            "total_tokens": metadata.get("totalTokenCount", 0),
+        }
+        return payload["candidates"][0]["content"]["parts"][0]["text"]
 
     async def _call_anthropic(
         self, messages: List[Dict[str, str]], max_tokens: int, temperature: float
@@ -133,7 +145,9 @@ class LLMModel:
             },
         )
         r.raise_for_status()
-        return r.json()["content"][0]["text"]
+        payload = r.json()
+        self.last_usage = payload.get("usage")
+        return payload["content"][0]["text"]
 
 
 class LLM:
@@ -142,6 +156,7 @@ class LLM:
     def __init__(self):
         self.model = self._init_model()
         self.model_name = getattr(self.model, "model_name", "unknown")
+        self.provider = getattr(self.model, "provider", "unknown")
         self.call_count = 0
         self.token_estimate = 0
 
@@ -266,35 +281,40 @@ class LLM:
           - unknowns (list): optional belief-state fields
         """
         prompt = [{"role": "system", "content": system}] + messages
+
+        def failure(message: str, error_type: str) -> Dict[str, Any]:
+            return {"content": message, "tool_calls": [], "error": True, "error_type": error_type}
+
         try:
             raw = await self._call_with_backoff(prompt)
             self.call_count += 1
-            self.token_estimate += sum(
-                len(str(m.get("content", "")).split())
-                for m in prompt
-            )
+            usage = getattr(self.model, "last_usage", None) or {}
+            self.token_estimate += int(usage.get("total_tokens") or (
+                sum(len(str(m.get("content", "")).split()) for m in prompt)
+                + len(str(raw).split())
+            ))
         except httpx.HTTPStatusError as e:
             # User‑friendly error messages for common HTTP errors
             if e.response.status_code == 429:
-                return {"content": "⏳ Rate limit reached. Please wait and try again.", "tool_calls": []}
+                return failure("⏳ Rate limit reached. Please wait and try again.", "rate_limit")
             if e.response.status_code == 401:
-                return {"content": "🔐 Authentication failed. Check your API key.", "tool_calls": []}
+                return failure("🔐 Authentication failed. Check your API key.", "authentication")
             if e.response.status_code == 403:
-                return {"content": "🔑 Access denied. Invalid credentials.", "tool_calls": []}
+                return failure("🔑 Access denied. Invalid credentials.", "authorization")
             if e.response.status_code == 500:
-                return {"content": "⚠️ LLM server error. Try again in a moment.", "tool_calls": []}
+                return failure("⚠️ LLM server error. Try again in a moment.", "server")
             if e.response.status_code == 503:
-                return {"content": "🔌 LLM service unavailable. Server is down.", "tool_calls": []}
+                return failure("🔌 LLM service unavailable. Server is down.", "service_unavailable")
             if e.response.status_code == 504:
-                return {"content": "⏱️ LLM took too long. Please try again.", "tool_calls": []}
-            return {"content": f"❌ HTTP {e.response.status_code}. Try again.", "tool_calls": []}
+                return failure("⏱️ LLM took too long. Please try again.", "timeout")
+            return failure(f"❌ HTTP {e.response.status_code}. Try again.", "http_error")
         except httpx.TimeoutException:
-            return {"content": "⏱️ Request timed out. LLM is slow.", "tool_calls": []}
+            return failure("⏱️ Request timed out. LLM is slow.", "timeout")
         except httpx.ConnectError:
-            return {"content": "🌐 Connection failed. Check your internet.", "tool_calls": []}
+            return failure("🌐 Connection failed. Check your internet.", "connection")
         except Exception as e:
             error_msg = str(e)[:50]
-            return {"content": f"❌ Error: {error_msg}", "tool_calls": []}
+            return failure(f"❌ Error: {error_msg}", "llm_error")
 
         # --- Structured parsing (JSON first, then XML) ---
         data = self._extract_json(raw)

@@ -43,7 +43,7 @@ setup(
     url="https://github.com/HuzaifaAshraf13/PENZER-CLI",
 
     packages=find_packages(),
-    py_modules=["cli", "config", "logger", "version"],
+    py_modules=["cli", "config", "logger", "version", "env_config", "build"],
 
     # Support broadly available Python versions on Linux and other environments.
     python_requires=">=3.9",

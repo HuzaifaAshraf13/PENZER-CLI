@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # during a Live display) for the duration of each turn.
 _pause_live = None
 _resume_live = None
+_output_live = None
 
 # Serializes every confirm_action() call — dangerous, sensitive, AND
 # privileged confirmations all go through this same lock. Without it,
@@ -52,10 +53,11 @@ _resume_live = None
 _confirm_lock = threading.RLock()
 
 
-def set_live_hooks(pause, resume) -> None:
-    global _pause_live, _resume_live
+def set_live_hooks(pause, resume, output=None) -> None:
+    global _pause_live, _resume_live, _output_live
     _pause_live = pause
     _resume_live = resume
+    _output_live = output
 
 
 # ─────────────────────────────────────────
@@ -427,6 +429,25 @@ def is_sensitive(command: str) -> bool:
     return False
 
 
+def approve_background_command(command: str, approval_required: bool = True) -> tuple[bool, str]:
+    """Apply the normal safety gate before a detached command is launched."""
+    escalates, _priv_tool = requires_privilege_escalation(command)
+    if escalates:
+        return False, "Background privileged commands are not supported; run them directly in your terminal."
+    dangerous, _pattern = is_dangerous(command)
+    if dangerous:
+        if not approval_required:
+            return False, "Dangerous background commands require explicit approval mode."
+        if not confirm_action(command, "Dangerous command detected.", timeout=CONFIRM_TIMEOUT_DEFAULT):
+            return False, "Dangerous command not approved."
+    if is_sensitive(command):
+        if not approval_required:
+            return False, "Sensitive background commands require explicit approval mode."
+        if not confirm_action(command, "Sensitive or install-related command detected.", timeout=CONFIRM_TIMEOUT_DEFAULT):
+            return False, "Sensitive command not approved."
+    return True, ""
+
+
 def _set_limits():
     """Apply resource limits to subprocess. Also puts the child in its
     own process group (via start_new_session in Popen) so a kill can
@@ -705,12 +726,35 @@ def execute(
         )
         pid_key = _register_proc(proc)
 
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+
+        def read_stream(stream, parts: list[str], label: str) -> None:
+            for line in iter(stream.readline, ""):
+                parts.append(line)
+                if _output_live is not None:
+                    try:
+                        _output_live(label, line.rstrip("\n"))
+                    except Exception:
+                        logger.debug("Live output hook failed", exc_info=True)
+            stream.close()
+
+        stdout_reader = threading.Thread(target=read_stream, args=(proc.stdout, stdout_parts, "stdout"), daemon=True)
+        stderr_reader = threading.Thread(target=read_stream, args=(proc.stderr, stderr_parts, "stderr"), daemon=True)
+        stdout_reader.start()
+        stderr_reader.start()
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_proc_group(proc)
             proc.wait(timeout=5)
+            stdout_reader.join(timeout=1)
+            stderr_reader.join(timeout=1)
             return _error(f"Timed out after {timeout}s")
+        stdout_reader.join()
+        stderr_reader.join()
+        stdout = "".join(stdout_parts)
+        stderr = "".join(stderr_parts)
 
         _change_log.append({
             "mode": mode,

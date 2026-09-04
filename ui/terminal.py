@@ -62,6 +62,8 @@ class InteractiveTerminal:
                 "bottom-toolbar": "#808080",
             }),
         )
+        self._session.app.full_screen = bool(os.isatty(0) and os.isatty(1))
+        self._session.app.enable_page_navigation_bindings = True
 
     def _key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
@@ -139,7 +141,10 @@ class InteractiveTerminal:
         return "\n".join(lines)
 
     def toolbar(self) -> str:
-        width = os.get_terminal_size().columns if os.isatty(1) else 80
+        try:
+            width = os.get_terminal_size().columns if os.isatty(1) else 80
+        except OSError:
+            width = 80
         mode = "compact" if width < 90 else "interactive"
         cwd = str(Path.cwd()).replace(str(Path.home()), "~", 1)
         model = os.getenv("LLM_MODEL", "default")
