@@ -245,7 +245,12 @@ class PenzerAgent:
         if len(self._steps) > _MAX_IN_MEMORY_STEPS:
             self._steps = self._steps[-_MAX_IN_MEMORY_STEPS:]
         self._pending_steps.append(step)
-        self._safe_status(description)
+        if kind in {"final_answer", "reasoning", "trusted_data"}:
+            self._safe_status("Preparing final response…")
+        elif kind == "recovery" and description.startswith("Model self-selected skill"):
+            self._safe_status("Skill selected…")
+        else:
+            self._safe_status(description)
         return step
 
     def _flush_steps(self) -> None:
@@ -708,7 +713,11 @@ class PenzerAgent:
         self._bootstrap_plan(user_input)
         self._mark_plan_step("understand_goal", "running", "collecting context")
         self._complexity_score = score_complexity(user_input)
-        self._is_complex_task  = self._complexity_score >= 0.4
+        lowered_goal = user_input.lower()
+        read_only_task = "read-only" in lowered_goal or any(
+            marker in lowered_goal for marker in ("pwd", "uname", "printf", "list top-level")
+        )
+        self._is_complex_task  = self._complexity_score >= 0.4 and not read_only_task
         self._max_iter         = self._max_iter_for_complexity(self._complexity_score)
         self._tokens_before_run = getattr(self.llm, "token_estimate", 0)
         historical_estimate = estimate_iterations_needed(user_input[:40])
@@ -765,8 +774,9 @@ class PenzerAgent:
         if past_mortems:
             mortem_hint = "\n## Past Experience\n" + "".join(
                 f"  [{pm['task_type']}] Worked: {pm['what_worked']} | Failed: {pm['what_failed']} | Next: {pm['next_time']}\n" for pm in past_mortems)
+        prompt_skills = self.core_skills if self._is_complex_task else []
         self._system_prompt = build_system_prompt(
-            core_skills=self.core_skills, memory_context=past_memory,
+            core_skills=prompt_skills, memory_context=past_memory,
             extra=skills_hint + insight_hint + mortem_hint, goal=user_input, plugin_tools=self.get_plugin_tool_descriptions(),
         )
         self._resume_state = {
@@ -810,7 +820,7 @@ class PenzerAgent:
             # instead of using the tool result) deserves the same honest
             # "[Note: incomplete]" flag a multi-tool one gets; gating this
             # on trace length let short-but-wrong answers through silently.
-            if self._trace and not self._direct_tool_answer:
+            if self._trace and not self._direct_tool_answer and self._is_complex_task and len(self._trace) > 3:
                 self._safe_status("Verification: checking tool results…")
                 completed, eval_reason = await self._evaluate_completion(user_input, result)
                 if completed is False:
@@ -828,7 +838,7 @@ class PenzerAgent:
                 self._spawn_background(
                     self._write_post_mortem_and_insights(user_input, result), "post_mortem"
                 )
-            if should_consolidate():
+            if self._is_complex_task and should_consolidate():
                 self._spawn_background(consolidate_memory(self.llm), "consolidate_memory")
             save_history(self.history)
         except Exception:
@@ -967,7 +977,7 @@ class PenzerAgent:
         self._safe_status("Planning next action…" if i == 0 else "Choosing next action…")
         if (i + 1) % 5 == 0:
             self._system_prompt = build_system_prompt(
-                core_skills=self.core_skills,
+                core_skills=self.core_skills if self._is_complex_task else [],
                 memory_context=get_relevant_memories(self._goal, n=3, deep=self._is_complex_task),
                 goal=self._goal, plugin_tools=self.get_plugin_tool_descriptions(),
             )
@@ -1153,7 +1163,8 @@ class PenzerAgent:
         if any(self._is_error(raw) and not self._is_timeout(raw) for raw, _ in results):
             fallback_results = []
             for call, (raw, elapsed) in zip(filtered_calls, results):
-                if self._is_error(raw) and not self._is_timeout(raw):
+                if (self._is_error(raw) and not self._is_timeout(raw)
+                    and self._extract_ip_answer(self._goal, str(raw)) is None):
                     fallback_results.append(await execution.run_with_fallback(self, call, prior_result=(raw, elapsed)))
                 else:
                     fallback_results.append((raw, elapsed))
@@ -1198,6 +1209,10 @@ class PenzerAgent:
                                tool=name, success=ok, elapsed_sec=elapsed)
 
             if ok and name == "terminal":
+                command_text = str(c.get("arguments", {}).get("command", "")).lower()
+                public_ip_request = any(key in self._goal.lower() for key in ("public ip", "what is my ip", "my ip"))
+                if public_ip_request and any(local_cmd in command_text for local_cmd in ("hostname -i", "hostname -i", "ip addr", "ifconfig")):
+                    continue
                 direct_answer = self._extract_ip_answer(self._goal, str(raw))
                 if direct_answer:
                     self._done = True
@@ -1252,6 +1267,7 @@ class PenzerAgent:
         request = asyncio.create_task(self.llm.chat(
             system=self._system_prompt,
             messages=self._msgs(step),
+            max_tokens=256 if not self._is_complex_task else 1536,
         ))
         started = time.monotonic()
         self._safe_status(f"LLM request: {provider} / {model_label}")

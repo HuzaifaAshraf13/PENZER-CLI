@@ -228,6 +228,7 @@ def clean_response(text: str) -> str:
     if not text:
         return ""
     text = text.strip()
+    text = text.replace("\\n", "\n")
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -983,10 +984,26 @@ async def main(task: str | None = None, json_mode: bool = False):
                         pass
 
                 agent.on_status = _on_status
+                noisy_streams: set[str] = set()
 
                 def _on_output(label: str, line: str) -> None:
-                    if line.strip():
-                        _on_status(f"Terminal {label}: {line.strip()[:100]}")
+                    text = line.strip()
+                    if not text:
+                        return
+                    looks_like_html = label == "stdout" and bool(
+                        "<" in text
+                        or ">" in text
+                        or "&quot" in text.lower()
+                        or "ifconfig.me" in text.lower()
+                        or "need a robust api" in text.lower()
+                        or "open sans" in text.lower()
+                    )
+                    if looks_like_html:
+                        if label not in noisy_streams:
+                            noisy_streams.add(label)
+                            _on_status("Terminal stdout: receiving response…")
+                        return
+                    _on_status(f"Terminal {label}: {text[:100]}")
 
                 set_live_hooks(None, None, _on_output)
                 _current_task = asyncio.ensure_future(agent.run(user_input))

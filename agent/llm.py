@@ -253,13 +253,13 @@ class LLM:
         return tool_calls, cleaned
 
     # ---------- Retry logic ----------
-    async def _call_with_backoff(self, messages: List[Dict[str, str]]) -> str:
+    async def _call_with_backoff(self, messages: List[Dict[str, str]], max_tokens: int = 2048) -> str:
         last_error = None
         for attempt, wait in enumerate(RETRY_DELAYS):
             if wait:
                 await asyncio.sleep(wait)
             try:
-                return await self.model.create_chat_completion(messages)
+                return await self.model.create_chat_completion(messages, max_tokens=max_tokens)
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in RETRYABLE_STATUS and attempt < len(RETRY_DELAYS) - 1:
                     last_error = e
@@ -272,7 +272,7 @@ class LLM:
         raise RuntimeError(f"LLM failed after retries: {last_error}")
 
     # ---------- Main chat entry point ----------
-    async def chat(self, system: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    async def chat(self, system: str, messages: List[Dict[str, str]], max_tokens: int = 2048) -> Dict[str, Any]:
         """
         Send a chat request and return a dict with:
           - content (str): the answer text
@@ -286,7 +286,7 @@ class LLM:
             return {"content": message, "tool_calls": [], "error": True, "error_type": error_type}
 
         try:
-            raw = await self._call_with_backoff(prompt)
+            raw = await self._call_with_backoff(prompt, max_tokens=max_tokens)
             self.call_count += 1
             usage = getattr(self.model, "last_usage", None) or {}
             self.token_estimate += int(usage.get("total_tokens") or (

@@ -62,7 +62,7 @@ class InteractiveTerminal:
                 "bottom-toolbar": "#808080",
             }),
         )
-        self._session.app.full_screen = bool(os.isatty(0) and os.isatty(1))
+        self._session.app.full_screen = os.getenv("PENZER_FULLSCREEN", "0").lower() in {"1", "true", "yes"}
         self._session.app.enable_page_navigation_bindings = True
 
     def _key_bindings(self) -> KeyBindings:

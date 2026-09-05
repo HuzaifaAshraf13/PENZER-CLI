@@ -16,6 +16,7 @@ import resource
 import threading
 import queue
 import json
+from urllib.parse import urlsplit
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,7 @@ logger = logging.getLogger(__name__)
 _pause_live = None
 _resume_live = None
 _output_live = None
+_approved_network_hosts: set[str] = set()
 
 # Serializes every confirm_action() call — dangerous, sensitive, AND
 # privileged confirmations all go through this same lock. Without it,
@@ -416,6 +418,17 @@ def confirm_action(
                 except Exception:
                     pass
 
+        if sys.stdout.isatty():
+            # Remove the temporary approval block after the decision; keep
+            # the decision itself in the audit file, not in the conversation.
+            try:
+                for _ in range(5):
+                    sys.stdout.write("\r\033[2K\033[1A")
+                sys.stdout.write("\r\033[2K")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
     if response is None:
         return False
     return response.strip().lower() in {"y", "yes"}
@@ -423,10 +436,26 @@ def confirm_action(
 
 def is_sensitive(command: str) -> bool:
     lowered = command.lower()
-    for p in SENSITIVE_PATTERNS:
-        if p.lower() in lowered:
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern in {"wget ", "ssh ", "scp ", "rsync "}:
+            executable = pattern.strip()
+            if re.search(rf"(?<!which )(?<!command -v )\b{re.escape(executable)}\s+", lowered):
+                return True
+            continue
+        if pattern.lower() in lowered:
             return True
     return False
+
+
+def _network_hosts(command: str) -> set[str]:
+    hosts = set()
+    for value in re.findall(r"https?://[^\s'\"]+", command.lower()):
+        host = urlsplit(value.rstrip(".,);]")).hostname
+        if host:
+            hosts.add(host)
+    for host in re.findall(r"(?<![A-Za-z0-9.-])(?:ifconfig\.me|api\.ipify\.org)(?![A-Za-z0-9.-])", command.lower()):
+        hosts.add(host)
+    return hosts
 
 
 def approve_background_command(command: str, approval_required: bool = True) -> tuple[bool, str]:
@@ -659,16 +688,23 @@ def execute(
         sensitive = is_sensitive(command)
         if sensitive and approval_required:
             reason = "Sensitive or install-related command detected."
-            update_execution_state(
-                needs_confirmation=True,
-                confirmation_reason=reason,
-            )
-            if confirm_action(command, reason, timeout=CONFIRM_TIMEOUT_DEFAULT):
+            hosts = _network_hosts(command)
+            reused = bool(hosts & _approved_network_hosts)
+            if reused:
                 force = True
-                _log_approval_decision(command, "sensitive", "approved", reason)
+                _log_approval_decision(command, "sensitive", "approved", "reused approval for same network host")
             else:
-                _log_approval_decision(command, "sensitive", "denied", reason)
-                return _warn(f"{reason} Execution cancelled by user.")
+                update_execution_state(
+                    needs_confirmation=True,
+                    confirmation_reason=reason,
+                )
+                if confirm_action(command, reason, timeout=CONFIRM_TIMEOUT_DEFAULT):
+                    force = True
+                    _approved_network_hosts.update(hosts)
+                    _log_approval_decision(command, "sensitive", "approved", reason)
+                else:
+                    _log_approval_decision(command, "sensitive", "denied", reason)
+                    return _warn(f"{reason} Execution cancelled by user.")
 
     # Resolve working directory
     cwd = workdir or _cwd
