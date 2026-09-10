@@ -45,6 +45,7 @@ from tools.executor import set_execution_state
 from agent.activity_timeline import emit_activity_event, update_activity_event, get_activity_timeline
 from agent.penzermodule.resource_monitor import ResourceMonitor
 from agent.penzermodule import execution
+import httpx
 from agent.config import (
     ITER_BY_COMPLEXITY, TRIM_AT, KEEP_LAST, STUCK_MIN, MAX_FAILURES,
     ITER_EXTENSION_SIZE, MAX_RUNTIME_SECONDS, ABSOLUTE_MAX_ITER,
@@ -1290,7 +1291,11 @@ class PenzerAgent:
         to RATE_LIMIT_BASE regardless of how much the run had already
         been rate-limited, so a persistently-throttled API got hammered
         at full speed every single iteration instead of actually backing
-        off harder over time."""
+        off harder over time.
+        
+        NOW ALSO: Catches server-side timeouts (httpx) and retries instead of
+        immediately giving up. Handles OpenRouter 43s timeout + async timeout.
+        """
         delay = self._backoff
         for attempt in range(max_attempts):
             try:
@@ -1303,27 +1308,50 @@ class PenzerAgent:
                 r = self._validate_llm_response(r)
                 self._backoff, self._rate_attempts, self._last_llm_error = max(1.0, self._backoff * 0.9), 0, ""
                 return r
-            except asyncio.TimeoutError:
-                self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
-                self.history.append({"role": "user", "content": "Timeout. Continue or give final answer."})
-                self._last_llm_error = "timeout"
-                return None
+                
+            except (asyncio.TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                # Server-side timeout (httpx.ConnectError, httpx.RemoteProtocolError from OpenRouter)
+                # OR client-side timeout (asyncio.TimeoutError)
+                # Both should retry with exponential backoff instead of immediately failing
+                if attempt < max_attempts - 1:
+                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
+                    wait = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + random.uniform(0, RATE_LIMIT_JITTER))
+                    retry_id = self._emit_activity(
+                        "retry", "Retrying LLM",
+                        message=f"Timeout — Attempt {attempt + 2}/{max_attempts} after {wait:.0f}s",
+                        status="running", details={"attempt": attempt + 2, "max_attempts": max_attempts, "error_type": type(e).__name__},
+                    )
+                    self._record_step("timeout", f"LLM timeout ({type(e).__name__}) — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
+                    await asyncio.sleep(wait)
+                    if retry_id:
+                        self._update_activity(retry_id, status="success", message="Retry scheduled")
+                    continue
+                else:
+                    # Max retries exhausted
+                    self._last_llm_error = "timeout"
+                    self._record_step("timeout", f"LLM timeout after {max_attempts} attempts")
+                    return None
+                    
             except Exception as e:
                 err = str(e).lower()
                 if any(x in err for x in ("rate", "429", "quota", "limit")):
                     self._rate_attempts += 1
                     wait = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + random.uniform(0, RATE_LIMIT_JITTER))
                     self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
-                    retry_id = self._emit_activity(
-                        "retry", "Retrying LLM",
-                        message=f"Attempt {attempt + 2}/{max_attempts} after rate limit",
-                        status="running", details={"attempt": attempt + 2, "max_attempts": max_attempts},
-                    )
-                    self._record_step("rate_limit", f"Rate limited — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
-                    await asyncio.sleep(wait)
-                    if retry_id:
-                        self._update_activity(retry_id, status="success", message="Retry scheduled")
-                    continue
+                    if attempt < max_attempts - 1:
+                        retry_id = self._emit_activity(
+                            "retry", "Retrying LLM",
+                            message=f"Attempt {attempt + 2}/{max_attempts} after rate limit",
+                            status="running", details={"attempt": attempt + 2, "max_attempts": max_attempts},
+                        )
+                        self._record_step("rate_limit", f"Rate limited — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
+                        await asyncio.sleep(wait)
+                        if retry_id:
+                            self._update_activity(retry_id, status="success", message="Retry scheduled")
+                        continue
+                    else:
+                        self._last_llm_error = "rate_limit"
+                        return None
                 logger.error("LLM error: %s", e)
                 self._last_llm_error = "error"
                 return None
