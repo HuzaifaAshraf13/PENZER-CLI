@@ -45,7 +45,6 @@ from tools.executor import set_execution_state
 from agent.activity_timeline import emit_activity_event, update_activity_event, get_activity_timeline
 from agent.penzermodule.resource_monitor import ResourceMonitor
 from agent.penzermodule import execution
-import httpx
 from agent.config import (
     ITER_BY_COMPLEXITY, TRIM_AT, KEEP_LAST, STUCK_MIN, MAX_FAILURES,
     ITER_EXTENSION_SIZE, MAX_RUNTIME_SECONDS, ABSOLUTE_MAX_ITER,
@@ -53,6 +52,7 @@ from agent.config import (
     RATE_LIMIT_BASE, RATE_LIMIT_MAX, RATE_LIMIT_JITTER,
     WORKING_MEMORY_SIZE, ACTION_FORMATTERS, ERROR_PATTERNS,
 )
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -1087,11 +1087,26 @@ class PenzerAgent:
 
     def _handle_empty_calls(self, text: str, empty: int) -> tuple[str | None, int]:
         """No tool calls this turn: either a final answer, or a nudge to
-        continue (gives up after two empty turns in a row)."""
+        continue (gives up after two empty turns in a row).
+        
+        FIXED: If the goal is "enumerate" and we have 2+ successful scans,
+        nudge the model toward a final answer instead of running more scans."""
         if text and self._looks_like_malformed_tool_payload(text):
             self._record_step("trusted_data", "Detected malformed tool payload instead of a final answer.", reason="malformed_tool_payload")
             self.history.append({"role": "user", "content": "The assistant response was not a valid final answer. Continue working on the task."})
             return None, empty
+        
+        # NEW: Check if enumeration task is done (2+ successful terminal/nmap runs)
+        if any(word in self._goal.lower() for word in ("enumerate", "scan", "recon", "discover")):
+            successful_scans = sum(1 for t in self._trace if t["success"] and t["tool"] in ("terminal", "browser"))
+            if successful_scans >= 2:
+                if not text:
+                    self.history.append({"role": "user", "content": 
+                        f"You have collected enough enumeration data from {successful_scans} scans. "
+                        f"Now provide a final summary of your findings and stop scanning."})
+                    empty = 0
+                    return None, empty
+        
         if text:
             self.history.append({"role": "assistant", "content": text})
             self._record_step("final_answer", text[:200])
@@ -1293,9 +1308,9 @@ class PenzerAgent:
         at full speed every single iteration instead of actually backing
         off harder over time.
         
-        NOW ALSO: Catches server-side timeouts (httpx) and retries instead of
-        immediately giving up. Handles OpenRouter 43s timeout + async timeout.
-        """
+        FIXED: Now catches server-side timeouts (httpx exceptions) and retries
+        with exponential backoff instead of immediately failing. Handles OpenRouter
+        43s timeout and async timeouts uniformly."""
         delay = self._backoff
         for attempt in range(max_attempts):
             try:
