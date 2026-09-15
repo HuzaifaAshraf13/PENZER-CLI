@@ -8,10 +8,12 @@ import asyncio
 import subprocess
 import time
 import uuid
+import shlex
+import sys
 from pathlib import Path
 
-from agent.core import mcp
 from tools.executor import approve_background_command, execute, get_change_log
+from tools.sandbox import build_sandbox_command
 from tools.standards import success, error, warning
 from config import get_profile_settings
 
@@ -60,8 +62,11 @@ def _start_background_job(payload: str, effective_workdir: str, mode: str, workf
     log_path = _JOB_ROOT / f"{job_id}.log"
     try:
         with log_path.open("w", encoding="utf-8") as fh:
+            command = ["bash", "-c", payload]
+            if mode == "python":
+                command = [sys.executable, "-c", payload]
             proc = subprocess.Popen(
-                ["bash", "-c", payload],
+                build_sandbox_command(command, effective_workdir),
                 cwd=effective_workdir,
                 stdout=fh,
                 stderr=subprocess.STDOUT,
@@ -147,12 +152,23 @@ async def _terminal_impl(
     effective_workdir = _resolve_workdir(session_id, workdir)
 
     # Handle cd — persist working directory per session
+    leading_cd = None
     if mode == "bash" and payload.strip().startswith("cd "):
-        target = os.path.normpath(os.path.join(effective_workdir, os.path.expanduser(payload.strip()[3:].strip())))
+        command_text = payload.strip()
+        if any(operator in command_text[3:] for operator in ("&&", ";", "||", "|", "\n")):
+            try:
+                leading_cd = shlex.split(command_text.split("&&", 1)[0].strip(), posix=True)[1]
+            except (IndexError, ValueError):
+                leading_cd = None
+        else:
+            leading_cd = command_text[3:].strip()
+    if leading_cd is not None:
+        target = os.path.normpath(os.path.join(effective_workdir, os.path.expanduser(leading_cd)))
         if not os.path.isdir(target):
             return error(f"No such directory: {target}")
-        _set_session_workdir(session_id, target)
-        return success(data={"cwd": target, "session_id": session_id})
+        if "&&" not in payload and ";" not in payload and "||" not in payload and "|" not in payload and "\n" not in payload:
+            _set_session_workdir(session_id, target)
+            return success(data={"cwd": target, "session_id": session_id})
 
     # Background process
     if background or timeout == 0:
@@ -189,6 +205,10 @@ async def _terminal_impl(
         )
         if isinstance(result.get("data"), dict):
             result["data"]["workflow"] = workflow
+        if result.get("status") == "success" and leading_cd is not None:
+            _set_session_workdir(session_id, target)
+            if isinstance(result.get("data"), dict):
+                result["data"]["cwd"] = target
         return result
     except Exception as e:
         return error(str(e))
@@ -220,7 +240,6 @@ async def terminal_direct(
     )
 
 
-@mcp.tool()
 async def terminal(
     command: str = None,
     code: str = None,
@@ -322,17 +341,14 @@ def terminal_kill_direct(job_id: str) -> dict:
         return error(f"Could not kill job {job_id}: {exc}")
 
 
-@mcp.tool()
 def terminal_check_job(job_id: str) -> dict:
     return terminal_check_job_direct(job_id)
 
 
-@mcp.tool()
 def terminal_kill(job_id: str) -> dict:
     return terminal_kill_direct(job_id)
 
 
-@mcp.tool()
 def terminal_get_change_log() -> dict:
     """Return all commands executed this session for audit/rollback."""
     changes = get_change_log()

@@ -71,6 +71,26 @@ def compose_summary_lines(matched: list[str] | None = None, trace: list | None =
     return lines
 
 
+def compose_turn_summary(trace: list | None = None, calls_used: int = 0, tokens_used: int = 0) -> str:
+    """Build a compact completion line without exposing model reasoning."""
+    trace = trace or []
+    failures = sum(1 for entry in trace if isinstance(entry, dict) and not entry.get("success"))
+    tool_count = len(trace)
+    outcome = "completed" if not failures else f"completed with {failures} issue{'s' if failures != 1 else ''}"
+    return (
+        f"{outcome} · {tool_count} tool{'s' if tool_count != 1 else ''} · "
+        f"{calls_used} model call{'s' if calls_used != 1 else ''} · ~{tokens_used} tokens"
+    )
+
+
+def _format_transient_output_status(label: str, line: str, reported_streams: set[str]) -> str | None:
+    """Collapse noisy subprocess output into one status update per stream."""
+    if not str(line or "").strip() or label in reported_streams:
+        return None
+    reported_streams.add(label)
+    return f"Terminal {label}: receiving output…"
+
+
 class LiveStatusView:
     def __init__(self) -> None:
         self.current = "Starting…"
@@ -285,22 +305,22 @@ def clean_response(text: str) -> str:
 def build_help_text() -> str:
     return "\n".join([
         "[bold]Commands[/bold]",
-        "• [cyan]help[/cyan]      Show this help",
-        "• [cyan]clear[/cyan]     Clear the terminal",
-        "• [cyan]plugins[/cyan]   List available plugin tools",
-        "• [cyan]apikey[/cyan]    Manage API credentials",
-        "• [cyan]doctor[/cyan]    Show startup health diagnostics",
-        "• [cyan]update[/cyan]    Check for updates",
-        "• [cyan]state[/cyan]     Show current execution state",
-        "• [cyan]plan[/cyan]      Show the current execution plan",
-        "• [cyan]memory[/cyan]    Show saved facts and memory state",
-        "• [cyan]checkpoints[/cyan] Show saved checkpoints",
-        "• [cyan]activity[/cyan]  Show the execution activity drawer",
-        "• [cyan]resume[/cyan]    Resume last interrupted task",
-        "• [cyan]profile[/cyan]   Show or switch the current CLI profile",
-        "• [cyan]benchmark[/cyan]  Show a lightweight quality summary",
-        "• [cyan]dashboard[/cyan] Show a runtime overview of memory, plugins, and health",
-        "• [cyan]exit[/cyan]      Leave Penzer",
+        "• [dark_red]help[/dark_red]      Show this help",
+        "• [dark_red]clear[/dark_red]     Clear the terminal",
+        "• [dark_red]plugins[/dark_red]   List available plugin tools",
+        "• [dark_red]apikey[/dark_red]    Manage API credentials",
+        "• [dark_red]doctor[/dark_red]    Show startup health diagnostics",
+        "• [dark_red]update[/dark_red]    Check for updates",
+        "• [dark_red]state[/dark_red]     Show current execution state",
+        "• [dark_red]plan[/dark_red]      Show the current execution plan",
+        "• [dark_red]memory[/dark_red]    Show saved facts and memory state",
+        "• [dark_red]checkpoints[/dark_red] Show saved checkpoints",
+        "• [dark_red]activity[/dark_red]  Show the execution activity drawer",
+        "• [dark_red]resume[/dark_red]    Resume last interrupted task",
+        "• [dark_red]profile[/dark_red]   Show or switch the current CLI profile",
+        "• [dark_red]benchmark[/dark_red]  Show a lightweight quality summary",
+        "• [dark_red]dashboard[/dark_red] Show a runtime overview of memory, plugins, and health",
+        "• [dark_red]exit[/dark_red]      Leave Penzer",
     ])
 
 
@@ -343,18 +363,18 @@ PENZER_LOGO = r"""
 
 
 def display_banner():
-    console.print(f"[bold red]{PENZER_LOGO}")
+    console.print(f"[bold dark_red]{PENZER_LOGO}")
     console.print(Panel(
         "[bold white]Autonomous Terminal Agent[/bold white]\n"
-        "[cyan]Autonomy comes up with constraints[/cyan]\n"
-        f"[dim]v{get_version()} · type 'help' to get started[/dim]",
-        border_style="red",
+        "[dim]Direct shell and file tools · bounded execution · evidence-first results[/dim]\n"
+        f"[dim]v{get_version()} · /help for commands · Ctrl-D to exit[/dim]",
+        border_style="dark_red",
         padding=(0, 1),
     ))
 
 
 def display_help():
-    console.print(Panel(build_help_text(), title="Help", border_style="cyan", padding=(0, 1)))
+    console.print(Panel(build_help_text(), title="Help", border_style="dark_red", padding=(0, 1)))
 
 
 def maybe_notify_update() -> None:
@@ -434,9 +454,9 @@ def prompt_for_llm_credentials() -> dict[str, str]:
     while True:
         console.print("\n[bold yellow]LLM configuration required.[/bold yellow]")
         console.print("Choose how you want to configure Penzer:")
-        console.print("  [cyan]1[/cyan] Use a local server URL")
-        console.print("  [cyan]2[/cyan] Enter API key and API URL")
-        console.print("  [cyan]3[/cyan] Exit")
+        console.print("  [dark_red]1[/dark_red] Use a local server URL")
+        console.print("  [dark_red]2[/dark_red] Enter API key and API URL")
+        console.print("  [dark_red]3[/dark_red] Exit")
 
         try:
             choice = console.input("[bold cyan]Select option [1-3]: [/bold cyan]").strip().lower()
@@ -687,6 +707,15 @@ async def run_noninteractive(task: str, json_mode: bool = False) -> int:
 
     def emit(event: dict) -> None:
         if json_mode:
+            event = dict(event)
+            details = dict(event.get("details") or {})
+            for field in ("stdout", "stderr", "content", "result"):
+                details.pop(field, None)
+            if details:
+                event["details"] = details
+            else:
+                event.pop("details", None)
+        if json_mode:
             print(json.dumps(event, ensure_ascii=True), flush=True)
         else:
             title = event.get("title") or event.get("event_type", "activity")
@@ -736,7 +765,7 @@ async def main(task: str | None = None, json_mode: bool = False):
         console.print("[red bold]Loading agent...[/red bold]")
         agent = await PenzerAgent().async_init()
         console.print("[bold green]✓ Ready[/bold green]")
-        console.print("[dim]Type a task or run [cyan]help[/cyan] for commands.[/dim]\n")
+        console.print("[dim]Type a task or run [dark_red]/help[/dark_red] for commands.[/dim]\n")
         maybe_notify_update()
         while True:
             try:
@@ -770,7 +799,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                     console.print("[dim]No plugin tools available yet.[/dim]")
                 if metadata:
                     console.print()
-                    console.print("[cyan]Plugin modules:[/cyan]")
+                    console.print("[dark_red]Plugin modules:[/dark_red]")
                     for entry in metadata:
                         console.print(f"  - {entry['name']}: {', '.join(entry['functions']) or 'no functions'}")
                 continue
@@ -783,7 +812,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                 panel_lines = [f"Status: {status}"]
                 for name, entry in report.get("checks", {}).items():
                     panel_lines.append(f"- {name}: {'ok' if entry.get('ok') else 'issue'} — {entry.get('message', '')}")
-                console.print(Panel("\n".join(panel_lines), title="Doctor", border_style="cyan"))
+                console.print(Panel("\n".join(panel_lines), title="Doctor", border_style="dark_red"))
                 continue
             if user_input.lower() == "update":
                 try:
@@ -794,21 +823,21 @@ async def main(task: str | None = None, json_mode: bool = False):
                     console.print(f"[red]Update failed: {exc}[/red]")
                 continue
             if user_input.lower() == "state":
-                console.print(Panel(format_execution_state(), title="Execution State", border_style="yellow"))
+                console.print(Panel(format_execution_state(), title="Execution State", border_style="dark_red"))
                 continue
             if user_input.lower() == "plan":
                 plan = getattr(agent, "get_plan", lambda: [])()
                 console.print(Panel(
                     InteractiveTerminal.format_plan(plan) if plan else "No plan created yet.",
-                    title="Execution Plan", border_style="cyan",
+                    title="Execution Plan", border_style="dark_red",
                 ))
                 continue
             if user_input.lower() in ("activity", "drawer"):
                 timeline = get_activity_timeline()
                 if timeline and timeline.events:
-                    console.print(Panel(timeline.render_drawer(), title="Execution Activity", border_style="cyan"))
+                    console.print(Panel(timeline.render_drawer(), title="Execution Activity", border_style="dark_red"))
                 else:
-                    console.print(Panel("No activity recorded yet.", title="Execution Activity", border_style="cyan"))
+                    console.print(Panel("No activity recorded yet.", title="Execution Activity", border_style="dark_red"))
                 continue
             if user_input.lower() == "memory":
                 from session.memory import kv_list, load_history
@@ -829,7 +858,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                         summary,
                     ]),
                     title="Memory",
-                    border_style="magenta",
+                    border_style="dark_red",
                 ))
                 continue
             if user_input.lower() == "checkpoints":
@@ -837,7 +866,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                 checkpoints = load_checkpoints()
                 if checkpoints:
                     for idx, cp in enumerate(checkpoints, 1):
-                        console.print(f"[cyan]{idx}.[/cyan] {cp.get('goal','')} — {cp.get('belief','')} @ {cp.get('timestamp','')}")
+                        console.print(f"[dark_red]{idx}.[/dark_red] {cp.get('goal','')} — {cp.get('belief','')} @ {cp.get('timestamp','')}")
                 else:
                     console.print("[dim]No checkpoints saved yet.[/dim]")
                 continue
@@ -852,7 +881,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                     f"Current step: [bold]{snapshot.get('resume_state', {}).get('current_step','')}[/bold]\n"
                     f"Blocked: [bold]{', '.join(snapshot.get('resume_state', {}).get('blocked_steps', [])) or 'none'}[/bold]",
                     title="Resume Preview",
-                    border_style="green",
+                    border_style="dark_red",
                 ))
                 try:
                     proceed = console.input("Resume this task? [y/N]: ").strip().lower() in {"y", "yes"}
@@ -894,7 +923,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                         console.print(f"[yellow]Unknown profile. Choose from: {', '.join(PROFILE_OPTIONS)}[/yellow]")
                 else:
                     current_profile = get_profile_settings()["name"]
-                    console.print(f"[cyan]Current profile:[/cyan] {current_profile}")
+                    console.print(f"[dark_red]Current profile:[/dark_red] {current_profile}")
                     for name, description in PROFILE_OPTIONS.items():
                         console.print(f"  - {name}: {description}")
                 continue
@@ -914,7 +943,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                     health_status="healthy" if doctor_report.get("ok") else "needs attention",
                     last_goal=(history[-1].get("goal") if history else None),
                 )
-                console.print(Panel(dashboard, title="Dashboard", border_style="magenta"))
+                console.print(Panel(dashboard, title="Dashboard", border_style="dark_red"))
                 continue
 
             if user_input.lower() == "benchmark":
@@ -935,12 +964,14 @@ async def main(task: str | None = None, json_mode: bool = False):
                         "Memory-backed context: enabled",
                     ]),
                     title="Benchmark Summary",
-                    border_style="cyan",
+                    border_style="dark_red",
                 ))
                 continue
             calls_before  = getattr(agent.llm, "call_count", 0)
             tokens_before = getattr(agent.llm, "token_estimate", 0)
             status_view = LiveStatusView()
+            terminal_ui.begin_turn()
+            turn_elapsed = "0s"
             terminal_ui.set_status("RUNNING")
             status_view.timeline.set_stream_handler(
                 lambda event: _render_activity_event(terminal_ui, event)
@@ -999,9 +1030,9 @@ async def main(task: str | None = None, json_mode: bool = False):
                         or "open sans" in text.lower()
                     )
                     if looks_like_html:
-                        if label not in noisy_streams:
-                            noisy_streams.add(label)
-                            _on_status("Terminal stdout: receiving response…")
+                        message = _format_transient_output_status(label, text, noisy_streams)
+                        if message:
+                            _on_status(message.replace("receiving output", "receiving response"))
                         return
                     _on_status(f"Terminal {label}: {text[:100]}")
 
@@ -1034,7 +1065,8 @@ async def main(task: str | None = None, json_mode: bool = False):
             finally:
                 _current_task = None
                 set_live_hooks(None, None, None)
-                terminal_ui.set_status("IDLE")
+                turn_elapsed = terminal_ui.turn_elapsed()
+                terminal_ui.end_turn()
                 # Clear the progress line before printing the final answer.
                 try:
                     sys.stdout.write("\r\033[2K\r")
@@ -1067,6 +1099,7 @@ async def main(task: str | None = None, json_mode: bool = False):
                 console.print()
                 for line in summary_lines:
                     console.print(f"[dim]{line}[/dim]")
+                console.print(f"[dim]Turn: {compose_turn_summary(trace, calls_used, tokens_used)} · {turn_elapsed}[/dim]")
             console.print()
     except Exception as e:
         console.print(f"\n[red bold]ERROR: {str(e)}[/red bold]")

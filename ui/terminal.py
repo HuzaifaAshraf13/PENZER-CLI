@@ -7,6 +7,7 @@ input editing and the small amount of presentation state needed by the shell.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
@@ -51,6 +52,7 @@ class InteractiveTerminal:
         history_path = root / "data" / "penzer_history"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         self.status = "IDLE"
+        self.turn_started_at: float | None = None
         self.session_id = os.urandom(2).hex()
         self._session = PromptSession(
             history=FileHistory(str(history_path)),
@@ -58,8 +60,8 @@ class InteractiveTerminal:
             multiline=True,
             key_bindings=self._key_bindings(),
             style=Style.from_dict({
-                "prompt": "#00d7ff bold",
-                "bottom-toolbar": "#808080",
+                "prompt": "#b3262e bold",
+                "bottom-toolbar": "#8f5a5e",
             }),
         )
         self._session.app.full_screen = os.getenv("PENZER_FULLSCREEN", "0").lower() in {"1", "true", "yes"}
@@ -98,6 +100,19 @@ class InteractiveTerminal:
     def set_status(self, value: str) -> None:
         self.status = value.upper()
 
+    def begin_turn(self) -> None:
+        self.turn_started_at = time.monotonic()
+        self.set_status("RUNNING")
+
+    def end_turn(self) -> None:
+        self.turn_started_at = None
+        self.set_status("IDLE")
+
+    def turn_elapsed(self) -> str:
+        if self.turn_started_at is None:
+            return "0s"
+        return f"{int(time.monotonic() - self.turn_started_at)}s"
+
     @staticmethod
     def format_event(event: dict) -> str:
         """Format one structured activity event without relying on color."""
@@ -133,7 +148,7 @@ class InteractiveTerminal:
     def format_plan(plan: list[dict]) -> str:
         """Render the agent's high-level plan without exposing reasoning."""
         symbols = {"done": "✓", "success": "✓", "running": "◐", "blocked": "×", "pending": "○"}
-        lines = ["● Planning"]
+        lines = ["Planning"]
         for index, step in enumerate(plan, 1):
             status = step.get("status", "pending")
             symbol = symbols.get(status, "○")
@@ -148,15 +163,15 @@ class InteractiveTerminal:
         mode = "compact" if width < 90 else "interactive"
         cwd = str(Path.cwd()).replace(str(Path.home()), "~", 1)
         model = os.getenv("LLM_MODEL", "default")
-        text = f"{model} · {cwd} · {self.status} · ASK · {mode} · ?"
+        text = f"{self.status} · {model} · {cwd} · /help"
         return text if len(text) <= width - 2 else text[: max(20, width - 5)] + "..."
 
     async def get_input(self) -> str:
         return await self._session.prompt_async(
-            message=[("class:prompt", "› ")],
+            message=[("class:prompt", "❯ ")],
             bottom_toolbar=self.toolbar,
         )
 
     def header(self, state: str = "IDLE") -> str:
         self.set_status(state)
-        return f"PENZER                              session: {self.session_id}  ● {self.status}"
+        return f"PENZER  ·  session {self.session_id}  ·  {self.status}"

@@ -21,7 +21,7 @@ Phase state machine — same shape as Claude Code's queryLoop: call model
 Planning lives in the conversation (system prompt + skill hints), not in
 a parallel execution-queue data structure.
 """
-import json, logging, asyncio, signal, time, random, re, itertools, weakref
+import ast, json, logging, asyncio, signal, time, random, re, itertools, weakref
 from typing import Any, Callable
 from collections import defaultdict, deque
 
@@ -38,6 +38,7 @@ from session.memory import (
     append_steps as _append_steps_to_disk, get_steps as _get_persisted_steps,
     clear_steps as _clear_persisted_steps,
 )
+from session.events import append_event
 from agent.system_prompts import build_system_prompt, _tokenize
 from agent.skills import load_all_skills, build_context_from_history
 from tools.plugins import load_plugin_tools
@@ -121,6 +122,7 @@ class PenzerAgent:
         self.history  = load_history()
         self.on_status: Callable[[str], None] = lambda m: None
         self.on_plan: Callable[[list[dict]], None] = lambda plan: None
+        self.on_budget_prompt: Callable[[dict], bool] = lambda details: False
         self._fn_cache: dict = {}
         self._reset()
         data = load_all_skills()
@@ -174,6 +176,8 @@ class PenzerAgent:
         # Single source of truth for loop control.
         self._done:   bool = False
         self._failed: bool = False
+        self._shutdown: bool = False
+        self._budget_prompted: bool = False
         self._direct_tool_answer: bool = False
         self._steps:         list = []
         self._pending_steps: list = []
@@ -229,6 +233,12 @@ class PenzerAgent:
             self.tools = await mcp.get_tools() or {}
         except Exception as e:
             logger.debug("MCP: %s", e)
+        self.tools.update({
+            "terminal": execution.DIRECT_TOOLS["terminal"],
+            "terminal_check_job": execution.DIRECT_TOOLS["terminal_check_job"],
+            "terminal_kill": execution.DIRECT_TOOLS["terminal_kill"],
+            "file_editor": execution.DIRECT_TOOLS["file_editor"],
+        })
         self.tools.setdefault("memory", "builtin")
         return self
 
@@ -936,6 +946,20 @@ class PenzerAgent:
                     f"Hit the iteration budget but still making progress — extending by {ITER_EXTENSION_SIZE} "
                     f"({elapsed}s elapsed of {MAX_RUNTIME_SECONDS}s budget).")
             else:
+                if not self._budget_prompted:
+                    self._budget_prompted = True
+                    details = {
+                        "iteration": self._iteration,
+                        "max_iter": self._max_iter,
+                        "message": "Iteration budget reached. Resume to continue.",
+                    }
+                    try:
+                        if self.on_budget_prompt(details):
+                            self._max_iter += ITER_EXTENSION_SIZE
+                            self._record_step("extend", f"Iteration budget extended by {ITER_EXTENSION_SIZE} on request.")
+                            return None
+                    except Exception:
+                        logger.exception("on_budget_prompt callback raised")
                 reason, has_specific_reason = "iteration limit reached", False
                 if time.time() - self._run_start_time > MAX_RUNTIME_SECONDS:
                     reason, has_specific_reason = f"time budget exceeded ({MAX_RUNTIME_SECONDS}s)", True
@@ -943,11 +967,10 @@ class PenzerAgent:
                     reason, has_specific_reason = "absolute iteration ceiling reached", True
                 elif self._trace and not any(t["success"] for t in self._trace[-3:]):
                     reason, has_specific_reason = "stopped making progress", True
-                self._failed = True
                 self._belief["goal_progress"] = "failed"
                 self._record_step("give_up", f"Stopping: {reason}.", reason="stop_condition", stop_reason=reason)
                 self._persist_all()
-                return f"Stopped: {reason}" if has_specific_reason else "Iteration limit reached"
+                return f"Stopped: {reason}" if has_specific_reason else "Iteration limit reached. Use resume to continue."
         if self._shutdown:
             self._persist_all()
             save_history(self.history)
@@ -1169,12 +1192,69 @@ class PenzerAgent:
         ip = candidates[0]
         return f"Your IP address is {ip}."
 
+    def _network_scan_answer(self, goal: str, command: str, result: Any) -> str | None:
+        """Finish host discovery with a concise list instead of raw nmap output."""
+        goal_text = str(goal or "").lower()
+        command_text = str(command or "").lower()
+        if "nmap" not in command_text or "-sn" not in command_text:
+            return None
+        if not any(word in goal_text for word in ("scan", "enumerate", "discover", "active host")):
+            return None
+        payload = result
+        if isinstance(result, str):
+            try:
+                payload = ast.literal_eval(result)
+            except (SyntaxError, ValueError):
+                return None
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            return None
+        data = payload.get("data")
+        stdout = data.get("stdout") if isinstance(data, dict) else None
+        if not stdout:
+            return None
+        hosts: list[tuple[str, str]] = []
+        pending: tuple[str, str] | None = None
+        report_re = re.compile(r"^Nmap scan report for (.+?)\s*$", re.IGNORECASE)
+        for line in str(stdout).splitlines():
+            report = report_re.match(line.strip())
+            if report:
+                target = report.group(1)
+                address_match = re.search(r"\(([^()]+)\)$", target)
+                if address_match:
+                    address = address_match.group(1)
+                    name = target[:address_match.start()].strip()
+                else:
+                    address = target.strip()
+                    name = ""
+                pending = (address, name)
+                continue
+            if pending and re.search(r"\bHost is up\b", line, re.IGNORECASE):
+                if pending not in hosts:
+                    hosts.append(pending)
+                pending = None
+        if not hosts:
+            return "Nmap scan completed.\n\nNo active hosts found."
+        lines = [f"Active hosts ({len(hosts)}):"]
+        for address, name in hosts:
+            lines.append(f"- {address}" + (f" ({name})" if name else ""))
+        return "Nmap scan completed.\n\n" + "\n".join(lines)
+
     async def _execute_tool_calls(self, filtered_calls: list, i: int) -> str | None:
         for c in filtered_calls:
             self._record_step("tool_call", f"{c['name']} {self._fmt_action(c['name'], c.get('arguments', {}))}",
                                tool=c["name"], args=c.get("arguments", {}))
             if self._requires_verification(c["name"], c.get("arguments", {})):
                 self._mark_plan_step("execute", "running", f"mutating_tool:{c['name']}")
+        journal_keys = {
+            c.get("id", f"{i}:{index}:{c.get('name', 'tool')}"): c
+            for index, c in enumerate(filtered_calls)
+        }
+        for key, call in journal_keys.items():
+            append_event("tool_started", self._run_id, {
+                "idempotency_key": key,
+                "tool_name": call.get("name"),
+                "tool_input": call.get("arguments", {}),
+            })
         results = await execution.run_speculative(self, filtered_calls)
         if any(self._is_error(raw) and not self._is_timeout(raw) for raw, _ in results):
             fallback_results = []
@@ -1188,6 +1268,12 @@ class PenzerAgent:
         for c, (raw, elapsed) in zip(filtered_calls, results):
             name  = c["name"]
             ok    = not self._is_error(raw)
+            append_event("tool_finished" if ok else "tool_blocked", self._run_id, {
+                "idempotency_key": c.get("id", f"{i}:{name}"),
+                "tool_name": name,
+                "success": ok,
+                "error_type": self._categorize_error(raw) if not ok else None,
+            })
             etype = self._categorize_error(raw) if not ok else None
             flagged = scan_instruction_like_patterns(str(raw))
             if flagged:
@@ -1226,6 +1312,15 @@ class PenzerAgent:
 
             if ok and name == "terminal":
                 command_text = str(c.get("arguments", {}).get("command", "")).lower()
+                scan_answer = self._network_scan_answer(self._goal, command_text, raw)
+                if scan_answer:
+                    self._done = True
+                    self._direct_tool_answer = True
+                    self._belief["goal_progress"] = "complete"
+                    self.history.append({"role": "assistant", "content": scan_answer})
+                    self._record_step("final_answer", scan_answer[:200], reason="network_scan_complete")
+                    self._persist_all()
+                    return scan_answer
                 public_ip_request = any(key in self._goal.lower() for key in ("public ip", "what is my ip", "my ip"))
                 if public_ip_request and any(local_cmd in command_text for local_cmd in ("hostname -i", "hostname -i", "ip addr", "ifconfig")):
                     continue
@@ -1420,12 +1515,9 @@ class PenzerAgent:
 
     def _is_error(self, r: Any) -> bool:
         s = str(r)
-        try:
-            d = json.loads(s.strip())
-            if isinstance(d, dict) and "status" in d:
-                return d.get("status") == "error"
-        except (json.JSONDecodeError, ValueError):
-            pass
+        d = self._parse_structured_result(s)
+        if isinstance(d, dict) and "status" in d:
+            return d.get("status") == "error"
         return any(t in s.lower() for t in ("error", "failed", "exception", "traceback", "not found", "unknown tool", "permission denied", "timeout"))
 
     def _is_timeout(self, r: Any) -> bool:
@@ -1433,17 +1525,24 @@ class PenzerAgent:
 
     def _categorize_error(self, result: Any) -> str:
         s = str(result)
-        try:
-            d = json.loads(s.strip())
-            if isinstance(d, dict) and d.get("status") == "error" and d.get("error_type"):
-                return str(d["error_type"])
-        except (json.JSONDecodeError, ValueError):
-            pass
+        d = self._parse_structured_result(s)
+        if isinstance(d, dict) and d.get("status") == "error" and d.get("error_type"):
+            return str(d["error_type"])
         sl = s.lower()
         for pattern, label in ERROR_PATTERNS:
             if pattern in sl:
                 return label
         return "ERROR"
+
+    @staticmethod
+    def _parse_structured_result(value: str) -> Any:
+        try:
+            return json.loads(value.strip())
+        except (json.JSONDecodeError, ValueError, TypeError):
+            try:
+                return ast.literal_eval(value.strip())
+            except (SyntaxError, ValueError, TypeError):
+                return None
 
     def _last_role(self) -> str:
         for m in reversed(self.history):
@@ -1463,6 +1562,29 @@ class PenzerAgent:
         if not ok:
             return f"{hdr}\nError: {self._brief(raw)}"
         if name == "terminal":
+            command_text = str(args.get("command") or args.get("script") or "").lower()
+            if "nmap" in command_text and "-sn" in command_text:
+                scan_summary = self._network_scan_answer(self._goal or "scan active hosts", command_text, raw)
+                if scan_summary:
+                    return f"{hdr}\n{scan_summary}"
+            structured = self._parse_structured_result(str(raw))
+            if isinstance(structured, dict) and isinstance(structured.get("data"), dict):
+                data = structured["data"]
+                output = str(data.get("stdout") or "").strip()
+                stderr = str(data.get("stderr") or "").strip()
+                exit_code = data.get("exit_code")
+                context_lines = [f"Exit code: {exit_code}" if exit_code is not None else "Command completed"]
+                if data.get("cwd"):
+                    context_lines.append(f"Working directory: {data['cwd']}")
+                if output:
+                    context_lines.append(f"Output:\n{output[:1200]}")
+                    if len(output) > 1200:
+                        context_lines.append("[stdout truncated for context]")
+                if stderr:
+                    context_lines.append(f"Errors:\n{stderr[:1200]}")
+                    if len(stderr) > 1200:
+                        context_lines.append("[stderr truncated for context]")
+                return f"{hdr}\n" + "\n".join(context_lines)
             # Line-count cap alone doesn't bound size: minified/single-
             # line output (e.g. curl'd HTML) has ~0 newlines, so
             # lines[:5] can still be the ENTIRE multi-KB/MB blob. That
@@ -1490,16 +1612,14 @@ class PenzerAgent:
 
     def _brief(self, raw: Any) -> str:
         s = str(raw).strip() or "(empty)"
-        try:
-            d = json.loads(s)
-            if isinstance(d, dict):
-                if d.get("status") == "error":
-                    return f"Error: {d.get('message', s)}"
-                for k in ("output", "content", "data", "result", "text"):
-                    if k in d:
-                        return str(d[k])[:250]
-        except (json.JSONDecodeError, ValueError):
-            pass
+        d = self._parse_structured_result(s)
+        if isinstance(d, dict):
+            if d.get("status") == "error":
+                return f"Error: {d.get('message', s)}"
+            data = d.get("data") if isinstance(d.get("data"), dict) else d
+            for k in ("output", "content", "stdout", "result", "text"):
+                if k in data:
+                    return str(data[k])[:250]
         return s[:250] + f" … [{len(s)-250} more]" if len(s) > 250 else s
 
     # ------------------------------------------------------------------

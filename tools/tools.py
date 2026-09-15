@@ -8,10 +8,11 @@ Individual tools are in separate files:
   - file_editor_tool.py: file_editor()
 """
 
-# Import all tools to register them with MCP
+# Import tool entry points. Browser and file-editor wrappers register with MCP;
+# terminal execution is exposed directly by the agent.
 from tools.terminal_tool import terminal, terminal_check_job, terminal_kill
 from tools.browser_tool import browser
-from tools.file_editor_tool import file_editor
+from tools.file_editor_tool import file_editor, file_editor_direct
 
 __all__ = [
     "terminal",
@@ -20,4 +21,5 @@ __all__ = [
     "browser",
     "ui",
     "file_editor",
+    "file_editor_direct",
 ]

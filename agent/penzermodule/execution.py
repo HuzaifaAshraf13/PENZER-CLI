@@ -12,6 +12,8 @@ from tools.executor import confirm_action
 from tools.executor import requires_privilege_escalation, SUDO_INTERACTIVE_TIMEOUT
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
 from agent.activity_timeline import emit_activity_event, update_activity_event
+from tools.file_editor_tool import file_editor_direct
+from tools.terminal_tool import terminal_direct, terminal_check_job_direct, terminal_kill_direct
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,13 @@ PLUGIN_SUBPROCESS_TIMEOUT = TOOL_TERMINAL_DEFAULT_TIMEOUT
 NON_IDEMPOTENT_TOOLS = {"terminal", "run_bash", "run_python", "browser"}
 MAX_EXPLICIT_TOOL_TIMEOUT = 600
 TIMEOUT_MARGIN = 10  # headroom beyond executor.py's own internal timeout/cleanup
+
+DIRECT_TOOLS = {
+    "terminal": terminal_direct,
+    "terminal_check_job": terminal_check_job_direct,
+    "terminal_kill": terminal_kill_direct,
+    "file_editor": file_editor_direct,
+}
 
 _DANGEROUS_PLUGIN_PATTERNS = re.compile(
     r"rm\s+-rf\s+/|:\(\)\{.*\};\s*:|curl[^|\n]*\|\s*(sh|bash)|wget[^|\n]*\|\s*(sh|bash)"
@@ -56,6 +65,26 @@ def _call_timeout(name: str, args: dict) -> int:
     if escalates:
         return max(requested, SUDO_INTERACTIVE_TIMEOUT + 15) + TIMEOUT_MARGIN
     return requested + TIMEOUT_MARGIN
+
+
+def _requires_serial_execution(call: dict) -> bool:
+    """Keep side-effecting calls ordered within one model turn."""
+    name = str(call.get("name", ""))
+    args = call.get("arguments") or {}
+    if name in {"terminal_check_job", "terminal_kill", "file_editor"}:
+        if name != "file_editor":
+            return True
+        return str(args.get("action", "")).lower() in {"write", "append", "replace", "delete", "create", "move", "rename"}
+    if name == "terminal":
+        if args.get("background") or args.get("timeout") == 0:
+            return True
+        command = str(args.get("command") or args.get("script") or args.get("code") or "").lower()
+        return any(token in command for token in (
+            " > ", " >> ", "tee ", "mv ", "rm ", "cp ", "mkdir ", "touch ",
+            "chmod ", "chown ", "sed -i", "perl -pi", "pip install", "apt install",
+            "cd ",
+        ))
+    return name == "plugin_tool"
 
 
 def tool_confidence(agent, tool_name: str, args: dict) -> float:
@@ -98,7 +127,7 @@ async def execute_single_tool(agent, call: dict) -> tuple[str, float]:
         return raw, round(time.time() - start, 2)
     # Valid if it's a registered MCP tool, the plugin_tool creation
     # action, or a dynamically created plugin.
-    if name != "plugin_tool" and name not in agent._plugin_tools and name not in agent.tools:
+    if name != "plugin_tool" and name not in DIRECT_TOOLS and name not in agent._plugin_tools and name not in agent.tools:
         return f"Unknown tool '{name}'.", 0.0
     agent._safe_status(f"{TOOL_LABELS.get(name, name)} {agent._fmt_action(name, args)}")
     event_type = "plugin" if name == "plugin_tool" or name in agent._plugin_tools else "tool"
@@ -132,6 +161,8 @@ async def run_speculative(agent, calls: list) -> list[tuple[str, float]]:
     """
     if len(calls) <= 1:
         return await run_parallel(agent, calls)
+    if any(_requires_serial_execution(call) for call in calls):
+        return await run_sequential(agent, calls)
     if any(
         c.get("name") == "terminal" and requires_privilege_escalation(str(
             (c.get("arguments") or {}).get("command")
@@ -142,6 +173,13 @@ async def run_speculative(agent, calls: list) -> list[tuple[str, float]]:
     ):
         return await run_parallel(agent, calls)
     return await run_parallel(agent, calls)
+
+
+async def run_sequential(agent, calls: list) -> list[tuple[str, float]]:
+    results = []
+    for call in calls:
+        results.append(await execute_single_tool(agent, call))
+    return results
 
 
 async def run_race(agent, calls: list) -> list[tuple[str, float]]:
@@ -228,6 +266,10 @@ async def run(agent, name: str, args: dict) -> str:
     tools = getattr(agent, "tools", {}) or {}
     if name == "memory" or tools.get(name) == "builtin":
         return run_memory_tool(agent, args)
+    if name in DIRECT_TOOLS:
+        fn = DIRECT_TOOLS[name]
+        out = await fn(**args) if inspect.iscoroutinefunction(fn) else await asyncio.to_thread(fn, **args)
+        return str(out)
     if name == "plugin_tool":
         return await run_plugin_tool(agent, args)
     if name in agent._plugin_tools:

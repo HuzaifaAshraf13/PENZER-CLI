@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, asdict
 
 from config import get_profile_settings
 from agent.activity_timeline import emit_activity_event, update_activity_event
+from tools.sandbox import build_sandbox_command
 
 logger = logging.getLogger(__name__)
 
@@ -730,6 +731,8 @@ def execute(
         else:
             shell_command = command
         cmd = ["bash", "-c", shell_command]
+
+    cmd = build_sandbox_command(cmd, cwd)
 
     logger.info(f"executor[{mode}][{cwd}]: {command[:150]}")
 

@@ -30,8 +30,7 @@ def _requires_approval(action: str, filepath: Path | None) -> tuple[bool, str]:
     return False, ""
 
 
-@mcp.tool()
-def file_editor(action: str, filepath: str = None, content: str = None, 
+def file_editor_direct(action: str, filepath: str = None, content: str = None,
                 find: str = None, replace: str = None, line_start: int = None, 
                 line_end: int = None) -> dict:
     """
@@ -324,3 +323,18 @@ def file_editor(action: str, filepath: str = None, content: str = None,
     
     except Exception as e:
         return error(f"File editor error: {str(e)}")
+
+
+@mcp.tool()
+def file_editor(action: str, filepath: str = None, content: str = None,
+                find: str = None, replace: str = None, line_start: int = None,
+                line_end: int = None) -> dict:
+    return file_editor_direct(
+        action=action,
+        filepath=filepath,
+        content=content,
+        find=find,
+        replace=replace,
+        line_start=line_start,
+        line_end=line_end,
+    )

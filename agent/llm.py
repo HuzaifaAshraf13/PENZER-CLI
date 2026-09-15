@@ -261,9 +261,17 @@ class LLM:
             try:
                 return await self.model.create_chat_completion(messages, max_tokens=max_tokens)
             except httpx.HTTPStatusError as e:
+                # Rate limits are actionable immediately; waiting through the
+                # full retry schedule only makes the CLI look hung.
+                if e.response.status_code == 429:
+                    raise
                 if e.response.status_code in RETRYABLE_STATUS and attempt < len(RETRY_DELAYS) - 1:
                     last_error = e
                     continue
+                raise
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RemoteProtocolError):
+                # Surface provider connectivity failures immediately. The
+                # caller can report the problem without blocking for minutes.
                 raise
             except Exception as e:
                 last_error = e
