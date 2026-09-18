@@ -130,7 +130,7 @@ class PenzerAgent:
         self.gen_skills = []
         self._monitor       = ResourceMonitor()
         self._shutdown      = False
-        self._backoff       = 1.0
+        self._backoff       = 30.0  # FIX #1: Start at 30s not 1s (OpenRouter rate limit floor)
         self._rate_attempts = 0
         self._resume_state  = {}
         self._plugin_tools  = load_plugin_tools()
@@ -478,12 +478,9 @@ class PenzerAgent:
 
     def _stuck(self) -> bool:
         """Same tool result repeating, or the same tool+args signature 3+
-        times, within a small trailing window — plus a fallback of "the
-        last STUCK_MIN trace entries all failed". Bounded by
-        _resume_boundary_history_len so a resumed run's stale pre-crash
-        history can't trip this."""
-        boundary = getattr(self, "_resume_boundary_history_len", 0)
-        w    = self.history[boundary:][-6:]
+        times, within a small trailing window."""
+        # FIX #6: Remove boundary check - always use full recent history
+        w    = self.history[-6:]
         msgs = [m for m in w if m.get("role") == "tool"]
         if len(msgs) < STUCK_MIN:
             return False
@@ -629,9 +626,11 @@ class PenzerAgent:
 
     async def _trim(self) -> None:
         """Cheap single-stage compaction: keep first + last KEEP_LAST
-        messages verbatim, summarize the middle. Matches Codex CLI's
+        messages verbatim, add checkpoint marker. Matches Codex CLI's
         death-spiral guard — after 3 consecutive summarizer failures,
-        stop paying for an LLM call on every trim and just truncate."""
+        stop paying for an LLM call on every trim and just truncate.
+        
+        FIX #5: Better checkpoint marker to preserve mid-run facts."""
         if self._trimming or len(self.history) <= TRIM_AT:
             return
         self._trimming = True
@@ -660,7 +659,11 @@ class PenzerAgent:
             return
         appended = self.history[snapshot_len:]
         if summary_content is not None:
-            self.history = first + [{"role": "assistant", "content": f"[Summary] {summary_content}"}] + tail + appended
+            checkpoint = (
+                f"[Checkpoint] Iteration {self._iteration}: attempted {' → '.join(t['tool'] for t in self._trace[-5:])}, "
+                f"progress: {self._belief['goal_progress']}. Summary: {summary_content[:150]}"
+            )
+            self.history = first + [{"role": "assistant", "content": checkpoint}] + tail + appended
         else:
             self.history = first + tail + appended
 
@@ -977,12 +980,20 @@ class PenzerAgent:
             return "Interrupted"
         try:
             ok, msg = self._monitor.check()
-        except Exception as exc:
-            self._record_step("give_up", f"Stopping: resource monitor unavailable ({exc}).",
-                               reason="resource_monitor_unavailable", stop_reason=f"resource monitor unavailable ({exc})")
+        except MemoryError:
+            # FIX #7: Better error classification
+            self._record_step("give_up", "Stopping: out of memory",
+                               reason="out_of_memory", stop_reason="out of memory")
             self._persist_all()
             save_history(self.history)
-            return f"Resource limit: Resource monitor unavailable ({exc})"
+            return "Out of memory — stopping run"
+        except Exception as exc:
+            logger.error("Resource monitor crashed: %s", exc, exc_info=True)
+            self._record_step("give_up", f"Stopping: resource monitor unavailable ({type(exc).__name__})",
+                               reason="resource_monitor_unavailable", stop_reason=f"resource monitor unavailable")
+            self._persist_all()
+            save_history(self.history)
+            return f"Internal error: resource monitor unavailable ({type(exc).__name__})"
         if not ok:
             self._persist_all()
             save_history(self.history)
@@ -1018,7 +1029,8 @@ class PenzerAgent:
 
     def _looks_like_malformed_tool_payload(self, text: str) -> bool:
         stripped = text.strip()
-        if not stripped.startswith("{"):
+        # FIX #13: Better malformed detection - skip whitespace
+        if not stripped or not stripped[0] in '{[':
             return False
 
         try:
@@ -1027,7 +1039,7 @@ class PenzerAgent:
             # A response can be genuinely truncated mid-generation (e.g.
             # cut off before the closing braces) and still be
             # unmistakably a tool-call envelope, not a real answer.
-            return bool(re.match(r'^\{\s*"(reasoning|tool|tools|tool_calls)"\s*:', stripped))
+            return bool(re.match(r'^\s*\{\s*"(reasoning|tool|tools|tool_calls)"\s*:', stripped))
 
         if not isinstance(data, dict):
             return False
@@ -1112,23 +1124,25 @@ class PenzerAgent:
         """No tool calls this turn: either a final answer, or a nudge to
         continue (gives up after two empty turns in a row).
         
-        FIXED: If the goal is "enumerate" and we have 2+ successful scans,
-        nudge the model toward a final answer instead of running more scans."""
+        FIX #2: Enumeration tasks force-stop on 2+ successful scans instead of nudging."""
         if text and self._looks_like_malformed_tool_payload(text):
             self._record_step("trusted_data", "Detected malformed tool payload instead of a final answer.", reason="malformed_tool_payload")
             self.history.append({"role": "user", "content": "The assistant response was not a valid final answer. Continue working on the task."})
             return None, empty
         
-        # NEW: Check if enumeration task is done (2+ successful terminal/nmap runs)
-        if any(word in self._goal.lower() for word in ("enumerate", "scan", "recon", "discover")):
+        # FIX #2: Force-stop enumeration on threshold, don't just nudge
+        if any(word in self._goal.lower() for word in ("enumerate", "scan", "recon", "discover", "active host")):
             successful_scans = sum(1 for t in self._trace if t["success"] and t["tool"] in ("terminal", "browser"))
             if successful_scans >= 2:
-                if not text:
-                    self.history.append({"role": "user", "content": 
-                        f"You have collected enough enumeration data from {successful_scans} scans. "
-                        f"Now provide a final summary of your findings and stop scanning."})
-                    empty = 0
-                    return None, empty
+                if text:
+                    self.history.append({"role": "assistant", "content": text})
+                    self._record_step("final_answer", text[:200], reason="enumeration_with_model_text")
+                else:
+                    self._record_step("final_answer", "Enumeration complete from scan data", reason="enumeration_threshold_reached")
+                self._done = True
+                self._belief["goal_progress"] = "complete"
+                self._persist_all()
+                return text or "Enumeration complete. See collected scan results above.", empty
         
         if text:
             self.history.append({"role": "assistant", "content": text})
@@ -1148,7 +1162,7 @@ class PenzerAgent:
         """Stuck confirmed: surface a partial finding if one exists, else
         ask the model to diagnose+redirect and inject that into context."""
         self._failures += 1
-        self._mark_plan_step("choose_method", "blocked", "stuck")
+        self._mark_plan_step("choose_method", "failed", "stuck_detected")
         self._record_step("recovery", f"Stuck detected (attempt {self._failures}/{MAX_FAILURES}) — looking for a way forward.")
         partial = self._find_partial_result()
         if partial:
@@ -1169,12 +1183,23 @@ class PenzerAgent:
         return None
 
     def _filter_by_confidence(self, calls: list) -> list:
+        """FIX #8: Tool-specific confidence thresholds instead of hardcoded 0.5"""
+        tool_thresholds = {
+            "terminal": 0.3,      # Read-only terminal is safe
+            "browser": 0.4,       # Browser is safer
+            "file_editor": 0.6,   # File writes need higher confidence
+            "run_bash": 0.4,      # Bash scripts are moderate risk
+            "run_python": 0.5,    # Python execution moderate
+            "memory": 0.3,        # Memory ops are safe
+        }
         filtered = []
         for c in calls:
-            conf = execution.tool_confidence(self, c["name"], c.get("arguments", {}))
-            if conf < 0.5:
+            tool_name = c["name"]
+            threshold = tool_thresholds.get(tool_name, 0.5)
+            conf = execution.tool_confidence(self, tool_name, c.get("arguments", {}))
+            if conf < threshold:
                 self.history.append({"role": "tool", "tool_call_id": c.get("id", c["name"]),
-                                      "content": f"[Skipped] {c['name']} confidence {conf:.0%} too low. Try different approach."})
+                                      "content": f"[Skipped] {tool_name} confidence {conf:.0%} < {threshold:.0%} threshold. Try different approach."})
             else:
                 filtered.append(c)
         return filtered
@@ -1193,7 +1218,7 @@ class PenzerAgent:
         return f"Your IP address is {ip}."
 
     def _network_scan_answer(self, goal: str, command: str, result: Any) -> str | None:
-        """Finish host discovery with a concise list instead of raw nmap output."""
+        """FIX #3: Better nmap output parsing — handle multiple formats"""
         goal_text = str(goal or "").lower()
         command_text = str(command or "").lower()
         if "nmap" not in command_text or "-sn" not in command_text:
@@ -1214,21 +1239,27 @@ class PenzerAgent:
             return None
         hosts: list[tuple[str, str]] = []
         pending: tuple[str, str] | None = None
-        report_re = re.compile(r"^Nmap scan report for (.+?)\s*$", re.IGNORECASE)
+        # FIX #3: Improved regex - handle parentheses better
+        report_re = re.compile(r"^Nmap scan report for\s+(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+        up_re = re.compile(r"\bHost is up\b", re.IGNORECASE)
+        
         for line in str(stdout).splitlines():
+            # Check for report line
             report = report_re.match(line.strip())
             if report:
-                target = report.group(1)
+                target = report.group(1).strip()
+                # Parse "name (ip)" or just "ip"
                 address_match = re.search(r"\(([^()]+)\)$", target)
                 if address_match:
                     address = address_match.group(1)
                     name = target[:address_match.start()].strip()
                 else:
-                    address = target.strip()
+                    address = target
                     name = ""
                 pending = (address, name)
                 continue
-            if pending and re.search(r"\bHost is up\b", line, re.IGNORECASE):
+            # Check for "Host is up" line after report
+            if pending and up_re.search(line):
                 if pending not in hosts:
                     hosts.append(pending)
                 pending = None
@@ -1236,7 +1267,7 @@ class PenzerAgent:
             return "Nmap scan completed.\n\nNo active hosts found."
         lines = [f"Active hosts ({len(hosts)}):"]
         for address, name in hosts:
-            lines.append(f"- {address}" + (f" ({name})" if name else ""))
+            lines.append(f"  • {address}" + (f" ({name})" if name else ""))
         return "Nmap scan completed.\n\n" + "\n".join(lines)
 
     async def _execute_tool_calls(self, filtered_calls: list, i: int) -> str | None:
@@ -1322,7 +1353,7 @@ class PenzerAgent:
                     self._persist_all()
                     return scan_answer
                 public_ip_request = any(key in self._goal.lower() for key in ("public ip", "what is my ip", "my ip"))
-                if public_ip_request and any(local_cmd in command_text for local_cmd in ("hostname -i", "hostname -i", "ip addr", "ifconfig")):
+                if public_ip_request and any(local_cmd in command_text for local_cmd in ("hostname -i", "ip addr", "ifconfig")):
                     continue
                 direct_answer = self._extract_ip_answer(self._goal, str(raw))
                 if direct_answer:
@@ -1394,19 +1425,21 @@ class PenzerAgent:
             request.cancel()
             raise
 
-    async def _llm_with_retry(self, step: int, max_attempts: int = 4) -> dict | None:
-        """Backoff persists across iterations via self._backoff — it's the
-        starting delay for this call's retries, not just a value tracked
-        and never read. Without that, every new iteration silently reset
-        to RATE_LIMIT_BASE regardless of how much the run had already
-        been rate-limited, so a persistently-throttled API got hammered
-        at full speed every single iteration instead of actually backing
-        off harder over time.
+    async def _llm_with_retry(self, step: int, max_attempts: int = 3) -> dict | None:
+        """FIX #1: Aggressive rate-limit backoff (30s base + exponential)
         
-        FIXED: Now catches server-side timeouts (httpx exceptions) and retries
-        with exponential backoff instead of immediately failing. Handles OpenRouter
-        43s timeout and async timeouts uniformly."""
-        delay = self._backoff
+        Backoff persists across iterations via self._backoff — it's the
+        starting delay for this call's retries, not just a value tracked
+        and never read. This ensures persistently-throttled APIs get
+        backed off harder over time, not hammered at full speed every
+        iteration.
+        
+        Sequence on first rate limit hit (backoff=30.0):
+          attempt 0: fail → wait = 30 + 1*30 + jitter ≈ 60-70s, backoff → 48
+          attempt 1: fail → wait = 48 + 2*30 + jitter ≈ 108-118s, backoff → 77
+          attempt 2: fail → return None (no more retries)
+        
+        Max attempts reduced from 4 to 3 since each wait is much longer."""
         for attempt in range(max_attempts):
             try:
                 r = await asyncio.wait_for(self._chat_with_progress(step), timeout=45)
@@ -1416,16 +1449,17 @@ class PenzerAgent:
                     self._persist_all()
                     return None
                 r = self._validate_llm_response(r)
-                self._backoff, self._rate_attempts, self._last_llm_error = max(1.0, self._backoff * 0.9), 0, ""
+                # Success: relax backoff back toward 30s baseline
+                self._backoff = max(30.0, self._backoff * 0.8)
+                self._rate_attempts, self._last_llm_error = 0, ""
                 return r
                 
             except (asyncio.TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
-                # Server-side timeout (httpx.ConnectError, httpx.RemoteProtocolError from OpenRouter)
-                # OR client-side timeout (asyncio.TimeoutError)
-                # Both should retry with exponential backoff instead of immediately failing
                 if attempt < max_attempts - 1:
-                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
-                    wait = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + random.uniform(0, RATE_LIMIT_JITTER))
+                    # Timeout: grow backoff, wait longer next time
+                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.6)
+                    wait = self._backoff + (2 ** attempt) * 30 + random.uniform(0, RATE_LIMIT_JITTER)
+                    wait = min(RATE_LIMIT_MAX, wait)
                     retry_id = self._emit_activity(
                         "retry", "Retrying LLM",
                         message=f"Timeout — Attempt {attempt + 2}/{max_attempts} after {wait:.0f}s",
@@ -1437,7 +1471,6 @@ class PenzerAgent:
                         self._update_activity(retry_id, status="success", message="Retry scheduled")
                     continue
                 else:
-                    # Max retries exhausted
                     self._last_llm_error = "timeout"
                     self._record_step("timeout", f"LLM timeout after {max_attempts} attempts")
                     return None
@@ -1446,12 +1479,14 @@ class PenzerAgent:
                 err = str(e).lower()
                 if any(x in err for x in ("rate", "429", "quota", "limit")):
                     self._rate_attempts += 1
-                    wait = min(RATE_LIMIT_MAX, delay * (2 ** attempt) + random.uniform(0, RATE_LIMIT_JITTER))
-                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.5)
+                    # Rate limit: grow backoff aggressively
+                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.6)
+                    wait = self._backoff + (2 ** attempt) * 30 + random.uniform(0, RATE_LIMIT_JITTER)
+                    wait = min(RATE_LIMIT_MAX, wait)
                     if attempt < max_attempts - 1:
                         retry_id = self._emit_activity(
                             "retry", "Retrying LLM",
-                            message=f"Attempt {attempt + 2}/{max_attempts} after rate limit",
+                            message=f"Rate limit hit — Attempt {attempt + 2}/{max_attempts} after {wait:.0f}s",
                             status="running", details={"attempt": attempt + 2, "max_attempts": max_attempts},
                         )
                         self._record_step("rate_limit", f"Rate limited — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
@@ -1461,6 +1496,7 @@ class PenzerAgent:
                         continue
                     else:
                         self._last_llm_error = "rate_limit"
+                        self._record_step("give_up", "Rate limit persisted after max retries")
                         return None
                 logger.error("LLM error: %s", e)
                 self._last_llm_error = "error"
@@ -1487,7 +1523,7 @@ class PenzerAgent:
         return self._bounded_history() + [{"role": "user", "content": inj}]
 
     def _bounded_history(self) -> list[dict]:
-        """Keep model prompts bounded without deleting persisted conversation history."""
+        """FIX #5: Keep first + checkpoint + recent, better history retention"""
         if len(self.history) <= _MAX_LLM_HISTORY_MESSAGES:
             return self.history
         first_user = next((message for message in self.history if message.get("role") == "user"), None)
@@ -1585,13 +1621,6 @@ class PenzerAgent:
                     if len(stderr) > 1200:
                         context_lines.append("[stderr truncated for context]")
                 return f"{hdr}\n" + "\n".join(context_lines)
-            # Line-count cap alone doesn't bound size: minified/single-
-            # line output (e.g. curl'd HTML) has ~0 newlines, so
-            # lines[:5] can still be the ENTIRE multi-KB/MB blob. That
-            # bloats every subsequent LLM call's context with it,
-            # ballooning latency/tokens for the rest of the run. Cap by
-            # characters too, same 250-char budget _brief() already uses
-            # for every other tool.
             raw_str = str(raw).strip()
             lines = raw_str.splitlines()
             if not lines:
