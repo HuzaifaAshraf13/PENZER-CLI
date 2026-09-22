@@ -12,8 +12,9 @@ from tools.executor import confirm_action
 from tools.executor import requires_privilege_escalation, SUDO_INTERACTIVE_TIMEOUT
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
 from agent.activity_timeline import emit_activity_event, update_activity_event
-from tools.file_editor_tool import file_editor_direct
-from tools.terminal_tool import terminal_direct, terminal_check_job_direct, terminal_kill_direct
+from tools.file_editor.tool import file_editor_direct
+from tools.terminal.tool import terminal_direct, terminal_check_job_direct, terminal_kill_direct
+from tools.browser.tool import browser_direct, browser_info_direct, browser_close_direct
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,9 @@ DIRECT_TOOLS = {
     "terminal_check_job": terminal_check_job_direct,
     "terminal_kill": terminal_kill_direct,
     "file_editor": file_editor_direct,
+    "browser": browser_direct,
+    "browser_info": browser_info_direct,
+    "browser_close": browser_close_direct,
 }
 
 _DANGEROUS_PLUGIN_PATTERNS = re.compile(

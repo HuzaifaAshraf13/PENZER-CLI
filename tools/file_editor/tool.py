@@ -1,4 +1,4 @@
-# tools/file_editor_tool.py
+# tools/file_editor/tool.py
 """
 File Editor Tool: Read, write, edit, delete, and manage files.
 """

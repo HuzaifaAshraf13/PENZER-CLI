@@ -51,6 +51,7 @@ from agent.config import (
     ITER_EXTENSION_SIZE, MAX_RUNTIME_SECONDS, ABSOLUTE_MAX_ITER,
     MAX_TOKENS_PER_RUN, CHECKPOINT_EVERY, COMPLEX_THRESHOLD,
     RATE_LIMIT_BASE, RATE_LIMIT_MAX, RATE_LIMIT_JITTER,
+    LLM_REQUEST_TIMEOUT, LLM_MAX_RETRIES,
     WORKING_MEMORY_SIZE, ACTION_FORMATTERS, ERROR_PATTERNS,
 )
 import httpx
@@ -238,6 +239,9 @@ class PenzerAgent:
             "terminal_check_job": execution.DIRECT_TOOLS["terminal_check_job"],
             "terminal_kill": execution.DIRECT_TOOLS["terminal_kill"],
             "file_editor": execution.DIRECT_TOOLS["file_editor"],
+            "browser": execution.DIRECT_TOOLS["browser"],
+            "browser_info": execution.DIRECT_TOOLS["browser_info"],
+            "browser_close": execution.DIRECT_TOOLS["browser_close"],
         })
         self.tools.setdefault("memory", "builtin")
         return self
@@ -941,6 +945,14 @@ class PenzerAgent:
     def _check_stop_conditions(self, i: int) -> str | None:
         """Iteration/time/token/shutdown/resource limits. Returns a
         terminal result if the loop should stop now, else None."""
+        elapsed = time.time() - self._run_start_time
+        if elapsed > MAX_RUNTIME_SECONDS:
+            self._belief["goal_progress"] = "failed"
+            reason = f"time budget exceeded ({MAX_RUNTIME_SECONDS}s)"
+            self._record_step("give_up", f"Stopping: {reason}.", reason="stop_condition", stop_reason=reason)
+            self._persist_all()
+            save_history(self.history)
+            return f"Stopped: {reason}. Use resume to continue."
         if i >= self._max_iter:
             if self._can_extend_iterations():
                 self._max_iter += ITER_EXTENSION_SIZE
@@ -1425,24 +1437,15 @@ class PenzerAgent:
             request.cancel()
             raise
 
-    async def _llm_with_retry(self, step: int, max_attempts: int = 3) -> dict | None:
-        """FIX #1: Aggressive rate-limit backoff (30s base + exponential)
-        
-        Backoff persists across iterations via self._backoff — it's the
-        starting delay for this call's retries, not just a value tracked
-        and never read. This ensures persistently-throttled APIs get
-        backed off harder over time, not hammered at full speed every
-        iteration.
-        
-        Sequence on first rate limit hit (backoff=30.0):
-          attempt 0: fail → wait = 30 + 1*30 + jitter ≈ 60-70s, backoff → 48
-          attempt 1: fail → wait = 48 + 2*30 + jitter ≈ 108-118s, backoff → 77
-          attempt 2: fail → return None (no more retries)
-        
-        Max attempts reduced from 4 to 3 since each wait is much longer."""
+    async def _llm_with_retry(self, step: int, max_attempts: int = LLM_MAX_RETRIES) -> dict | None:
+        """Retry transient provider failures briefly, then fail fast.
+
+        A rate-limited or stalled provider must not hold the interactive REPL
+        for minutes. The run snapshot remains resumable for a later attempt.
+        """
         for attempt in range(max_attempts):
             try:
-                r = await asyncio.wait_for(self._chat_with_progress(step), timeout=45)
+                r = await asyncio.wait_for(self._chat_with_progress(step), timeout=LLM_REQUEST_TIMEOUT)
                 if r.get("error"):
                     self._last_llm_error = str(r.get("error_type") or "llm_error")
                     self._failed = True
@@ -1456,16 +1459,13 @@ class PenzerAgent:
                 
             except (asyncio.TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
                 if attempt < max_attempts - 1:
-                    # Timeout: grow backoff, wait longer next time
-                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.6)
-                    wait = self._backoff + (2 ** attempt) * 30 + random.uniform(0, RATE_LIMIT_JITTER)
-                    wait = min(RATE_LIMIT_MAX, wait)
+                    wait = min(RATE_LIMIT_MAX, RATE_LIMIT_BASE + random.uniform(0, RATE_LIMIT_JITTER))
                     retry_id = self._emit_activity(
                         "retry", "Retrying LLM",
                         message=f"Timeout — Attempt {attempt + 2}/{max_attempts} after {wait:.0f}s",
                         status="running", details={"attempt": attempt + 2, "max_attempts": max_attempts, "error_type": type(e).__name__},
                     )
-                    self._record_step("timeout", f"LLM timeout ({type(e).__name__}) — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
+                    self._record_step("timeout", f"LLM timeout ({type(e).__name__}) — retrying once in {wait:.1f}s")
                     await asyncio.sleep(wait)
                     if retry_id:
                         self._update_activity(retry_id, status="success", message="Retry scheduled")
@@ -1479,17 +1479,14 @@ class PenzerAgent:
                 err = str(e).lower()
                 if any(x in err for x in ("rate", "429", "quota", "limit")):
                     self._rate_attempts += 1
-                    # Rate limit: grow backoff aggressively
-                    self._backoff = min(RATE_LIMIT_MAX, self._backoff * 1.6)
-                    wait = self._backoff + (2 ** attempt) * 30 + random.uniform(0, RATE_LIMIT_JITTER)
-                    wait = min(RATE_LIMIT_MAX, wait)
+                    wait = min(RATE_LIMIT_MAX, RATE_LIMIT_BASE + random.uniform(0, RATE_LIMIT_JITTER))
                     if attempt < max_attempts - 1:
                         retry_id = self._emit_activity(
                             "retry", "Retrying LLM",
                             message=f"Rate limit hit — Attempt {attempt + 2}/{max_attempts} after {wait:.0f}s",
                             status="running", details={"attempt": attempt + 2, "max_attempts": max_attempts},
                         )
-                        self._record_step("rate_limit", f"Rate limited — waiting {wait:.0f}s before retry {attempt + 1}/{max_attempts}")
+                        self._record_step("rate_limit", f"Rate limited — retrying once in {wait:.1f}s")
                         await asyncio.sleep(wait)
                         if retry_id:
                             self._update_activity(retry_id, status="success", message="Retry scheduled")

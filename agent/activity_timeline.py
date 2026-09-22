@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,10 +75,13 @@ class ActivityTimeline:
         if message:
             bits.append(message)
         details = event.get("details") or {}
-        if details:
-            detail_text = ", ".join(f"{k}={v}" for k, v in details.items() if v not in (None, ""))
-            if detail_text:
-                bits.append(detail_text)
+        if not details:
+            return " | ".join(bits)
+        event_type = event.get("event_type")
+        handler = self._DRAWER_HANDLERS.get(event_type, _render_generic_details)
+        detail_lines = handler(details, compact=False)
+        if detail_lines:
+            bits.append("; ".join(line.strip(" •") for line in detail_lines))
         return " | ".join(bits)
 
     def render_drawer(self) -> str:
@@ -174,6 +179,44 @@ def _short_text(value: Any, limit: int = DETAIL_LIMIT_COMPACT) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _parse_result(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    text = str(value or "").strip()
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, SyntaxError, json.JSONDecodeError):
+            continue
+    return None
+
+
+def _result_summary(value: Any, compact: bool) -> list[str]:
+    parsed = _parse_result(value)
+    if not parsed:
+        return [f"    • result: {_short_text(value, DETAIL_LIMIT_COMPACT if compact else DETAIL_LIMIT_FULL)}"]
+    lines: list[str] = []
+    status = parsed.get("status")
+    if status:
+        lines.append(f"    • status: {status}")
+    if parsed.get("error"):
+        lines.append(f"    • error: {_short_text(parsed['error'], DETAIL_LIMIT_FULL)}")
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+    for key in ("action", "url", "title", "element_count", "session_id", "attached", "login_confirmed", "exit_code", "cwd"):
+        if data.get(key) not in (None, ""):
+            lines.append(f"    • {key.replace('_', ' ')}: {_short_text(data[key], DETAIL_LIMIT_FULL)}")
+    for key in ("stdout", "stderr", "content"):
+        text = str(data.get(key) or "").strip()
+        if text:
+            label = "output" if key == "stdout" else key
+            lines.append(f"    • {label}: {_short_text(text.splitlines()[0], DETAIL_LIMIT_FULL)}")
+    if not lines:
+        lines.append(f"    • result: {_short_text(value, DETAIL_LIMIT_COMPACT if compact else DETAIL_LIMIT_FULL)}")
+    return lines
+
+
 def _format_details(details: dict[str, Any], prefix: str = "    • ") -> list[str]:
     """Shared formatter used by render_text for generic key/value detail dumps."""
     lines: list[str] = []
@@ -207,22 +250,22 @@ def _render_terminal_details(details: dict[str, Any], compact: bool) -> list[str
         stdout = details.get("stdout")
         stderr = details.get("stderr")
         if isinstance(stdout, str) and stdout.strip():
-            lines.append(f"    • stdout: {stdout.strip().splitlines()[0]}")
+            lines.append(f"    • output: {_short_text(stdout.strip().splitlines()[0])}")
         elif isinstance(stderr, str) and stderr.strip():
-            lines.append(f"    • stderr: {stderr.strip().splitlines()[0]}")
+            lines.append(f"    • stderr: {_short_text(stderr.strip().splitlines()[0])}")
     else:
         if details.get("mode"):
             lines.append(f"    • mode: {details.get('mode')}")
         stdout = details.get("stdout")
         if isinstance(stdout, str) and stdout.strip():
-            lines.append("    • stdout:")
+            lines.append("    • output:")
             for line in stdout.strip().splitlines()[:3]:
-                lines.append(f"      {line}")
+                lines.append(f"      {_short_text(line, DETAIL_LIMIT_FULL)}")
         stderr = details.get("stderr")
         if isinstance(stderr, str) and stderr.strip():
             lines.append("    • stderr:")
             for line in stderr.strip().splitlines()[:3]:
-                lines.append(f"      {line}")
+                lines.append(f"      {_short_text(line, DETAIL_LIMIT_FULL)}")
     return lines
 
 
@@ -308,8 +351,7 @@ def _render_tool_details(details: dict[str, Any], compact: bool) -> list[str]:
     if details.get("tool"):
         lines.append(f"    • tool: {details.get('tool')}")
     if details.get("result") is not None:
-        limit = DETAIL_LIMIT_COMPACT if compact else DETAIL_LIMIT_FULL
-        lines.append(f"    • result: {_short_text(details.get('result'), limit)}")
+        lines.extend(_result_summary(details.get("result"), compact))
     if not compact and details.get("args"):
         lines.append(f"    • args: {_short_text(details.get('args'), DETAIL_LIMIT_FULL)}")
     return lines

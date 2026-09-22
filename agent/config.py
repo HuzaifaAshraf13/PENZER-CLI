@@ -25,8 +25,10 @@ CHECKPOINT_EVERY     = 10
 MEMORY_CRITICAL      = 85
 COMPLEX_THRESHOLD    = 3
 RATE_LIMIT_BASE      = 5.0
-RATE_LIMIT_MAX       = 60.0
-RATE_LIMIT_JITTER    = 2.0
+RATE_LIMIT_MAX       = 5.0
+RATE_LIMIT_JITTER    = 0.5
+LLM_REQUEST_TIMEOUT  = 30
+LLM_MAX_RETRIES      = 2
 WORKING_MEMORY_SIZE  = 7
 # Circuit breaker: if _check_consistency() reports violations on this
 # many consecutive checkpoints, the run force-stops rather than let a
