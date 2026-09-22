@@ -12,6 +12,9 @@ import json
 import logging
 import os
 import re
+import socket
+import subprocess
+import time
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +37,12 @@ DOWNLOAD_ROOT = PROJECT_ROOT / "data" / "browser_downloads"
 MAX_OBSERVE_ELEMENTS = 80
 MAX_TEXT = 500
 SAFE_SCHEMES = {"http", "https"}
+DEFAULT_DEBUGGER_ADDRESS = "127.0.0.1:9222"
+CHROME_BINARY = os.getenv("PENZER_CHROME_BINARY", "google-chrome")
+CHROME_USER_DATA_DIR = os.getenv(
+    "PENZER_CHROME_USER_DATA_DIR", str(Path.home() / ".config" / "google-chrome-penzer")
+)
+CHROME_PROFILE_DIRECTORY = os.getenv("PENZER_CHROME_PROFILE", "Default")
 
 
 @dataclass
@@ -44,6 +53,8 @@ class BrowserState:
     cdp_available: bool = False
     attached: bool = False
     login_confirmed: bool = False
+    original_handle: str | None = None
+    background_handle: str | None = None
 
 
 _drivers: dict[str, webdriver.Chrome] = {}
@@ -119,7 +130,100 @@ def _persist_state(driver: webdriver.Chrome, session_id: str) -> None:
         logger.debug("Could not persist browser session %s", session_id, exc_info=True)
 
 
-def _get_driver(session_id: str = "default", attach_existing: bool = False,
+def _prepare_background_target(driver: webdriver.Chrome, state: BrowserState) -> None:
+    """Keep automation out of the user's active tab and window focus."""
+    state.original_handle = driver.current_window_handle
+    target = driver.execute_cdp_cmd(
+        "Target.createTarget", {"url": "about:blank", "background": True}
+    )
+    handle = target.get("targetId") if isinstance(target, dict) else None
+    if not handle:
+        raise WebDriverException("Chrome did not return a background target")
+    driver.switch_to.window(handle)
+    state.background_handle = handle
+
+
+def _debugger_available(address: str) -> bool:
+    host, separator, port = address.rpartition(":")
+    if not separator or not host:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.5):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _chrome_process_running(data_dir: Path | None = None) -> bool:
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if CHROME_BINARY in command and "--type=" not in command and (
+            data_dir is None or f"--user-data-dir={data_dir}" in command
+        ):
+            return True
+    return False
+
+
+def _harden_profile_permissions() -> None:
+    target = Path(CHROME_USER_DATA_DIR)
+    if not target.exists():
+        return
+    try:
+        target.chmod(0o700)
+        for path in target.rglob("*"):
+            if path.is_symlink():
+                continue
+            path.chmod(0o700 if path.is_dir() else 0o600)
+    except OSError as exc:
+        raise WebDriverException(
+            f"Could not secure Chrome profile permissions: {exc}"
+        ) from exc
+
+
+def _prepare_profile() -> None:
+    target = Path(CHROME_USER_DATA_DIR)
+    target.mkdir(parents=True, exist_ok=True)
+    _harden_profile_permissions()
+
+
+def _start_profile_chrome(address: str) -> bool:
+    if _chrome_process_running(Path(CHROME_USER_DATA_DIR)):
+        return False
+    host, _, port = address.rpartition(":")
+    if not host or not port:
+        return False
+    try:
+        _prepare_profile()
+        subprocess.Popen(
+            [
+                CHROME_BINARY,
+                "--headless=new",
+                f"--remote-debugging-address={host}",
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={CHROME_USER_DATA_DIR}",
+                f"--profile-directory={CHROME_PROFILE_DIRECTORY}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-gpu",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _debugger_available(address):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _get_driver(session_id: str = "default", attach_existing: bool = True,
                 debugger_address: str | None = None) -> webdriver.Chrome:
     with _lock:
         if session_id in _drivers:
@@ -132,9 +236,18 @@ def _get_driver(session_id: str = "default", attach_existing: bool = False,
         options = Options()
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        address = debugger_address or os.getenv("PENZER_BROWSER_DEBUGGER_ADDRESS", "").strip()
-        if attach_existing and not address:
-            return None
+        address = (
+            debugger_address
+            or os.getenv("PENZER_BROWSER_DEBUGGER_ADDRESS", "").strip()
+            or DEFAULT_DEBUGGER_ADDRESS
+        )
+        if not _debugger_available(address):
+            _start_profile_chrome(address)
+        if not _debugger_available(address):
+            raise WebDriverException(
+                f"Chrome remote debugging is unavailable at {address}; "
+                "Penzer could not start its background profile"
+            )
         if address:
             options.add_experimental_option("debuggerAddress", address)
         options.add_experimental_option("prefs", {
@@ -150,7 +263,7 @@ def _get_driver(session_id: str = "default", attach_existing: bool = False,
         state.bidi_available = callable(getattr(driver, "bidi_connection", None))
         state.cdp_available = callable(getattr(driver, "execute_cdp_cmd", None))
         _drivers[session_id] = driver
-        _load_persisted_state(driver, session_id)
+        _prepare_background_target(driver, state)
         return driver
 
 
@@ -264,11 +377,16 @@ def _browser_impl(action: str, query: str = None, url: str = None,
                   amount: int = 600, direction: str = "down", index: int = None,
                   key: str = None, value: str = None, allowed_hosts: list[str] = None,
                   subaction: str = "list", cookie: dict = None,
-                  attach_existing: bool = False, debugger_address: str = None) -> dict:
+                  attach_existing: bool = True, debugger_address: str = None) -> dict:
     attach_existing = attach_existing or action.lower() == "attach"
-    if attach_existing and not (debugger_address or os.getenv("PENZER_BROWSER_DEBUGGER_ADDRESS", "").strip()):
-        return error("Attach mode requires debugger_address or PENZER_BROWSER_DEBUGGER_ADDRESS.")
-    driver = _get_driver(session_id, attach_existing=attach_existing, debugger_address=debugger_address)
+    try:
+        driver = _get_driver(
+            session_id,
+            attach_existing=attach_existing,
+            debugger_address=debugger_address,
+        )
+    except WebDriverException as exc:
+        return error(f"Could not attach to Chrome at the debugging endpoint: {exc}")
     if driver is None:
         return error("Could not attach to an existing Chrome session.")
     state = _state(session_id)
@@ -406,7 +524,7 @@ def browser_direct(action: str, query: str = None, url: str = None, selector: st
                    element_id: str = None, amount: int = 600, direction: str = "down",
                    index: int = None, key: str = None, value: str = None,
                    allowed_hosts: list[str] = None, subaction: str = "list",
-                   cookie: dict = None, attach_existing: bool = False,
+                   cookie: dict = None, attach_existing: bool = True,
                    debugger_address: str = None) -> dict:
     return _browser_impl(action, query, url, selector, text, timeout, session_id,
                          element_id, amount, direction, index, key, value,
@@ -421,6 +539,10 @@ def browser(**kwargs) -> dict:
 def browser_info_direct(session_id: str = "default") -> dict:
     try:
         driver = _get_driver(session_id)
+        if driver is None:
+            return error(
+                f"Chrome remote debugging is unavailable at {DEFAULT_DEBUGGER_ADDRESS}."
+            )
         state = _state(session_id)
         return success(data={
             "session_id": session_id,
@@ -432,6 +554,13 @@ def browser_info_direct(session_id: str = "default") -> dict:
             "attached": state.attached,
             "login_confirmed": state.login_confirmed,
         })
+    except WebDriverException:
+        return error(
+            f"Cannot attach to Chrome at {DEFAULT_DEBUGGER_ADDRESS}; "
+            "Chrome may already be open without remote debugging. "
+            "Close it once, then rerun Penzer so it can start the real profile "
+            "in background mode."
+        )
     except Exception as exc:
         return error(f"Failed to get browser info: {exc}")
 
@@ -446,8 +575,10 @@ def browser_close_direct(session_id: str = "default") -> dict:
         if not driver:
             return warning(data={}, message=f"Session {session_id} not found")
         try:
-            _persist_state(driver, session_id)
-            driver.quit()
+            state = _state(session_id)
+            if state.background_handle in driver.window_handles:
+                driver.switch_to.window(state.background_handle)
+                driver.close()
             _drivers.pop(session_id, None)
             _states.pop(session_id, None)
             return success(data={"closed": session_id})

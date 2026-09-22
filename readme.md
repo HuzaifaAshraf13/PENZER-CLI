@@ -129,6 +129,31 @@ apikey local http://localhost:8000
 
 ---
 
+## Browser automation
+
+Penzer uses Selenium 4 with Google Chrome or Chromium. Browser work always runs in its own persistent headless profile at `~/.config/google-chrome-penzer`, so no visible tabs are opened during agent tasks. It never copies or uses your normal Chrome profile.
+
+Prepare the profile and sign in once:
+
+```bash
+google-chrome \
+  --user-data-dir="$HOME/.config/google-chrome-penzer" \
+  --profile-directory=Default
+```
+
+1. Run the command above.
+2. Log into the websites Penzer should use. Repeat this step whenever you add a new site.
+3. Close Chrome completely.
+4. Start Penzer with `penzer`.
+
+Penzer starts the same profile in background mode and reuses its cookies, local storage, and active sessions. Your normal Chrome windows and tabs are not modified. New logins made later in your normal Chrome profile are not synchronized automatically.
+
+The default profile is `Default`. Select another profile before setup with `PENZER_CHROME_PROFILE="Profile 1"` or `PENZER_CHROME_PROFILE="Profile 2"`.
+
+The profile contains sensitive browser state. Penzer restricts its profile files to your Linux user, and Chrome encrypts supported cookies and credentials using the local browser/OS encryption service. This is not a full encrypted vault: another process running as your user may still access the profile while Chrome is running. Never commit or upload `~/.config/google-chrome-penzer`; it is ignored by Git.
+
+---
+
 ## Main commands
 
 ```text

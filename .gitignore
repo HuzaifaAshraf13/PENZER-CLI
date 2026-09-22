@@ -58,6 +58,10 @@ agent_memory.json
 .penzer/
 generated/
 
+# Local Chrome browser state; contains cookies, sessions, and profile data
+google-chrome-penzer/
+/.config/google-chrome-penzer/
+
 # Project planning / local docs
 project.md
 roadmap.md
