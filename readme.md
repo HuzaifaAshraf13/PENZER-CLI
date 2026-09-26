@@ -130,6 +130,14 @@ apikey local http://localhost:8000
 ---
 
 ## Browser automation
+**Features:**
+- Chrome DevTools Protocol via cdpify
+- Headless browser control (open, navigate, wait)
+- Element snapshots with refs (@e1, @e2, etc.)
+- Click, type, screenshot, extract content
+- Page evaluation (JavaScript)
+- Session management (multi-browser support)
+- Automatic element detection (buttons, links, inputs, clickable)
 
 ---
 
