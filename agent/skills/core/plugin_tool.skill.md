@@ -3,7 +3,7 @@ skill_id: core.plugin_tool
 name: Plugin Tool Creator
 description: Reuse or create Python plugin tools for repetitive tasks and persist them under tools/plugins.
 keywords: [plugin, tool, create, python, generate, extend, automate, custom tool, reuse]
-mcp_tools: [terminal, file_editor]
+tools: [terminal, file_editor]
 agent_behavior: |
   WHEN TO USE
     Use this skill when a task would benefit from a reusable helper that is

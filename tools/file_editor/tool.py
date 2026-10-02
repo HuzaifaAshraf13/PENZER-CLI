@@ -7,7 +7,6 @@ import difflib
 import os
 from pathlib import Path
 
-from agent.core import mcp
 from tools.standards import success, error, warning
 from agent.activity_timeline import emit_activity_event, update_activity_event
 
@@ -18,13 +17,16 @@ def _is_disallowed_write(target: Path) -> bool:
     try:
         resolved = target.resolve(strict=False)
         workdir = _WORKDIR.resolve(strict=False)
-        return not str(resolved).startswith(str(workdir))
+        resolved.relative_to(workdir)
+        return False
+    except ValueError:
+        return True
     except Exception:
         return True
 
 
 def _requires_approval(action: str, filepath: Path | None) -> tuple[bool, str]:
-    if action in {"delete", "write", "append", "replace"} and filepath is not None:
+    if action in {"create", "delete", "write", "append", "replace"} and filepath is not None:
         if _is_disallowed_write(filepath):
             return True, "Approval required before destructive or out-of-workdir file mutation."
     return False, ""
@@ -325,7 +327,6 @@ def file_editor_direct(action: str, filepath: str = None, content: str = None,
         return error(f"File editor error: {str(e)}")
 
 
-@mcp.tool()
 def file_editor(action: str, filepath: str = None, content: str = None,
                 find: str = None, replace: str = None, line_start: int = None,
                 line_end: int = None) -> dict:

@@ -120,12 +120,18 @@ def _load_section(section: str) -> any:
     return None
 
 
-def _atomic_write_json(path: Path, value: any) -> None:
+def _atomic_write_json(path: Path, value: any, *, compact: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(value, f, indent=2, cls=SetEncoder)
+            json.dump(
+                value,
+                f,
+                indent=None if compact else 2,
+                separators=(",", ":") if compact else None,
+                cls=SetEncoder,
+            )
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
@@ -151,12 +157,11 @@ _cache_state: dict = {"data": None, "mtime": None}
 
 # threading.RLock protects _cache_state AND the file read/modify/write
 # cycle in _load()/_save() — covers races between threads in the SAME
-# process (e.g. cli.py's background MCP server thread vs the
-# interactive loop).
+# process (for example, background memory consolidation vs the CLI loop).
 _memory_lock = threading.RLock()
 
-# fcntl-based file lock adds cross-PROCESS protection on top — if the
-# MCP server (or a second CLI instance) ever runs as a separate OS
+# fcntl-based file lock adds cross-PROCESS protection on top — if a
+# second CLI instance runs as a separate OS
 # process against the same storage dir, the threading lock alone does
 # nothing for that, since each process has its own independent lock
 # object. stdlib only (no new dependency); POSIX-only, with a safe
@@ -255,15 +260,24 @@ def _load() -> dict:
         return copy.deepcopy(data)
 
 
-def _save(data: dict) -> None:
+def _save(
+    data: dict,
+    *,
+    sections: tuple[str, ...] | None = None,
+    write_legacy: bool = True,
+) -> None:
     global _cache_state
     with _lock():
         try:
-            for key in ["episodic", "semantic", "insights", "post_mortem", "kv",
-                        "history", "skill_metrics", "checkpoints", "consolidation",
-                        "graph_nodes", "graph_edges", "steps"]:
+            section_names = sections or (
+                "episodic", "semantic", "insights", "post_mortem", "kv",
+                "history", "skill_metrics", "checkpoints", "consolidation",
+                "graph_nodes", "graph_edges", "steps",
+            )
+            for key in section_names:
                 _save_section(key, data.get(key, _fresh().get(key)))
-            _atomic_write_json(STORAGE_FILE, data)
+            if write_legacy:
+                _atomic_write_json(STORAGE_FILE, data)
             _cache_state = {"data": copy.deepcopy(data), "mtime": _newest_mtime()}
         except Exception as e:
             logger.error("Storage save: %s", e)
@@ -275,7 +289,7 @@ def _save(data: dict) -> None:
 
 def save_last_run(snapshot: dict) -> None:
     try:
-        _atomic_write_json(LAST_RUN_PATH, snapshot)
+        _atomic_write_json(LAST_RUN_PATH, snapshot, compact=True)
     except Exception as e:
         logger.error("Save last run: %s", e)
 

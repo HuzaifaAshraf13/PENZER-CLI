@@ -3,7 +3,7 @@ skill_id: core.meta
 name: Skill Generator
 description: Generate, update, and delete skills using file_editor after successful tasks
 keywords: [meta, generate, skill, create, learn, remember how, save pattern, evolve]
-mcp_tools: [file_editor, terminal]
+tools: [file_editor, terminal]
 agent_behavior: |
   GATE 1 — SHOULD I GENERATE?
     Generate only if ALL true:
@@ -24,7 +24,7 @@ agent_behavior: |
     name: SKILL NAME
     description: VERB + one sentence
     keywords: [kw1, kw2, kw3, kw4, kw5]
-    mcp_tools: [tools, used]
+    tools: [tools, used]
     agent_behavior: |
       Step 1 with exact tool and command
       Step 2 with exact tool and command

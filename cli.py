@@ -40,10 +40,9 @@ warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*
 logger = get_logger("cli")
 
 from agent.agent import PenzerAgent
-from agent.server import start_server
 
 for _log in [
-    "agent.agent", "agent.penzermodule", "penzer.core", "penzer.server",
+    "agent.agent", "agent.penzermodule",
     "agent.skills.search", "agent.skills.loader",
     "agent.skills.base", "session.memory", "httpx",
     "tools.executor", "tools.plugins",
@@ -608,14 +607,16 @@ def run_doctor() -> dict:
         skills_ok = False
         skills_message = f"skill loading failed: {exc}"
 
-    mcp_ok = True
-    mcp_message = "MCP registry reachable"
+    tools_ok = True
+    tools_message = "direct tool registry available"
     try:
-        from agent.core import get_mcp_status
-        get_mcp_status()
+        from agent.penzermodule.execution import DIRECT_TOOLS
+        missing_tools = {"terminal", "browser", "file_editor"} - set(DIRECT_TOOLS)
+        if missing_tools:
+            raise RuntimeError(f"missing direct tools: {', '.join(sorted(missing_tools))}")
     except Exception as exc:
-        mcp_ok = False
-        mcp_message = f"MCP status unavailable: {exc}"
+        tools_ok = False
+        tools_message = f"direct tools unavailable: {exc}"
 
     checks = {
         "config": {
@@ -625,7 +626,7 @@ def run_doctor() -> dict:
         "memory": {"ok": memory_ok, "message": memory_message},
         "plugins": {"ok": plugin_ok, "message": plugin_message},
         "skills": {"ok": skills_ok, "message": skills_message},
-        "mcp": {"ok": mcp_ok, "message": mcp_message},
+        "tools": {"ok": tools_ok, "message": tools_message},
     }
     ok = all(check["ok"] for check in checks.values())
     return {
@@ -723,10 +724,6 @@ async def run_noninteractive(task: str, json_mode: bool = False) -> int:
             print(f"[{status}] {title}", flush=True)
 
     timeline.set_stream_handler(emit)
-    logging.getLogger("penzer.server").setLevel(logging.CRITICAL)
-    server_thread = threading.Thread(target=start_server, daemon=True)
-    server_thread.start()
-    await asyncio.sleep(0.5)
     # LLM initialization has a legacy informational print; keep JSON stdout pure.
     with contextlib.redirect_stdout(io.StringIO()) if json_mode else contextlib.nullcontext():
         agent = await PenzerAgent().async_init()
@@ -758,10 +755,6 @@ async def main(task: str | None = None, json_mode: bool = False):
         display_banner()
         if not _has_llm_config():
             prompt_for_llm_credentials()
-        logging.getLogger("penzer.server").setLevel(logging.CRITICAL)
-        server_thread = threading.Thread(target=start_server, daemon=True)
-        server_thread.start()
-        await asyncio.sleep(0.5)
         console.print("[red bold]Loading agent...[/red bold]")
         agent = await PenzerAgent().async_init()
         console.print("[bold green]✓ Ready[/bold green]")

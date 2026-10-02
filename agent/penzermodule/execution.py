@@ -9,12 +9,21 @@ import time, asyncio, inspect, json, re, hashlib, logging, shlex
 
 from tools.plugins import create_plugin_tool, load_plugin_tools, validate_plugin_source
 from tools.executor import confirm_action
-from tools.executor import requires_privilege_escalation, SUDO_INTERACTIVE_TIMEOUT
+from tools.executor import (
+    CONFIRM_TIMEOUT_DEFAULT,
+    requires_privilege_escalation,
+    SUDO_INTERACTIVE_TIMEOUT,
+)
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
 from agent.activity_timeline import emit_activity_event, update_activity_event
 from tools.file_editor.tool import file_editor_direct
 from tools.terminal.tool import terminal_direct, terminal_check_job_direct, terminal_kill_direct
-from tools.browser.tool import browser_direct, browser_info_direct, browser_close_direct
+from tools.browser.tool import (
+    browser_abort_direct,
+    browser_direct,
+    browser_info_direct,
+    browser_close_direct,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +36,7 @@ TOOL_LABELS = {
 FALLBACKS = {"terminal": "run_bash", "run_bash": "run_python", "run_python": "terminal"}
 
 TOOL_TIMEOUT = 30
+TOOL_BROWSER_TIMEOUT = 90
 TOOL_TERMINAL_DEFAULT_TIMEOUT = 60  # mirrors tools/terminal.py's default
 PLUGIN_SUBPROCESS_TIMEOUT = TOOL_TERMINAL_DEFAULT_TIMEOUT
 NON_IDEMPOTENT_TOOLS = {"terminal", "run_bash", "run_python", "browser"}
@@ -49,14 +59,66 @@ _DANGEROUS_PLUGIN_PATTERNS = re.compile(
     r"|/etc/(passwd|shadow)|nc\s+-l|curl\s+[^\n]*-d\s+[^\n]*@",
     re.IGNORECASE,
 )
+_WEB_GOAL = re.compile(
+    r"\b(search|browse|browser|web|website|webpage|internet|online|research|"
+    r"look\s+up|gather|intel|information|details|find|sources?|latest|current)\b",
+    re.IGNORECASE,
+)
+_NETWORK_FETCH = re.compile(
+    r"\b(curl|wget|httpie|lynx|w3m)\b|requests\.(get|post)|urllib(?:3)?\.request|"
+    r"httpx\.(get|post)|aiohttp\.|fetch\s*\(",
+    re.IGNORECASE,
+)
+_HTTP_URL = re.compile(r"https?://[^\s\"'<>|)]+", re.IGNORECASE)
 
 
-def _call_timeout(name: str, args: dict) -> int:
+def route_web_requests_to_browser(goal: str, calls: list[dict]) -> list[dict]:
+    """Route web-research fetches through the browser, preserving other calls."""
+    if not _WEB_GOAL.search(goal or ""):
+        return calls
+
+    routed = []
+    for call in calls:
+        name = str(call.get("name", ""))
+        args = call.get("arguments") or {}
+        command = " ".join(
+            str(args.get(key, "")) for key in ("command", "script", "code")
+        )
+        if name not in {"terminal", "run_bash", "run_python"} or not _NETWORK_FETCH.search(command):
+            routed.append(call)
+            continue
+
+        urls = _HTTP_URL.findall(command)
+        if urls:
+            url = urls[0].rstrip(".,;:]")
+            if re.match(
+                r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::|/|$)",
+                url,
+                re.IGNORECASE,
+            ):
+                routed.append(call)
+                continue
+            browser_args = {"action": "open", "url": url}
+        else:
+            browser_args = {"action": "search", "query": goal}
+        browser_args["session_id"] = str(args.get("session_id") or "agent1")
+        routed.append({**call, "name": "browser", "arguments": browser_args})
+
+    return routed
+
+
+def _call_timeout(name: str, args: dict, agent=None) -> int:
     """Trusts the caller's own `timeout` arg (clamped), with a small
     margin so the tool's own internal cleanup fires first. Sudo/su/pkexec
     calls get a floor of SUDO_INTERACTIVE_TIMEOUT regardless of the
     caller's value, since they wait on a real password prompt."""
-    if name != "terminal":
+    if name == "browser":
+        return TOOL_BROWSER_TIMEOUT
+    if name == "plugin_tool":
+        return CONFIRM_TIMEOUT_DEFAULT + TIMEOUT_MARGIN
+    if agent is not None and name in getattr(agent, "_plugin_tools", {}):
+        return PLUGIN_SUBPROCESS_TIMEOUT + TIMEOUT_MARGIN
+    if name not in {"terminal", "run_bash", "run_python"}:
         return TOOL_TIMEOUT
     requested = args.get("timeout", TOOL_TERMINAL_DEFAULT_TIMEOUT)
     try:
@@ -67,14 +129,16 @@ def _call_timeout(name: str, args: dict) -> int:
     cmd_text = str(args.get("command") or args.get("script") or args.get("code") or "")
     escalates, _ = requires_privilege_escalation(cmd_text)
     if escalates:
-        return max(requested, SUDO_INTERACTIVE_TIMEOUT + 15) + TIMEOUT_MARGIN
-    return requested + TIMEOUT_MARGIN
+        requested = max(requested, SUDO_INTERACTIVE_TIMEOUT)
+    return requested + CONFIRM_TIMEOUT_DEFAULT + TIMEOUT_MARGIN
 
 
 def _requires_serial_execution(call: dict) -> bool:
     """Keep side-effecting calls ordered within one model turn."""
     name = str(call.get("name", ""))
     args = call.get("arguments") or {}
+    if name in {"browser", "browser_info", "browser_close", "browser_list", "browser_close_all"}:
+        return True
     if name in {"terminal_check_job", "terminal_kill", "file_editor"}:
         if name != "file_editor":
             return True
@@ -129,7 +193,7 @@ async def execute_single_tool(agent, call: dict) -> tuple[str, float]:
             agent._update_activity(activity_id, status="success" if not agent._is_error(raw) else "failed",
                                     message=str(raw)[:160], details={"tool": name, "result": str(raw)[:400]})
         return raw, round(time.time() - start, 2)
-    # Valid if it's a registered MCP tool, the plugin_tool creation
+    # Valid if it's a direct tool, the plugin_tool creation
     # action, or a dynamically created plugin.
     if name != "plugin_tool" and name not in DIRECT_TOOLS and name not in agent._plugin_tools and name not in agent.tools:
         return f"Unknown tool '{name}'.", 0.0
@@ -139,11 +203,19 @@ async def execute_single_tool(agent, call: dict) -> tuple[str, float]:
         event_type, f"{name} activity", message=agent._fmt_action(name, args),
         status="running", details={"tool": name, "args": args},
     )
-    timeout = _call_timeout(name, args)
+    timeout = _call_timeout(name, args, agent)
     try:
         raw = await asyncio.wait_for(run(agent, name, args), timeout=timeout)
     except asyncio.TimeoutError:
-        raw = f"Timeout after {timeout}s"
+        if name == "browser":
+            session_id = str(args.get("session_id") or "default")
+            try:
+                await asyncio.to_thread(browser_abort_direct, session_id)
+            except Exception:
+                logger.exception("Failed to abort timed-out browser session %s", session_id)
+            raw = f"Browser timed out after {timeout}s; browser session was stopped"
+        else:
+            raw = f"Timeout after {timeout}s"
     except Exception as e:
         logger.exception("Unhandled tool execution error: %s", name)
         raw = f"Error: {e}"
@@ -203,7 +275,9 @@ async def run_race(agent, calls: list) -> list[tuple[str, float]]:
 
     tasks    = {asyncio.create_task(run_and_report(i, c)): (i, c) for i, c in enumerate(calls)}
     pending  = set(tasks)
-    deadline = time.time() + max(_call_timeout(c["name"], c.get("arguments", {})) for c in calls)
+    deadline = time.time() + max(
+        _call_timeout(c["name"], c.get("arguments", {}), agent) for c in calls
+    )
     try:
         while pending:
             remaining = deadline - time.time()
@@ -243,6 +317,8 @@ async def run_with_fallback(agent, call: dict, prior_result: tuple[str, float] |
         results = await run_parallel(agent, [call])
         raw, elapsed = results[0] if results else ("", 0.0)
     if raw and not agent._is_error(raw):
+        return raw, elapsed
+    if name in NON_IDEMPOTENT_TOOLS:
         return raw, elapsed
     fb = fallback_tool(agent, name)
     if fb and fb in agent.tools:
@@ -314,7 +390,7 @@ async def run(agent, name: str, args: dict) -> str:
             if attempt == max_attempts - 1:
                 fb  = FALLBACKS.get(name)
                 cmd = args.get("command") or args.get("query") or args.get("code") or ""
-                if fb and fb in agent.tools and cmd:
+                if name not in NON_IDEMPOTENT_TOOLS and fb and fb in agent.tools and cmd:
                     agent._record_step("tool_call", f"{name} errored — falling back to {fb}",
                                         tool=fb, fallback_from=name)
                     return await run(agent, fb, {"command": cmd})

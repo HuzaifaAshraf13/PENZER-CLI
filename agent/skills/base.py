@@ -9,7 +9,7 @@ class Skill:
     name:           str
     description:    str
     keywords:       List[str]
-    mcp_tools:      List[str]
+    tools:          List[str]
     agent_behavior: str
     priority:       float = 0.5
     core:           bool  = False

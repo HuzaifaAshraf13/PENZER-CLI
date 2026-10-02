@@ -25,7 +25,6 @@ import ast, json, logging, asyncio, signal, time, random, re, itertools, weakref
 from typing import Any, Callable
 from collections import defaultdict, deque
 
-from agent.core import mcp
 from agent.llm import LLM
 from session.memory import (
     load_history, save_history, clear_history,
@@ -149,6 +148,7 @@ class PenzerAgent:
         self._last_matched_skills: list  = []
         self._active_skills:       list  = []
         self._system_prompt:       str   = ""
+        self._prompt_extra:        str   = ""
         self._consec_errors:       dict  = defaultdict(int)
         self._iteration:           int   = 0
         self._novel_task:          bool  = False
@@ -226,23 +226,7 @@ class PenzerAgent:
         task.add_done_callback(_on_done)
 
     async def async_init(self) -> "PenzerAgent":
-        try:
-            import tools.tools
-        except Exception as e:
-            logger.debug("tools.tools: %s", e)
-        try:
-            self.tools = await mcp.get_tools() or {}
-        except Exception as e:
-            logger.debug("MCP: %s", e)
-        self.tools.update({
-            "terminal": execution.DIRECT_TOOLS["terminal"],
-            "terminal_check_job": execution.DIRECT_TOOLS["terminal_check_job"],
-            "terminal_kill": execution.DIRECT_TOOLS["terminal_kill"],
-            "file_editor": execution.DIRECT_TOOLS["file_editor"],
-            "browser": execution.DIRECT_TOOLS["browser"],
-            "browser_info": execution.DIRECT_TOOLS["browser_info"],
-            "browser_close": execution.DIRECT_TOOLS["browser_close"],
-        })
+        self.tools = dict(execution.DIRECT_TOOLS)
         self.tools.setdefault("memory", "builtin")
         return self
 
@@ -299,7 +283,14 @@ class PenzerAgent:
 
     def _update_working_memory(self, tool: str, result: str, ok: bool) -> None:
         if ok and result:
-            self._working_mem.append(f"{tool}: {result[:80]}")
+            if tool == "browser":
+                structured = self._parse_structured_result(result)
+                data = structured.get("data", {}) if isinstance(structured, dict) else {}
+                summary = data.get("content") or data.get("text") if isinstance(data, dict) else None
+                summary = summary or (structured.get("message", "") if isinstance(structured, dict) else result)
+                self._working_mem.append(f"browser: {str(summary)[:500]}")
+            else:
+                self._working_mem.append(f"{tool}: {result[:80]}")
 
     def _working_mem_summary(self) -> str:
         if not self._working_mem:
@@ -372,7 +363,7 @@ class PenzerAgent:
         for skill in self._active_skills:
             lines = [l.strip() for l in (skill.agent_behavior or "").splitlines()
                      if l.strip() and not l.strip().startswith("#")]
-            tools = set(skill.mcp_tools or [])
+            tools = set(skill.tools or [])
             for idx, line in enumerate(lines):
                 self._skill_plan.append({"skill": skill.name, "step": idx, "instruction": line, "tools": tools, "done": False})
         tool_order = ["memory", "planning", "browser", "terminal", "file_editor"]
@@ -401,7 +392,7 @@ class PenzerAgent:
                     self._skill_done.add(step["skill"])
 
     def _skills_for_tool(self, tool_name: str) -> list:
-        return [s for s in self._active_skills if not set(s.mcp_tools or []) or tool_name in set(s.mcp_tools or [])]
+        return [s for s in self._active_skills if not set(s.tools or []) or tool_name in set(s.tools or [])]
 
     def _apply_skill_selection(self, skill_used: str | None) -> None:
         """Model can self-report a skill via "skill_used" even if the
@@ -594,6 +585,7 @@ class PenzerAgent:
         self._matched_skills = snapshot.get("matched_skills", self._matched_skills)
         self._last_matched_skills = snapshot.get("last_matched_skills", self._last_matched_skills)
         self._system_prompt = snapshot.get("system_prompt", self._system_prompt)
+        self._prompt_extra = snapshot.get("prompt_extra", self._prompt_extra)
         self._failures = snapshot.get("failures", self._failures)
         self._consec_errors = defaultdict(int, snapshot.get("consec_errors", dict(self._consec_errors)))
         self._skill_plan = snapshot.get("skill_plan", self._skill_plan)
@@ -619,6 +611,7 @@ class PenzerAgent:
                 "complexity_score": self._complexity_score, "is_complex_task": self._is_complex_task,
                 "max_iter": self._max_iter, "matched_skills": self._matched_skills,
                 "last_matched_skills": self._last_matched_skills, "system_prompt": self._system_prompt,
+                "prompt_extra": self._prompt_extra,
                 "failures": self._failures, "consec_errors": dict(self._consec_errors),
                 "skill_plan": self._skill_plan, "skill_steps": self._skill_steps,
                 "skill_done": list(self._skill_done), "working_mem": list(self._working_mem),
@@ -684,7 +677,14 @@ class PenzerAgent:
 
     async def resume_last_task(self) -> str:
         snapshot = load_last_run()
-        if not snapshot or not snapshot.get("trace"):
+        if (
+            not isinstance(snapshot, dict)
+            or not isinstance(snapshot.get("goal"), str)
+            or not snapshot["goal"].strip()
+            or not isinstance(snapshot.get("history"), list)
+            or not snapshot["history"]
+            or snapshot.get("done", False)
+        ):
             return "No interrupted task to resume."
         self._reset()
         self._restore_snapshot(snapshot)
@@ -781,6 +781,13 @@ class PenzerAgent:
             "No skill was suggested by the initial match — check the full CORE SKILLS list yourself before assuming none apply; "
             "report any skill you use via \"skill_used\".\n"
         )
+        active_skill_names = {skill.name for skill in self._active_skills}
+        other_skills = [skill for skill in self.core_skills if skill.name not in active_skill_names]
+        if other_skills:
+            skills_hint += "Available core skill catalog (detailed procedures follow for matched skills):\n"
+            skills_hint += "".join(
+                f"- {skill.name}: {skill.description}\n" for skill in other_skills
+            )
         insight_hint = ""
         if self._task_insights:
             insight_hint += "\n## Recalled Insights\n" + "".join(f"- {i['insight']}\n" for i in self._task_insights)
@@ -792,10 +799,11 @@ class PenzerAgent:
         if past_mortems:
             mortem_hint = "\n## Past Experience\n" + "".join(
                 f"  [{pm['task_type']}] Worked: {pm['what_worked']} | Failed: {pm['what_failed']} | Next: {pm['next_time']}\n" for pm in past_mortems)
-        prompt_skills = self.core_skills if self._is_complex_task else []
+        prompt_skills = self._active_skills
+        self._prompt_extra = skills_hint + insight_hint + mortem_hint
         self._system_prompt = build_system_prompt(
             core_skills=prompt_skills, memory_context=past_memory,
-            extra=skills_hint + insight_hint + mortem_hint, goal=user_input, plugin_tools=self.get_plugin_tool_descriptions(),
+            extra=self._prompt_extra, goal=user_input, plugin_tools=self.get_plugin_tool_descriptions(),
         )
         self._resume_state = {
             "goal": user_input, "current_step": "Start", "completed_steps": [], "blocked_steps": [],
@@ -880,6 +888,7 @@ class PenzerAgent:
             if r is None:
                 return self._llm_failure_result()
             calls, text = r.get("tool_calls") or [], r.get("content", "").strip()
+            calls = execution.route_web_requests_to_browser(self._goal, calls)
             self._apply_belief_updates(r)
             self._apply_skill_selection(r.get("skill_used"))
             if not calls:
@@ -1024,9 +1033,10 @@ class PenzerAgent:
         self._safe_status("Planning next action…" if i == 0 else "Choosing next action…")
         if (i + 1) % 5 == 0:
             self._system_prompt = build_system_prompt(
-                core_skills=self.core_skills if self._is_complex_task else [],
+                core_skills=self._active_skills,
                 memory_context=get_relevant_memories(self._goal, n=3, deep=self._is_complex_task),
-                goal=self._goal, plugin_tools=self.get_plugin_tool_descriptions(),
+                extra=self._prompt_extra, goal=self._goal,
+                plugin_tools=self.get_plugin_tool_descriptions(),
             )
         if (i + 1) % CHECKPOINT_EVERY == 0:
             await self._checkpoint(i)
@@ -1353,6 +1363,20 @@ class PenzerAgent:
             self._record_step("tool_result", f"{name} {'done' if ok else 'failed'} ({elapsed}s): {self._brief(raw)[:100]}",
                                tool=name, success=ok, elapsed_sec=elapsed)
 
+            structured_result = self._parse_structured_result(str(raw))
+            result_data = structured_result.get("data", {}) if isinstance(structured_result, dict) else {}
+            if name == "browser" and isinstance(result_data, dict) and result_data.get("blocked"):
+                page_url = str(result_data.get("url") or c.get("arguments", {}).get("url") or "the requested page")
+                block_reason = str(result_data.get("block_reason") or "The site blocked automated access.")
+                answer = f"I couldn't inspect {page_url}: {block_reason}"
+                self._done = True
+                self._direct_tool_answer = True
+                self._belief["goal_progress"] = "blocked"
+                self.history.append({"role": "assistant", "content": answer})
+                self._record_step("final_answer", answer[:200], reason="browser_access_blocked")
+                self._persist_all()
+                return answer
+
             if ok and name == "terminal":
                 command_text = str(c.get("arguments", {}).get("command", "")).lower()
                 scan_answer = self._network_scan_answer(self._goal, command_text, raw)
@@ -1632,6 +1656,11 @@ class PenzerAgent:
                 tail_parts.append(f"{omitted_chars} more chars")
             tail = f"\n… ({', '.join(tail_parts)})" if tail_parts else ""
             return f"{hdr}\n{preview}{tail}"
+        if name == "browser":
+            structured = self._parse_structured_result(str(raw))
+            if isinstance(structured, dict):
+                data = structured.get("data", structured)
+                return f"{hdr}\n{json.dumps(data, ensure_ascii=False, default=str)[:5000]}"
         if name in ("file_editor", "memory") and args.get("action") in ("write", "create", "delete", "replace", "store"):
             return f"{hdr}\nDone"
         return f"{hdr}\n{self._brief(raw)}"

@@ -3,7 +3,7 @@ skill_id: core.planning
 name: Task Planner
 description: Break complex tasks into verified executable steps before acting
 keywords: [plan, complex, steps, strategy, approach, breakdown, multi-step, organize, how to, figure out]
-mcp_tools: [memory]
+tools: [memory]
 agent_behavior: |
 
   TRIGGER — PLAN BEFORE ACTING WHEN:

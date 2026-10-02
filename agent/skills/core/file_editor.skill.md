@@ -3,7 +3,7 @@ skill_id: core.file_editor
 name: File Editor
 description: Read, write, edit, append, delete, list, and create files and directories
 keywords: [file, read, write, edit, create, delete, append, replace, list, directory, folder, path, content]
-mcp_tools: [file_editor]
+tools: [file_editor]
 agent_behavior: |
 
   ACTION REFERENCE

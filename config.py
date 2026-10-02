@@ -79,16 +79,6 @@ LOCAL_MODEL_GPU_LAYERS = int(os.getenv("LOCAL_MODEL_GPU_LAYERS", "50"))
 LOCAL_MODEL_THREADS = int(os.getenv("LOCAL_MODEL_THREADS", "4"))
 
 # ============================================================================
-# MCP SERVER SETTINGS
-# ============================================================================
-MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
-try:
-    MCP_PORT = int(os.getenv("MCP_PORT", "5000"))
-except ValueError:
-    MCP_PORT = 5000
-MCP_TIMEOUT = 30
-
-# ============================================================================
 # SECURITY TOOLS CATEGORIES
 # ============================================================================
 SECURITY_TOOLS = {
@@ -188,13 +178,6 @@ def validate_config() -> list[str]:
     profile_name = (os.getenv("PENZER_PROFILE", DEFAULT_PROFILE) or DEFAULT_PROFILE).lower()
     if profile_name not in PROFILE_OPTIONS:
         errors.append(f"PENZER_PROFILE must be one of: {', '.join(PROFILE_OPTIONS)}.")
-
-    try:
-        port = int(os.getenv("MCP_PORT", "5000"))
-        if port < 1 or port > 65535:
-            errors.append("MCP_PORT must be an integer between 1 and 65535.")
-    except Exception:
-        errors.append("MCP_PORT must be an integer between 1 and 65535.")
 
     if not isinstance(LOCAL_MODEL_ENABLED, bool):
         errors.append("LOCAL_MODEL_ENABLED must be a boolean-like env value.")

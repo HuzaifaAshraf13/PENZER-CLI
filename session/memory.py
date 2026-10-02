@@ -1,7 +1,7 @@
 """
 session/memory.py
 Top-level orchestrator for the memory system. This is the module the
-rest of the codebase (agent.py, cli.py, the MCP server, etc.) imports
+rest of the codebase (agent.py, cli.py, etc.) imports
 from — everything from memory_storage.py, memory_core.py, and
 memory_graph.py is re-exported here so existing `from session.memory
 import X` call sites keep working unchanged after the split.
@@ -242,7 +242,7 @@ def update_skill_metric(skill_name: str, success: bool) -> None:
         if success:
             m["successes"] += 1
         data["skill_metrics"][skill_name] = m
-        _save(data)
+        _save(data, sections=("skill_metrics",), write_legacy=False)
 
 
 def get_skill_metric(skill_name: str) -> dict:
@@ -266,7 +266,7 @@ def add_checkpoint(checkpoint: dict) -> None:
         data["checkpoints"].append(checkpoint)
         if len(data["checkpoints"]) > MAX_CHECKPOINTS:
             data["checkpoints"] = data["checkpoints"][-MAX_CHECKPOINTS:]
-        _save(data)
+        _save(data, sections=("checkpoints",), write_legacy=False)
 
 
 # -- Step Log (structured, retrievable "what is the agent doing") -----------
@@ -306,7 +306,7 @@ def append_steps(run_id: str, new_steps: list[dict]) -> None:
             data["steps"].append(entry)
         if len(data["steps"]) > MAX_STEPS:
             data["steps"] = data["steps"][-MAX_STEPS:]
-        _save(data)
+        _save(data, sections=("steps",), write_legacy=False)
 
 
 def get_steps(run_id: str | None = None, n: int = 100) -> list[dict]:
@@ -350,7 +350,7 @@ def clear_steps(run_id: str | None = None) -> int:
             data["steps"] = []
         removed = before - len(data["steps"])
         if removed:
-            _save(data)
+            _save(data, sections=("steps",), write_legacy=False)
         return removed
 
 
@@ -430,4 +430,4 @@ async def consolidate_memory(llm) -> None:
             ep for ep in data["episodic"] if ep["event"] not in consolidated_events
         ]
     data["consolidation"] = {"count": 0, "last_run": datetime.now().isoformat()}
-    _save(data)
+    _save(data, sections=("episodic", "consolidation"), write_legacy=False)

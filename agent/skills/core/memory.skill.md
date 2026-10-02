@@ -3,7 +3,7 @@ skill_id: core.memory
 name: Memory Manager
 description: Retrieve or store durable user facts and follow-up context with the built-in memory tool; use it for things like IPs, preferences, paths, and prior answers.
 keywords: [memory, store, remember, retrieve, fact, save, forget, recall, key, value, preference, ip, address, public, project, path, config, env, name, email, phone]
-mcp_tools: [memory]
+tools: [memory]
 agent_behavior: |
   WHAT THIS TOOL IS
     A structured key-value store for facts the user explicitly wants kept.

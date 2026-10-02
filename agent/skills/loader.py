@@ -29,7 +29,7 @@ def _parse(path: Path) -> Optional[Skill]:
         name = str(meta.get("name") or path.stem)
         description = str(meta.get("description") or "")
         keywords = meta.get("keywords") or []
-        mcp_tools = meta.get("mcp_tools") or []
+        tools = meta.get("tools") or []
         agent_behavior = str(meta.get("agent_behavior") or "")
         priority = float(meta.get("priority", 0.5))
         core = bool(meta.get("core", False))
@@ -38,15 +38,15 @@ def _parse(path: Path) -> Optional[Skill]:
 
         if not isinstance(keywords, list):
             raise ValueError("keywords must be a list")
-        if not isinstance(mcp_tools, list):
-            raise ValueError("mcp_tools must be a list")
+        if not isinstance(tools, list):
+            raise ValueError("tools must be a list")
 
         return Skill(
             skill_id=skill_id,
             name=name,
             description=description,
             keywords=keywords,
-            mcp_tools=mcp_tools,
+            tools=tools,
             agent_behavior=agent_behavior,
             priority=priority,
             core=core,

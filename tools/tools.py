@@ -8,8 +8,7 @@ Individual tools are in separate files:
   - file_editor/tool.py: file_editor()
 """
 
-# Import tool entry points. Browser and file-editor wrappers remain available to
-# MCP clients, while the agent uses their local direct implementations.
+# Import direct tool entry points for compatibility with existing callers.
 from tools.terminal.tool import terminal, terminal_check_job, terminal_kill
 from tools.browser.tool import browser, browser_direct, browser_info, browser_close
 from tools.file_editor.tool import file_editor, file_editor_direct

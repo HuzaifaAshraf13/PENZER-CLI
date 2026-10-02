@@ -11,7 +11,7 @@ keywords: [terminal, bash, shell, command, execute, run, script, python, timeout
            download, upload, curl, wget, npm, pip, apt, brew, yarn, cron, schedule, backup, archive,
            compress, extract, zip, tar, secret, secrets, token, credentials, platform, os, linux,
            macos, windows, dry-run, cleanup, temp, tmp]
-mcp_tools: [terminal, terminal_check_job, terminal_kill, run_bash, run_python]
+tools: [terminal, terminal_check_job, terminal_kill, run_bash, run_python]
 agent_behavior: |
   STEP 0 — SELF-ASSESS RISK (before picking anything)
     Before calling terminal, silently rate what you're about to run:
