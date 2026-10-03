@@ -118,6 +118,8 @@ from typing import Optional, List
 from session.memory import get_relevant_kv_facts, get_skill_metric
 
 logger = logging.getLogger(__name__)
+MAX_SKILL_BLOCK_CHARS = 18_000
+MAX_SKILLS_IN_PROMPT = 8
 
 STOPWORDS = {
     "about", "after", "all", "also", "and", "any", "are", "around", "before",
@@ -535,23 +537,36 @@ def _rank(skills: List, goal: str) -> List:
         )
 
     def score(skill) -> float:
-        base = float(getattr(skill, "priority", 0.5))
         skill_tokens = _skill_token_set(skill)
         overlap = goal_tokens & skill_tokens
-        if overlap:
-            base += min(0.7, len(overlap) * 0.16)
-        keyword_hits = 0
-        for kw in skill.keywords or []:
-            if _tokenize(kw) & goal_tokens:
-                keyword_hits += 1
-        if keyword_hits:
-            base += min(0.4, keyword_hits * 0.12)
-        if any(token in goal_tokens for token in _tokenize(skill.name)):
-            base += 0.08
-        base += getattr(skill, "success_rate", 0.0) * 0.15
-        return min(1.0, base)
+        keyword_hits = sum(
+            1 for keyword in skill.keywords or []
+            if (tokens := _tokenize(keyword)) and tokens.issubset(goal_tokens)
+        )
+        name_hits = len(goal_tokens & _tokenize(skill.name))
+        return (
+            keyword_hits * 3.0
+            + len(overlap) * 0.5
+            + name_hits * 1.5
+            + float(getattr(skill, "priority", 0.5)) * 0.1
+            + float(getattr(skill, "success_rate", 0.0)) * 0.1
+        )
 
     return sorted(skills, key=lambda s: score(s), reverse=True)
+
+
+def _select_prompt_skills(skills: List, goal: str) -> tuple[List, List]:
+    selected = []
+    omitted = []
+    used_chars = 0
+    for skill in _rank(skills, goal):
+        rendered_size = len(_fmt_core_skill(skill))
+        if len(selected) >= MAX_SKILLS_IN_PROMPT or used_chars + rendered_size > MAX_SKILL_BLOCK_CHARS:
+            omitted.append(skill)
+            continue
+        selected.append(skill)
+        used_chars += rendered_size
+    return selected, omitted
 
 
 def _fmt_plugin_tools_block(plugin_tools: Optional[dict]) -> str:
@@ -593,19 +608,25 @@ def build_system_prompt(
     skills_lines: List[str] = []
     if core_skills:
         _enrich(core_skills)
-        ranked = _rank(core_skills, goal)
+        selected, omitted = _select_prompt_skills(core_skills, goal)
         skills_lines += [
             "## CORE SKILLS",
-            f"{len(ranked)} skills — check before any tool.",
+            f"{len(selected)} detailed skills shown out of {len(core_skills)} — check before any tool.",
             "\u2705 PROVEN = battle-tested. Use by default.",
             "",
         ]
-        if ranked:
-            best = ranked[0]
+        if selected:
+            best = selected[0]
             skills_lines.append(f"Best fit for this task: {best.name} \u2014 {getattr(best, 'description', '')}")
             skills_lines.append("")
-        for skill in ranked[:12]:
+        for skill in selected:
             skills_lines.append(_fmt_core_skill(skill))
+        if omitted:
+            skills_lines.extend([
+                "## OTHER MATCHED SKILLS",
+                "Full instructions omitted due to the skill context budget. If one is needed, report its exact name via skill_used so its procedure can be loaded.",
+            ])
+            skills_lines.extend(f"- {skill.name}" for skill in omitted)
     block = "\n".join(skills_lines).strip()
     prompt = MAIN_SYSTEM_PROMPT.replace("{{SKILLS_BLOCK}}", block)
     prompt = prompt.replace("{{PLUGIN_TOOLS_BLOCK}}", _fmt_plugin_tools_block(plugin_tools))

@@ -346,11 +346,15 @@ class PenzerAgent:
         for skill in self.core_skills:
             skill_name = (skill.name or "").lower()
             keyword_tokens = set()
+            keyword_match = False
             for kw in skill.keywords or []:
-                keyword_tokens |= _tokenize(kw)
+                phrase_tokens = _tokenize(kw)
+                keyword_tokens |= phrase_tokens
+                if phrase_tokens and phrase_tokens.issubset(goal_tokens):
+                    keyword_match = True
             name_desc_tokens = _tokenize(skill.name or "") | _tokenize(getattr(skill, "description", "") or "")
             weak_overlap = goal_tokens & (name_desc_tokens - keyword_tokens)
-            if (goal_tokens & keyword_tokens) or len(weak_overlap) >= 2:
+            if keyword_match or len(weak_overlap) >= 2:
                 matched.append(skill)
             elif "memory" in skill_name and self._looks_like_memory_query(lowered):
                 matched.append(skill)
@@ -361,13 +365,31 @@ class PenzerAgent:
         self._skill_steps = {s.name: 0 for s in self._active_skills}
         self._skill_done  = set()
         for skill in self._active_skills:
-            lines = [l.strip() for l in (skill.agent_behavior or "").splitlines()
-                     if l.strip() and not l.strip().startswith("#")]
+            instructions = self._skill_plan_sections(skill)
             tools = set(skill.tools or [])
-            for idx, line in enumerate(lines):
-                self._skill_plan.append({"skill": skill.name, "step": idx, "instruction": line, "tools": tools, "done": False})
+            for idx, instruction in enumerate(instructions):
+                if len(self._skill_plan) >= 24:
+                    break
+                self._skill_plan.append({"skill": skill.name, "step": idx, "instruction": instruction, "tools": tools, "done": False})
         tool_order = ["memory", "planning", "browser", "terminal", "file_editor"]
         self._skill_plan.sort(key=lambda s: next((i for i, t in enumerate(tool_order) if t in s["tools"]), len(tool_order)))
+
+    @staticmethod
+    def _skill_plan_sections(skill) -> list[str]:
+        behavior_lines = (skill.agent_behavior or "").splitlines()
+        step_heading = re.compile(r"^STEP\s+\d+(?:\.\d+)?[A-Za-z]?\s*[—-]\s*.+$", re.IGNORECASE)
+        section_heading = re.compile(r"^[A-Z][A-Z0-9 &/()'-]{2,}$")
+        headings = [
+            line.strip() for line in behavior_lines
+            if line and line == line.lstrip()
+            and (step_heading.fullmatch(line.strip()) or section_heading.fullmatch(line.strip()))
+        ]
+        steps = [heading for heading in headings if step_heading.fullmatch(heading)]
+        if not steps:
+            steps = headings
+        if not steps:
+            steps = [getattr(skill, "description", "Follow the skill procedure")]
+        return steps[:12]
 
     def _skill_plan_summary(self) -> str:
         if not self._skill_plan:
@@ -406,6 +428,12 @@ class PenzerAgent:
         self._active_skills.append(skill)
         self._matched_skills.append(skill.name)
         self._novel_task = False
+        skill_heading = f"## SELF-SELECTED CORE SKILL: {skill.name}"
+        if skill_heading not in self._system_prompt:
+            self._system_prompt = (
+                f"{self._system_prompt.rstrip()}\n\n{skill_heading}\n"
+                f"{(skill.agent_behavior or '').strip()}"
+            )
         self._emit_activity("skill", "Skill selected", message=f"Model self-selected skill '{skill.name}'.",
                              status="success", details={"skill": skill.name})
         self._record_step("recovery", f"Model self-selected skill '{skill.name}' — promoting into the active plan.")
@@ -914,10 +942,10 @@ class PenzerAgent:
         return "Stopped: internal error (loop exited without a result)"
 
     def _llm_failure_result(self) -> str | None:
-        reason = self._last_llm_error or "rate_limit"
+        reason = self._last_llm_error or "error"
         if reason == "timeout":
             return "⏱️ LLM request timed out. No tool was executed."
-        if reason == "error":
+        if reason in {"error", "llm_error"}:
             return "LLM request failed. Try again in a moment."
         if reason == "connection":
             return "🌐 LLM connection failed. Check your network and try again."
@@ -927,7 +955,13 @@ class PenzerAgent:
             return "🔑 LLM access denied. Check your credentials."
         if reason == "service_unavailable":
             return "🔌 LLM service unavailable. Try again later."
-        return "Rate limit exceeded. Try again in a moment."
+        if reason == "server":
+            return "⚠️ LLM server error. Try again in a moment."
+        if reason == "http_error":
+            return "LLM provider returned an HTTP error. Check provider status and try again."
+        if reason == "rate_limit":
+            return "Rate limit exceeded. Try again in a moment."
+        return "LLM request failed. Try again in a moment."
 
     def _append_assistant_turn(self, text: str, calls: list) -> None:
         """Always emits a clean human-readable status this iteration —
@@ -1365,6 +1399,23 @@ class PenzerAgent:
 
             structured_result = self._parse_structured_result(str(raw))
             result_data = structured_result.get("data", {}) if isinstance(structured_result, dict) else {}
+            if name == "browser" and c.get("arguments", {}).get("action") == "search" and result_data.get("no_relevant_results"):
+                run_trace = self._trace[self._resume_boundary_trace_len:]
+                search_attempts = [
+                    entry for entry in run_trace
+                    if entry.get("tool") == "browser"
+                    and (entry.get("args") or {}).get("action") == "search"
+                ]
+                if len(search_attempts) >= 2 and all(not entry.get("success") for entry in search_attempts[-2:]):
+                    answer = "Browser search returned no relevant results twice. I stopped without making a factual summary."
+                    self._done = True
+                    self._direct_tool_answer = True
+                    self._belief["goal_progress"] = "failed"
+                    self.history.append({"role": "assistant", "content": answer})
+                    self._record_step("final_answer", answer, reason="browser_search_no_relevant_results")
+                    self._persist_all()
+                    return answer
+
             if name == "browser" and isinstance(result_data, dict) and result_data.get("blocked"):
                 page_url = str(result_data.get("url") or c.get("arguments", {}).get("url") or "the requested page")
                 block_reason = str(result_data.get("block_reason") or "The site blocked automated access.")
@@ -1501,7 +1552,16 @@ class PenzerAgent:
                     
             except Exception as e:
                 err = str(e).lower()
-                if any(x in err for x in ("rate", "429", "quota", "limit")):
+                normalized_error_type = type(e).__name__.lower().replace("_", "")
+                is_rate_limited = (
+                    isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 429
+                    or normalized_error_type in {"ratelimiterror", "toomanyrequests"}
+                    or any(phrase in err for phrase in (
+                        "rate limit", "rate_limit", "too many requests",
+                        "quota exceeded", "quota_exceeded",
+                    ))
+                )
+                if is_rate_limited:
                     self._rate_attempts += 1
                     wait = min(RATE_LIMIT_MAX, RATE_LIMIT_BASE + random.uniform(0, RATE_LIMIT_JITTER))
                     if attempt < max_attempts - 1:
@@ -1522,7 +1582,7 @@ class PenzerAgent:
                 logger.error("LLM error: %s", e)
                 self._last_llm_error = "error"
                 return None
-        self._last_llm_error = "rate_limit"
+            self._last_llm_error = "error"
         return None
 
     def _msgs(self, step: int) -> list[dict]:

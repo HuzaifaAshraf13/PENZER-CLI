@@ -10,7 +10,9 @@ keywords: [terminal, bash, shell, command, execute, run, script, python, timeout
            server, service, database, migrate, migration, disk, memory, cpu, uptime, sysinfo, system,
            download, upload, curl, wget, npm, pip, apt, brew, yarn, cron, schedule, backup, archive,
            compress, extract, zip, tar, secret, secrets, token, credentials, platform, os, linux,
-           macos, windows, dry-run, cleanup, temp, tmp]
+           macos, windows, dry-run, cleanup, temp, tmp, network route, network routes,
+           network interfaces, dns lookup, internet connection, ip address, traceroute,
+           network diagnostics]
 tools: [terminal, terminal_check_job, terminal_kill, run_bash, run_python]
 agent_behavior: |
   STEP 0 — SELF-ASSESS RISK (before picking anything)

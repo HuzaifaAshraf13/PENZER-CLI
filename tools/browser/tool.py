@@ -5,24 +5,28 @@ import atexit
 import json
 import logging
 import os
-import re
 import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Optional, Any, Dict, List
-from dataclasses import dataclass, field
-from urllib.parse import quote, urlencode, urlparse
-from xml.etree import ElementTree
 
 import requests
 
 try:
     from cdpify import Client
-    from cdpify.events import RawCDPEvent
 except ImportError as exc:
     raise ImportError("cdpify is required: pip install cdpify") from exc
+
+from . import runtime
+from .policy import is_government_domain as _is_government_domain
+from .policy import is_http_url as _is_http_url
+from .results import error, success, warning
+from .search import search_web
+from .session import CDPSession
+from .tabs import capture_events as _capture_events
+from .tabs import refresh_tabs as _refresh_tabs
 
 
 logger = logging.getLogger(__name__)
@@ -35,203 +39,38 @@ _session_lock = threading.RLock()
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
-@dataclass
-class CDPSession:
-    session_id: str
-    client: Optional[Any] = None
-    root_client: Optional[Client] = None
-    target_id: str = ""
-    port: int = 0
-    process: Optional[subprocess.Popen] = None
-    element_refs: Dict[str, Dict] = field(default_factory=dict)
-    target_clients: Dict[str, Any] = field(default_factory=dict)
-    target_sessions: Dict[str, str] = field(default_factory=dict)
-    event_tasks: List[asyncio.Task] = field(default_factory=list)
-    network_events: List[Dict[str, Any]] = field(default_factory=list)
-    next_ref: int = 1
-    console_messages: List[Dict[str, str]] = field(default_factory=list)
-    last_error: str = ""
-    action_count: int = 0
-    url: str = ""
-
-
-def success(data: Any = None, message: str = "") -> Dict:
-    return {
-        "status": "success",
-        "message": message or "OK",
-        "data": data if data is not None else {},
-    }
-
-
-def error(message: str, data: Any = None) -> Dict:
-    return {
-        "status": "error",
-        "message": message,
-        "data": data if data is not None else {},
-    }
-
-
-def warning(message: str, data: Any = None) -> Dict:
-    return {
-        "status": "warning",
-        "message": message,
-        "data": data if data is not None else {},
-    }
-
-
 def _candidate_chrome_binaries() -> List[str]:
-    preferred = os.getenv("PENZER_CHROME_BINARY")
-    if preferred:
-        return [preferred]
-    return [
-        "google-chrome",
-        "google-chrome-stable",
-        "chromium",
-        "chromium-browser",
-        "microsoft-edge",
-        "microsoft-edge-stable",
-        "brave-browser",
-    ]
+    return runtime.candidate_chrome_binaries(os.environ)
 
 
 def _verify_chrome_binary(binary: str) -> bool:
-    """Verify Chrome binary exists and is functional."""
-    try:
-        result = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            timeout=5,
-        )
-        return result.returncode == 0
-    except Exception as exc:
-        logger.error("Chrome verification failed for %s: %s", binary, exc)
-        return False
+    return runtime.verify_chrome_binary(binary, subprocess)
 
 
 def _browser_profile_dir(session_id: str) -> Path:
-    profile_root = Path(os.getenv(
-        "PENZER_BROWSER_PROFILE_ROOT",
-        Path(__file__).resolve().parents[2] / "data" / "browser_profiles",
-    ))
-    profile_name = quote(session_id, safe="._-") or "default"
-    if profile_name in {".", ".."}:
-        profile_name = f"_{profile_name.replace('.', 'dot')}"
-    profile_dir = (profile_root / profile_name).resolve()
-    personal_roots = (
-        Path.home() / ".config" / "google-chrome",
-        Path.home() / ".config" / "chromium",
-        Path.home() / ".config" / "microsoft-edge",
-        Path.home() / ".config" / "BraveSoftware" / "Brave-Browser",
-        Path.home() / "Library" / "Application Support" / "Google" / "Chrome",
-        Path.home() / "Library" / "Application Support" / "Chromium",
-        Path.home() / "Library" / "Application Support" / "Microsoft Edge",
-        Path.home() / "Library" / "Application Support" / "BraveSoftware" / "Brave-Browser",
-        Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Google" / "Chrome" / "User Data",
-        Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Microsoft" / "Edge" / "User Data",
-    )
-    if any(profile_dir == root.resolve() or root.resolve() in profile_dir.parents for root in personal_roots):
-        raise ValueError("Browser profile root must not be inside a personal Chrome-family profile")
-    return profile_dir
+    return runtime.browser_profile_dir(session_id, os.environ)
 
 
 def _spawn_chrome(session_id: str) -> subprocess.Popen:
-    for binary in _candidate_chrome_binaries():
-        if _verify_chrome_binary(binary):
-            break
-    else:
-        raise RuntimeError("Chrome binary not found or broken in common locations")
-
-    profile_dir = _browser_profile_dir(session_id)
-    profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    chrome_args = [
-        binary,
-        "--remote-debugging-port=0",
-        f"--user-data-dir={profile_dir}",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-    ]
-    if os.getenv("PENZER_BROWSER_HEADLESS", "1").lower() not in {"0", "false", "no"}:
-        chrome_args.append("--headless=new")
-
-    try:
-        return subprocess.Popen(
-            chrome_args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid if hasattr(os, "setsid") else None,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Chrome not found: {binary}") from exc
+    return runtime.spawn_chrome(
+        session_id,
+        environ=os.environ,
+        candidate_binaries=_candidate_chrome_binaries,
+        verify_binary=_verify_chrome_binary,
+        profile_dir=_browser_profile_dir,
+        subprocess_module=subprocess,
+        os_module=os,
+    )
 
 
 async def _get_debugger_url(profile_dir: str, timeout: int = 15) -> tuple[int, str]:
-    deadline = time.monotonic() + timeout
-    port_file = Path(profile_dir) / "DevToolsActivePort"
-
-    while time.monotonic() < deadline:
-        try:
-            lines = (await asyncio.to_thread(port_file.read_text, encoding="ascii")).splitlines()
-            port = int(lines[0])
-            response = await asyncio.to_thread(
-                requests.get, f"http://127.0.0.1:{port}/json/version", timeout=2,
-            )
-            response.raise_for_status()
-            return port, response.json()["webSocketDebuggerUrl"]
-        except (OSError, ValueError, IndexError, KeyError, requests.RequestException):
-            await asyncio.sleep(0.1)
-
-    raise RuntimeError(f"Chrome did not publish a debugger endpoint in {timeout}s")
+    return await runtime.get_debugger_url(profile_dir, timeout, requests)
 
 
 def _kill_chrome(pid: int, process: Optional[subprocess.Popen] = None):
-    if process is not None and process.poll() is not None:
-        return
-
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except Exception as exc:
-        logger.debug("Chrome graceful cleanup failed: %s", exc)
-        if process is not None:
-            try:
-                process.terminate()
-            except OSError:
-                pass
-
-    if process is not None:
-        try:
-            process.wait(timeout=3)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-
-    try:
-        if hasattr(os, "killpg"):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        elif process is not None:
-            process.kill()
-        else:
-            os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except Exception as exc:
-        logger.warning("Chrome force cleanup failed for %s: %s", pid, exc)
-        if process is not None:
-            try:
-                process.kill()
-            except OSError:
-                pass
-    finally:
-        if process is not None:
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                logger.error("Chrome process %s did not exit after SIGKILL", pid)
+    runtime.kill_chrome(
+        pid, process, os_module=os, signal_module=signal, subprocess_module=subprocess,
+    )
 
 
 def _get_event_loop() -> asyncio.AbstractEventLoop:
@@ -309,21 +148,6 @@ async def _wait_for_page(client: Client, selector: str = "", text: str = "", tim
             return True
         await asyncio.sleep(0.2)
     return False
-
-
-def _is_http_url(url: str) -> bool:
-    parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _is_government_domain(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower().rstrip(".")
-    return (
-        host.endswith(".gov")
-        or ".gov." in host
-        or host.endswith(".mil")
-        or ".mil." in host
-    )
 
 
 async def _get_page_metadata(client: Client) -> Dict[str, str]:
@@ -726,129 +550,8 @@ async def _upload_file(client: Client, ref: str, filepath: str, session: CDPSess
     return True
 
 
-async def _refresh_tabs(session: CDPSession) -> List[Dict[str, str]]:
-    if session.root_client is None:
-        return []
-    result = await session.root_client.execute("Target.getTargets")
-    targets = [target for target in result.get("targetInfos", []) if target.get("type") == "page"]
-    live_ids = {target["targetId"] for target in targets}
-    for target_id in list(session.target_clients):
-        if target_id not in live_ids:
-            session.target_clients.pop(target_id, None)
-            session.target_sessions.pop(target_id, None)
-    for target in targets:
-        target_id = target["targetId"]
-        if target_id not in session.target_clients:
-            attached = await session.root_client.execute(
-                "Target.attachToTarget", {"targetId": target_id, "flatten": True}
-            )
-            session.target_sessions[target_id] = attached["sessionId"]
-            session.target_clients[target_id] = session.root_client.session(attached["sessionId"])
-            await session.target_clients[target_id].execute("Page.enable")
-            await session.target_clients[target_id].execute("Runtime.enable")
-            await session.target_clients[target_id].execute("Network.enable")
-    if session.target_id not in live_ids and targets:
-        session.target_id = targets[0]["targetId"]
-        session.client = session.target_clients[session.target_id]
-        session.element_refs.clear()
-    return [{
-        "id": target["targetId"],
-        "url": target.get("url", ""),
-        "title": target.get("title", ""),
-        "active": target["targetId"] == session.target_id,
-    } for target in targets]
-
-
-async def _capture_events(root_client: Client, session: CDPSession, event_name: str) -> None:
-    try:
-        async for received in root_client.listen_all(event_name, RawCDPEvent):
-            event = received.value
-            params = event.params
-            session_id = received.session_id
-            target_id = next((
-                target_id for target_id, value in session.target_sessions.items()
-                if value == session_id
-            ), "")
-            if event_name == "Runtime.consoleAPICalled":
-                args = params.get("args", [])
-                message = " ".join(str(arg.get("value", arg.get("description", ""))) for arg in args)
-                session.console_messages.append({
-                    "type": str(params.get("type", "log")),
-                    "text": message[:500],
-                    "url": str((params.get("stackTrace", {}).get("callFrames") or [{}])[0].get("url", "")),
-                })
-                del session.console_messages[:-50]
-            else:
-                session.network_events.append({
-                    "event": event_name.rsplit(".", 1)[-1],
-                    "target": target_id,
-                    "url": str(params.get("request", {}).get("url") or params.get("response", {}).get("url") or "")[:500],
-                    "method": str(params.get("request", {}).get("method", "")),
-                    "status": params.get("response", {}).get("status"),
-                    "error": str(params.get("errorText", "")),
-                })
-                del session.network_events[:-100]
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.debug("CDP event stream ended: %s", event_name, exc_info=True)
-
-
 async def _search_web(query: str) -> Dict[str, Any]:
-    query = query.strip()
-    if not query:
-        return error("Search query required")
-    url = f"https://www.bing.com/search?{urlencode({'format': 'rss', 'q': query})}"
-    try:
-        response = await asyncio.to_thread(requests.get, url, timeout=15)
-        response.raise_for_status()
-        rss = ElementTree.fromstring(response.content)
-    except (requests.RequestException, ElementTree.ParseError) as exc:
-        return error(f"Search request failed: {exc}")
-
-    results = []
-    for result in rss.iter():
-        if result.tag.rsplit("}", 1)[-1].lower() != "item":
-            continue
-        fields = {
-            child.tag.rsplit("}", 1)[-1].lower(): (child.text or "").strip()
-            for child in result
-        }
-        if fields.get("title") and fields.get("link"):
-            results.append({
-                "title": fields["title"],
-                "url": fields["link"],
-                "snippet": fields.get("description", ""),
-                "date": fields.get("pubdate", ""),
-            })
-
-    query_terms = {
-        token for token in re.findall(r"[a-z0-9]+", query.lower())
-        if len(token) > 2 and token not in {"the", "and", "for", "official", "latest", "current"}
-    }
-    for item in results:
-        item["government_domain"] = _is_government_domain(item["url"])
-        candidate_text = " ".join(str(item.get(key, "")) for key in ("title", "url", "snippet")).lower()
-        item["query_matches"] = sorted(
-            term for term in query_terms
-            if re.search(rf"\b{re.escape(term)}\b", candidate_text)
-            or any(term in token for token in re.findall(r"[a-z0-9]+", candidate_text) if len(token) > len(term))
-        )
-        item["relevance"] = len(item["query_matches"])
-    results.sort(
-        key=lambda item: (int(item.get("relevance", 0)), bool(item.get("government_domain"))),
-        reverse=True,
-    )
-    government = [item for item in results if item.get("government_domain")]
-    return success({
-        "query": query,
-        "url": url,
-        "title": "Bing search results",
-        "government_domain_candidates": government,
-        "relevant_government_results": [item for item in government if item.get("relevance", 0) >= 2],
-        "results": results,
-        "content": "\n".join(item["snippet"] for item in results if item["snippet"]),
-    }, f"Searched the web for {query}")
+    return await search_web(query)
 
 
 async def _get_page_content(client: Client) -> str:
@@ -1417,10 +1120,37 @@ async def _close_session_async(session: CDPSession) -> None:
 
 
 def _cleanup_owned_chrome() -> None:
+    global _event_loop
     with _session_lock:
         sessions = list(_sessions.items())
         starting = list(_starting_processes.items())
         pids = dict(_chrome_pids)
+
+    loop = _event_loop
+    if loop is not None and not loop.is_closed():
+        if loop.is_running():
+            logger.error("Browser event loop is still running during shutdown; cancelling session listeners")
+            for _, session in sessions:
+                for task in session.event_tasks:
+                    loop.call_soon_threadsafe(task.cancel)
+        else:
+            async def close_sessions() -> None:
+                await asyncio.gather(
+                    *(_close_session_async(session) for _, session in sessions),
+                    return_exceptions=True,
+                )
+
+            try:
+                loop.run_until_complete(close_sessions())
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception:
+                logger.exception("Failed to drain browser CDP sessions during shutdown")
+            finally:
+                if not loop.is_running() and not loop.is_closed():
+                    loop.close()
+                    _event_loop = None
+
     for session_id, session in sessions:
         pid = pids.get(session_id)
         process = session.process

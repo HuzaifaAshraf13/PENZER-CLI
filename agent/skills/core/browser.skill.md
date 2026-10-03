@@ -2,7 +2,7 @@
 skill_id: core.browser
 name: Browser Automation & Web Intelligence
 description: Control Penzer's isolated CDP Chrome for compact page snapshots, search, and authorized interaction
-keywords: [browser, chrome, cdp, click, type, press, navigate, url, screenshot, snapshot, elements, content, extract, scroll, hover, select, tabs, downloads, upload, network, console, web, automation, search, research]
+keywords: [browser, chrome, cdp, click, type, press, navigate, url, screenshot, snapshot, elements, content, extract, scroll, hover, select, tabs, downloads, upload, network requests, browser network diagnostics, console, web, automation, search, research]
 tools: [browser, browser_info, browser_close, browser_list, browser_close_all, browser_abort]
 agent_behavior: |
   Browser uses Penzer-owned Chrome processes through CDP/cdpify. Every session has an isolated user-data directory; never attach to a personal Chrome profile.

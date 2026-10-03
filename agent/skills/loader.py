@@ -5,14 +5,40 @@ Core skills → always loaded, always shown to agent.
 """
 import yaml
 import logging
+import math
+import re
 from pathlib import Path
 from typing import List, Optional
-from datetime import datetime, timedelta
 from agent.skills.base import Skill
 
 logger      = logging.getLogger(__name__)
 SKILLS_DIR  = Path(__file__).parent
 CORE_DIR    = SKILLS_DIR / "core"
+VALID_SKILL_TOOLS = {
+    "browser", "browser_info", "browser_close", "browser_list", "browser_close_all", "browser_abort",
+    "file_editor", "memory", "terminal", "terminal_check_job", "terminal_kill",
+    "run_bash", "run_python", "plugin_tool",
+}
+_SKILL_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
+
+
+def _required_text(meta: dict, key: str) -> str:
+    value = meta.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return value.strip()
+
+
+def _string_list(meta: dict, key: str) -> List[str]:
+    value = meta.get(key)
+    if not isinstance(value, list):
+        raise ValueError(f"{key} must be a list")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"{key} must contain only non-empty strings")
+    cleaned = [item.strip() for item in value]
+    if len({item.lower() for item in cleaned}) != len(cleaned):
+        raise ValueError(f"{key} must not contain duplicates")
+    return cleaned
 
 def _parse(path: Path) -> Optional[Skill]:
     try:
@@ -25,21 +51,28 @@ def _parse(path: Path) -> Optional[Skill]:
         if not isinstance(meta, dict) or not meta:
             raise ValueError("frontmatter did not produce a mapping")
 
-        skill_id = str(meta.get("skill_id") or path.stem)
-        name = str(meta.get("name") or path.stem)
-        description = str(meta.get("description") or "")
-        keywords = meta.get("keywords") or []
-        tools = meta.get("tools") or []
-        agent_behavior = str(meta.get("agent_behavior") or "")
-        priority = float(meta.get("priority", 0.5))
-        core = bool(meta.get("core", False))
-        version = str(meta.get("version", "1.0"))
+        skill_id = _required_text(meta, "skill_id")
+        if not _SKILL_ID_RE.fullmatch(skill_id):
+            raise ValueError("skill_id must use lowercase letters, digits, '.', '_' or '-'")
+        name = _required_text(meta, "name")
+        description = _required_text(meta, "description")
+        keywords = _string_list(meta, "keywords")
+        tools = _string_list(meta, "tools")
+        agent_behavior = _required_text(meta, "agent_behavior")
+        unknown_tools = sorted(set(tools) - VALID_SKILL_TOOLS)
+        if unknown_tools:
+            raise ValueError(f"tools contains unknown tool names: {', '.join(unknown_tools)}")
+        raw_priority = meta.get("priority", 0.5)
+        if isinstance(raw_priority, bool) or not isinstance(raw_priority, (int, float)):
+            raise ValueError("priority must be a number between 0 and 1")
+        priority = float(raw_priority)
+        if not math.isfinite(priority) or not 0 <= priority <= 1:
+            raise ValueError("priority must be a finite number between 0 and 1")
+        core = meta.get("core", False)
+        if not isinstance(core, bool):
+            raise ValueError("core must be a boolean")
+        version = _required_text(meta, "version") if "version" in meta else "1.0"
         generated_at = None
-
-        if not isinstance(keywords, list):
-            raise ValueError("keywords must be a list")
-        if not isinstance(tools, list):
-            raise ValueError("tools must be a list")
 
         return Skill(
             skill_id=skill_id,
