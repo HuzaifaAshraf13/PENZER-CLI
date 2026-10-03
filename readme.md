@@ -132,12 +132,19 @@ apikey local http://localhost:8000
 ## Browser automation
 **Features:**
 - Chrome DevTools Protocol via cdpify
-- Headless browser control (open, navigate, wait)
+- Headless or optional visible Chrome control (search, open, navigate)
 - Element snapshots with refs (@e1, @e2, etc.)
-- Click, type, screenshot, extract content
+- CDP mouse clicks, text input, key presses, screenshots, and content extraction
 - Page evaluation (JavaScript)
-- Session management (multi-browser support)
+- Persistent per-session Chrome profiles for cookies and sign-ins
 - Automatic element detection (buttons, links, inputs, clickable)
+
+Profiles are stored under `data/browser_profiles/<session_id>` by default. Set
+`PENZER_BROWSER_PROFILE_ROOT` to change the profile root. Chrome runs headless
+by default; set `PENZER_BROWSER_HEADLESS=0` in a graphical session to show the
+browser and handle user-assisted login or site challenges. Profiles contain
+cookies and other site data, so keep them private. These options do not bypass
+site access controls.
 
 ---
 

@@ -165,7 +165,6 @@ Tool syntax:
   {"tool": "terminal",    "args": {"command": "ls -la"}}
   {"tool": "terminal",    "args": {"command": "...", "timeout": 600, "background": true, "session_id": "..."}}
   {"tool": "terminal_check_job", "args": {"job_id": "..."}}
-  {"tool": "browser",     "args": {"action": "search", "query": "..."}}
   {"tool": "file_editor", "args": {"action": "read", "filepath": "..."}}
   {"tool": "memory",      "args": {"action": "store", "key": "x", "value": "y"}}
   {"tool": "memory",      "args": {"action": "get", "key": "x"}}

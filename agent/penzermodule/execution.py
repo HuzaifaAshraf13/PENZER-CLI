@@ -20,7 +20,9 @@ from tools.file_editor.tool import file_editor_direct
 from tools.terminal.tool import terminal_direct, terminal_check_job_direct, terminal_kill_direct
 from tools.browser.tool import (
     browser_abort_direct,
+    browser_close_all,
     browser_direct,
+    browser_list,
     browser_info_direct,
     browser_close_direct,
 )
@@ -39,7 +41,10 @@ TOOL_TIMEOUT = 30
 TOOL_BROWSER_TIMEOUT = 90
 TOOL_TERMINAL_DEFAULT_TIMEOUT = 60  # mirrors tools/terminal.py's default
 PLUGIN_SUBPROCESS_TIMEOUT = TOOL_TERMINAL_DEFAULT_TIMEOUT
-NON_IDEMPOTENT_TOOLS = {"terminal", "run_bash", "run_python", "browser"}
+NON_IDEMPOTENT_TOOLS = {
+    "terminal", "run_bash", "run_python", "browser", "browser_close",
+    "browser_close_all", "browser_abort",
+}
 MAX_EXPLICIT_TOOL_TIMEOUT = 600
 TIMEOUT_MARGIN = 10  # headroom beyond executor.py's own internal timeout/cleanup
 
@@ -51,6 +56,9 @@ DIRECT_TOOLS = {
     "browser": browser_direct,
     "browser_info": browser_info_direct,
     "browser_close": browser_close_direct,
+    "browser_list": browser_list,
+    "browser_close_all": browser_close_all,
+    "browser_abort": browser_abort_direct,
 }
 
 _DANGEROUS_PLUGIN_PATTERNS = re.compile(
@@ -137,7 +145,7 @@ def _requires_serial_execution(call: dict) -> bool:
     """Keep side-effecting calls ordered within one model turn."""
     name = str(call.get("name", ""))
     args = call.get("arguments") or {}
-    if name in {"browser", "browser_info", "browser_close", "browser_list", "browser_close_all"}:
+    if name in {"browser", "browser_info", "browser_close", "browser_list", "browser_close_all", "browser_abort"}:
         return True
     if name in {"terminal_check_job", "terminal_kill", "file_editor"}:
         if name != "file_editor":
