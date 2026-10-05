@@ -17,7 +17,12 @@ from tools.executor import (
 from session.memory import get_skill_metric, kv_store, kv_get, kv_list, kv_delete
 from agent.activity_timeline import emit_activity_event, update_activity_event
 from tools.file_editor.tool import file_editor_direct
-from tools.terminal.tool import terminal_direct, terminal_check_job_direct, terminal_kill_direct
+from tools.terminal.tool import (
+    terminal_direct,
+    terminal_check_job_direct,
+    terminal_list_jobs_direct,
+    terminal_kill_direct,
+)
 from tools.browser.tool import (
     browser_abort_direct,
     browser_close_all,
@@ -51,6 +56,7 @@ TIMEOUT_MARGIN = 10  # headroom beyond executor.py's own internal timeout/cleanu
 DIRECT_TOOLS = {
     "terminal": terminal_direct,
     "terminal_check_job": terminal_check_job_direct,
+    "terminal_list_jobs": terminal_list_jobs_direct,
     "terminal_kill": terminal_kill_direct,
     "file_editor": file_editor_direct,
     "browser": browser_direct,
@@ -147,7 +153,7 @@ def _requires_serial_execution(call: dict) -> bool:
     args = call.get("arguments") or {}
     if name in {"browser", "browser_info", "browser_close", "browser_list", "browser_close_all", "browser_abort"}:
         return True
-    if name in {"terminal_check_job", "terminal_kill", "file_editor"}:
+    if name in {"terminal_check_job", "terminal_list_jobs", "terminal_kill", "file_editor"}:
         if name != "file_editor":
             return True
         return str(args.get("action", "")).lower() in {"write", "append", "replace", "delete", "create", "move", "rename"}
@@ -233,7 +239,7 @@ async def execute_single_tool(agent, call: dict) -> tuple[str, float]:
     return raw, round(time.time() - start, 2)
 
 
-async def run_speculative(agent, calls: list) -> list[tuple[str, float]]:
+async def run_speculative(agent, calls: list, on_start=None) -> list[tuple[str, float]]:
     """Keep the execution path deliberately simple: when a batch is
     intentionally parallel, execute it in parallel without hidden
     "first-success" race heuristics. The agent loop decides which answer
@@ -244,9 +250,9 @@ async def run_speculative(agent, calls: list) -> list[tuple[str, float]]:
     loop harder to reason about than the gains justify.
     """
     if len(calls) <= 1:
-        return await run_parallel(agent, calls)
+        return await run_parallel(agent, calls, on_start=on_start)
     if any(_requires_serial_execution(call) for call in calls):
-        return await run_sequential(agent, calls)
+        return await run_sequential(agent, calls, on_start=on_start)
     if any(
         c.get("name") == "terminal" and requires_privilege_escalation(str(
             (c.get("arguments") or {}).get("command")
@@ -255,13 +261,15 @@ async def run_speculative(agent, calls: list) -> list[tuple[str, float]]:
         ))[0]
         for c in calls
     ):
-        return await run_parallel(agent, calls)
-    return await run_parallel(agent, calls)
+        return await run_parallel(agent, calls, on_start=on_start)
+    return await run_parallel(agent, calls, on_start=on_start)
 
 
-async def run_sequential(agent, calls: list) -> list[tuple[str, float]]:
+async def run_sequential(agent, calls: list, on_start=None) -> list[tuple[str, float]]:
     results = []
-    for call in calls:
+    for index, call in enumerate(calls):
+        if on_start is not None:
+            on_start(index, call)
         results.append(await execute_single_tool(agent, call))
     return results
 
@@ -336,10 +344,18 @@ async def run_with_fallback(agent, call: dict, prior_result: tuple[str, float] |
     return raw, elapsed
 
 
-async def run_parallel(agent, calls: list) -> list[tuple[str, float]]:
+async def run_parallel(agent, calls: list, on_start=None) -> list[tuple[str, float]]:
     """gather(..., return_exceptions=True) so one call raising doesn't
     crash its siblings or propagate past this boundary."""
-    results = await asyncio.gather(*[execute_single_tool(agent, c) for c in calls], return_exceptions=True)
+    async def execute_started(index: int, call: dict) -> tuple[str, float]:
+        if on_start is not None:
+            on_start(index, call)
+        return await execute_single_tool(agent, call)
+
+    results = await asyncio.gather(
+        *(execute_started(index, call) for index, call in enumerate(calls)),
+        return_exceptions=True,
+    )
     out = []
     for c, r in zip(calls, results):
         if isinstance(r, Exception):

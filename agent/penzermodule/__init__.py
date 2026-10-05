@@ -1,3 +1,5 @@
-"""PENZER — the only two things kept out of agent.py: tool-dispatch
-mechanics (execution.py) and the resource monitor (resource_monitor.py).
-Both are plain functions/a self-contained class, not manager classes."""
+"""Agent subsystems kept separate from PenzerAgent's state and policy.
+
+The modules expose plain functions for iteration control and tool dispatch,
+plus a self-contained resource monitor; they do not introduce manager classes.
+"""

@@ -7,13 +7,14 @@ Each tool is in its own file:
   - file_editor/tool.py: file_editor()
 """
 
-from tools.terminal.tool import terminal, terminal_check_job, terminal_kill
+from tools.terminal.tool import terminal, terminal_check_job, terminal_list_jobs, terminal_kill
 from tools.browser.tool import browser
 from tools.file_editor.tool import file_editor
 
 __all__ = [
     "terminal",
     "terminal_check_job",
+    "terminal_list_jobs",
     "terminal_kill",
     "browser",
     "file_editor",

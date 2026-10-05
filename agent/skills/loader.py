@@ -16,7 +16,7 @@ SKILLS_DIR  = Path(__file__).parent
 CORE_DIR    = SKILLS_DIR / "core"
 VALID_SKILL_TOOLS = {
     "browser", "browser_info", "browser_close", "browser_list", "browser_close_all", "browser_abort",
-    "file_editor", "memory", "terminal", "terminal_check_job", "terminal_kill",
+    "file_editor", "memory", "terminal", "terminal_check_job", "terminal_list_jobs", "terminal_kill",
     "run_bash", "run_python", "plugin_tool",
 }
 _SKILL_ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
@@ -40,6 +40,44 @@ def _string_list(meta: dict, key: str) -> List[str]:
         raise ValueError(f"{key} must not contain duplicates")
     return cleaned
 
+
+def _workflow_list(meta: dict, allowed_tools: set[str]) -> List[dict]:
+    workflow = meta.get("workflow", [])
+    if not isinstance(workflow, list):
+        raise ValueError("workflow must be a list")
+    if len(workflow) > 12:
+        raise ValueError("workflow must contain at most 12 steps")
+
+    cleaned = []
+    for index, raw_step in enumerate(workflow, 1):
+        if not isinstance(raw_step, dict):
+            raise ValueError(f"workflow step {index} must be a mapping")
+        title = raw_step.get("title")
+        success_criteria = raw_step.get("success_criteria")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError(f"workflow step {index} title must be non-empty text")
+        if not isinstance(success_criteria, str) or not success_criteria.strip():
+            raise ValueError(f"workflow step {index} success_criteria must be non-empty text")
+        step_tools = raw_step.get("tools", [])
+        if not isinstance(step_tools, list) or any(
+            not isinstance(tool, str) or not tool.strip() for tool in step_tools
+        ):
+            raise ValueError(f"workflow step {index} tools must be a list of tool names")
+        normalized_tools = [tool.strip() for tool in step_tools]
+        unknown_tools = sorted(set(normalized_tools) - allowed_tools)
+        if unknown_tools:
+            raise ValueError(
+                f"workflow step {index} uses unknown tools: {', '.join(unknown_tools)}"
+            )
+        if len({tool.lower() for tool in normalized_tools}) != len(normalized_tools):
+            raise ValueError(f"workflow step {index} tools must not contain duplicates")
+        cleaned.append({
+            "title": title.strip(),
+            "tools": normalized_tools,
+            "success_criteria": success_criteria.strip(),
+        })
+    return cleaned
+
 def _parse(path: Path) -> Optional[Skill]:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -59,6 +97,7 @@ def _parse(path: Path) -> Optional[Skill]:
         keywords = _string_list(meta, "keywords")
         tools = _string_list(meta, "tools")
         agent_behavior = _required_text(meta, "agent_behavior")
+        workflow = _workflow_list(meta, VALID_SKILL_TOOLS)
         unknown_tools = sorted(set(tools) - VALID_SKILL_TOOLS)
         if unknown_tools:
             raise ValueError(f"tools contains unknown tool names: {', '.join(unknown_tools)}")
@@ -85,6 +124,7 @@ def _parse(path: Path) -> Optional[Skill]:
             core=core,
             version=version,
             generated_at=generated_at,
+            workflow=workflow,
         )
     except Exception as e:
         logger.error("Failed to parse %s: %s", path.name, e)

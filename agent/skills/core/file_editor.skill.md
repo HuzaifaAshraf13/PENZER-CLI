@@ -4,6 +4,16 @@ name: File Editor
 description: Read, write, edit, append, delete, list, and create files and directories
 keywords: [file, read, write, edit, create, delete, append, replace, list, directory, folder, path, content]
 tools: [file_editor]
+workflow:
+  - title: Inspect the target before editing
+    tools: [file_editor]
+    success_criteria: The current file contents and intended change location are known.
+  - title: Apply the smallest appropriate edit
+    tools: [file_editor]
+    success_criteria: The edit operation reports success and only the requested content changed.
+  - title: Verify the resulting file
+    tools: [file_editor]
+    success_criteria: A follow-up read confirms the requested result is present and intact.
 agent_behavior: |
 
   ACTION REFERENCE

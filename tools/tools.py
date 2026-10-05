@@ -9,13 +9,14 @@ Individual tools are in separate files:
 """
 
 # Import direct tool entry points for compatibility with existing callers.
-from tools.terminal.tool import terminal, terminal_check_job, terminal_kill
+from tools.terminal.tool import terminal, terminal_check_job, terminal_list_jobs, terminal_kill
 from tools.browser.tool import browser, browser_direct, browser_info, browser_close
 from tools.file_editor.tool import file_editor, file_editor_direct
 
 __all__ = [
     "terminal",
     "terminal_check_job",
+    "terminal_list_jobs",
     "terminal_kill",
     "browser",
     "browser_direct",

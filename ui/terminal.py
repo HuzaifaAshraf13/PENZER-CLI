@@ -15,15 +15,16 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
+from rich.markup import escape
+from rich.table import Table
 
 
 SLASH_COMMANDS = (
-    "/help", "/status", "/tools", "/skills", "/memory", "/plan",
-    "/permissions", "/model", "/config", "/session", "/history", "/clear",
-    "/compact", "/retry", "/stop", "/resume", "/exit", "/plugins", "/doctor",
-    "/activity", "/checkpoints", "/dashboard", "/benchmark", "/profile",
-    "/apikey", "/update", "/state",
+    "/help", "/memory", "/plan", "/clear", "/resume", "/exit", "/quit",
+    "/plugins", "/doctor", "/activity", "/drawer", "/checkpoints", "/dashboard",
+    "/benchmark", "/profile", "/apikey", "/update", "/state", "/jobs",
 )
+SUPPORTED_COMMANDS = frozenset(command[1:] for command in SLASH_COMMANDS)
 
 
 def normalize_command(value: str) -> str:
@@ -32,6 +33,13 @@ def normalize_command(value: str) -> str:
     if value.startswith("/"):
         return value[1:].lstrip()
     return value
+
+
+def is_supported_command(value: str) -> bool:
+    """Return whether the first token maps to a built-in CLI command."""
+    normalized = normalize_command(value)
+    command = normalized.split(maxsplit=1)[0].lower() if normalized else ""
+    return command in SUPPORTED_COMMANDS
 
 
 class SlashCommandCompleter(Completer):
@@ -154,6 +162,30 @@ class InteractiveTerminal:
             symbol = symbols.get(status, "○")
             lines.append(f"  {index}. {symbol} {step.get('title', 'Untitled step')}")
         return "\n".join(lines)
+
+    @staticmethod
+    def format_jobs(jobs: list[dict]) -> Table | str:
+        """Render concise background-job metadata without raw output logs."""
+        if not jobs:
+            return "No background jobs found."
+        table = Table(title="Background Jobs", show_lines=False)
+        table.add_column("Job ID", style="cyan", no_wrap=True)
+        table.add_column("Status", no_wrap=True)
+        table.add_column("Workflow")
+        table.add_column("PID", justify="right")
+        table.add_column("Command")
+        for job in jobs:
+            command = " ".join(str(job.get("command") or "").split())
+            if len(command) > 72:
+                command = command[:69] + "..."
+            table.add_row(
+                escape(str(job.get("job_id") or "")),
+                escape(str(job.get("status") or "unknown")),
+                escape(str(job.get("workflow") or "general")),
+                escape(str(job.get("pid") or "")),
+                escape(command),
+            )
+        return table
 
     def toolbar(self) -> str:
         try:

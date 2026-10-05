@@ -4,6 +4,19 @@ name: Browser Automation & Web Intelligence
 description: Control Penzer's isolated CDP Chrome for compact page snapshots, search, and authorized interaction
 keywords: [browser, chrome, cdp, click, type, press, navigate, url, screenshot, snapshot, elements, content, extract, scroll, hover, select, tabs, downloads, upload, network requests, browser network diagnostics, console, web, automation, search, research]
 tools: [browser, browser_info, browser_close, browser_list, browser_close_all, browser_abort]
+workflow:
+  - title: Search or open the most relevant source
+    tools: [browser]
+    success_criteria: A relevant source URL is open, or search results provide a justified next URL.
+  - title: Inspect structured page state
+    tools: [browser]
+    success_criteria: The current page URL, title, and relevant visible content have been inspected using a fresh snapshot or content result.
+  - title: Interact only when the task requires it
+    tools: [browser]
+    success_criteria: The requested interaction is confirmed by updated page state; challenges and access blocks are reported rather than bypassed.
+  - title: Verify sources and return findings
+    tools: [browser, browser_info]
+    success_criteria: Claims are tied to inspected page URLs and limitations or missing evidence are stated.
 agent_behavior: |
   Browser uses Penzer-owned Chrome processes through CDP/cdpify. Every session has an isolated user-data directory; never attach to a personal Chrome profile.
 

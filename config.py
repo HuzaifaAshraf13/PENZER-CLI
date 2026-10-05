@@ -160,7 +160,7 @@ DEFAULT_PROFILE = os.getenv("PENZER_PROFILE", "balanced")
 PROFILE_OPTIONS = {
     "balanced": "Balanced defaults for everyday use",
     "safe": "Safer approvals and fewer risky actions",
-    "fast": "Faster execution with fewer confirmation prompts",
+    "fast": "Low-latency OpenRouter routing and fewer confirmation prompts",
 }
 
 

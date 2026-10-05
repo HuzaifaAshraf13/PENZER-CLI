@@ -21,7 +21,7 @@ Phase state machine — same shape as Claude Code's queryLoop: call model
 Planning lives in the conversation (system prompt + skill hints), not in
 a parallel execution-queue data structure.
 """
-import ast, json, logging, asyncio, signal, time, random, re, itertools, weakref
+import ast, json, logging, asyncio, signal, time, random, re, weakref
 from typing import Any, Callable
 from collections import defaultdict, deque
 
@@ -40,15 +40,16 @@ from session.memory import (
 from session.events import append_event
 from agent.system_prompts import build_system_prompt, _tokenize
 from agent.skills import load_all_skills, build_context_from_history
+from agent.skills import runtime as skill_runtime
 from tools.plugins import load_plugin_tools
 from tools.executor import set_execution_state
 from agent.activity_timeline import emit_activity_event, update_activity_event, get_activity_timeline
 from agent.penzermodule.resource_monitor import ResourceMonitor
-from agent.penzermodule import execution
+from agent.penzermodule import context, execution, loop
 from agent.config import (
-    ITER_BY_COMPLEXITY, TRIM_AT, KEEP_LAST, STUCK_MIN, MAX_FAILURES,
-    ITER_EXTENSION_SIZE, MAX_RUNTIME_SECONDS, ABSOLUTE_MAX_ITER,
-    MAX_TOKENS_PER_RUN, CHECKPOINT_EVERY, COMPLEX_THRESHOLD,
+    ITER_BY_COMPLEXITY, STUCK_MIN, MAX_FAILURES,
+    MAX_RUNTIME_SECONDS, ABSOLUTE_MAX_ITER,
+    MAX_TOKENS_PER_RUN, COMPLEX_THRESHOLD,
     RATE_LIMIT_BASE, RATE_LIMIT_MAX, RATE_LIMIT_JITTER,
     LLM_REQUEST_TIMEOUT, LLM_MAX_RETRIES,
     WORKING_MEMORY_SIZE, ACTION_FORMATTERS, ERROR_PATTERNS,
@@ -58,8 +59,6 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _MAX_IN_MEMORY_STEPS = 500  # caps step-log growth; disk copy is unbounded via _flush_steps
-_MAX_LLM_HISTORY_MESSAGES = 12
-
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)  # strips a ``` / ```json code fence
 
 _MEMORY_CUE_RE = re.compile(
@@ -338,58 +337,14 @@ class PenzerAgent:
         return bool(_MEMORY_CUE_RE.search(query))
 
     def _match_core_skills(self, user_input: str) -> list:
-        """STRONG match: overlap with a skill's curated keywords. WEAK
-        match: 2+ shared words with the skill's own name/description."""
-        lowered = user_input.lower()
-        goal_tokens = _tokenize(user_input)
-        matched = []
-        for skill in self.core_skills:
-            skill_name = (skill.name or "").lower()
-            keyword_tokens = set()
-            keyword_match = False
-            for kw in skill.keywords or []:
-                phrase_tokens = _tokenize(kw)
-                keyword_tokens |= phrase_tokens
-                if phrase_tokens and phrase_tokens.issubset(goal_tokens):
-                    keyword_match = True
-            name_desc_tokens = _tokenize(skill.name or "") | _tokenize(getattr(skill, "description", "") or "")
-            weak_overlap = goal_tokens & (name_desc_tokens - keyword_tokens)
-            if keyword_match or len(weak_overlap) >= 2:
-                matched.append(skill)
-            elif "memory" in skill_name and self._looks_like_memory_query(lowered):
-                matched.append(skill)
-        return matched
+        return skill_runtime.match_core_skills(self, user_input)
 
     def _orchestrate_skills(self) -> None:
-        self._skill_plan  = []
-        self._skill_steps = {s.name: 0 for s in self._active_skills}
-        self._skill_done  = set()
-        for skill in self._active_skills:
-            instructions = self._skill_plan_sections(skill)
-            tools = set(skill.tools or [])
-            for idx, instruction in enumerate(instructions):
-                if len(self._skill_plan) >= 24:
-                    break
-                self._skill_plan.append({"skill": skill.name, "step": idx, "instruction": instruction, "tools": tools, "done": False})
-        tool_order = ["memory", "planning", "browser", "terminal", "file_editor"]
-        self._skill_plan.sort(key=lambda s: next((i for i, t in enumerate(tool_order) if t in s["tools"]), len(tool_order)))
+        skill_runtime.orchestrate_skills(self)
 
     @staticmethod
     def _skill_plan_sections(skill) -> list[str]:
-        behavior_lines = (skill.agent_behavior or "").splitlines()
-        step_heading = re.compile(r"^STEP\s+\d+(?:\.\d+)?[A-Za-z]?\s*[—-]\s*.+$", re.IGNORECASE)
-        section_heading = re.compile(r"^[A-Z][A-Z0-9 &/()'-]{2,}$")
-        headings = [
-            line.strip() for line in behavior_lines
-            if line and line == line.lstrip()
-            and (step_heading.fullmatch(line.strip()) or section_heading.fullmatch(line.strip()))
-        ]
-        steps = [heading for heading in headings if step_heading.fullmatch(heading)]
-        if not steps:
-            steps = headings
-        if not steps:
-            steps = [getattr(skill, "description", "Follow the skill procedure")]
-        return steps[:12]
+        return skill_runtime.skill_plan_sections(skill)
 
     def _skill_plan_summary(self) -> str:
         if not self._skill_plan:
@@ -399,45 +354,18 @@ class PenzerAgent:
         lines = [f"SKILL PLAN [{done}/{total} steps]"]
         for s in [s for s in self._skill_plan if not s["done"]][:3]:
             lines.append(f"  [{s['skill']}] step {s['step']+1}: {s['instruction'][:80]}")
+            if s.get("success_criteria"):
+                lines.append(f"    done when: {s['success_criteria'][:100]}")
         return "\n".join(lines)
 
     def _mark_skill_step_done(self, tool_name: str) -> None:
-        touched = set()
-        for step in self._skill_plan:
-            if step["done"] or step["skill"] in touched:
-                continue
-            if not step["tools"] or tool_name in step["tools"]:
-                step["done"] = True
-                touched.add(step["skill"])
-                self._skill_steps[step["skill"]] = step["step"] + 1
-                if all(s["done"] for s in self._skill_plan if s["skill"] == step["skill"]):
-                    self._skill_done.add(step["skill"])
+        skill_runtime.mark_skill_step_done(self, tool_name)
 
     def _skills_for_tool(self, tool_name: str) -> list:
-        return [s for s in self._active_skills if not set(s.tools or []) or tool_name in set(s.tools or [])]
+        return skill_runtime.skills_for_tool(self, tool_name)
 
     def _apply_skill_selection(self, skill_used: str | None) -> None:
-        """Model can self-report a skill via "skill_used" even if the
-        initial keyword match missed it."""
-        if not skill_used or skill_used in self._matched_skills:
-            return
-        by_name = {s.name: s for s in self.core_skills}
-        skill = by_name.get(skill_used)
-        if skill is None:
-            return
-        self._active_skills.append(skill)
-        self._matched_skills.append(skill.name)
-        self._novel_task = False
-        skill_heading = f"## SELF-SELECTED CORE SKILL: {skill.name}"
-        if skill_heading not in self._system_prompt:
-            self._system_prompt = (
-                f"{self._system_prompt.rstrip()}\n\n{skill_heading}\n"
-                f"{(skill.agent_behavior or '').strip()}"
-            )
-        self._emit_activity("skill", "Skill selected", message=f"Model self-selected skill '{skill.name}'.",
-                             status="success", details={"skill": skill.name})
-        self._record_step("recovery", f"Model self-selected skill '{skill.name}' — promoting into the active plan.")
-        self._orchestrate_skills()
+        skill_runtime.apply_skill_selection(self, skill_used)
 
     # ------------------------------------------------------------------
     # Reflection: JSON extraction, completion eval, post-mortems, stuck
@@ -650,47 +578,7 @@ class PenzerAgent:
             logger.error("Persist snapshot: %s", e)
 
     async def _trim(self) -> None:
-        """Cheap single-stage compaction: keep first + last KEEP_LAST
-        messages verbatim, add checkpoint marker. Matches Codex CLI's
-        death-spiral guard — after 3 consecutive summarizer failures,
-        stop paying for an LLM call on every trim and just truncate.
-        
-        FIX #5: Better checkpoint marker to preserve mid-run facts."""
-        if self._trimming or len(self.history) <= TRIM_AT:
-            return
-        self._trimming = True
-        version = self._history_version
-        snapshot_len = len(self.history)
-        first, mid, tail = self.history[:1], self.history[1:-KEEP_LAST], self.history[-KEEP_LAST:]
-        if not mid:
-            self._trimming = False
-            return
-        summary_content = None
-        if self._trim_failures < 3:
-            try:
-                r = await self.llm.chat(
-                    system=f"Compress history. GOAL: {self._goal}\nKeep goal-relevant facts only. 2-3 sentences: what tried, what worked, what still needed.",
-                    messages=[{"role": "user", "content": "\n".join(f"{m['role']}: {str(m.get('content',''))[:100]}" for m in mid)}],
-                )
-                summary_content = r.get("content", "")
-                self._trim_failures = 0
-            except Exception:
-                self._trim_failures += 1
-                if self._trim_failures == 3:
-                    self._record_step("trim", "Summarizer failed 3 times in a row — falling back to plain truncation for the rest of this run.", reason="compaction_failures")
-        self._trimming = False
-        if self._history_version != version:
-            logger.info("Discarding a trim result — history moved on (a new run/resume started) while this trim was pending.")
-            return
-        appended = self.history[snapshot_len:]
-        if summary_content is not None:
-            checkpoint = (
-                f"[Checkpoint] Iteration {self._iteration}: attempted {' → '.join(t['tool'] for t in self._trace[-5:])}, "
-                f"progress: {self._belief['goal_progress']}. Summary: {summary_content[:150]}"
-            )
-            self.history = first + [{"role": "assistant", "content": checkpoint}] + tail + appended
-        else:
-            self.history = first + tail + appended
+        await context.trim_history(self)
 
     async def _checkpoint(self, iteration: int):
         try:
@@ -904,42 +792,7 @@ class PenzerAgent:
     # -> dispatch tools -> collect results -> check stop -> repeat.
     # ------------------------------------------------------------------
     async def _loop(self) -> str:
-        empty = 0
-        start_at = self._iteration + 1 if self._trace else 0
-        for i in itertools.count(start_at):
-            self._iteration = i
-            stop = self._check_stop_conditions(i)
-            if stop is not None:
-                return stop
-            await self._pre_iteration_tasks(i)
-            r = await self._llm_with_retry(i)
-            if r is None:
-                return self._llm_failure_result()
-            calls, text = r.get("tool_calls") or [], r.get("content", "").strip()
-            calls = execution.route_web_requests_to_browser(self._goal, calls)
-            self._apply_belief_updates(r)
-            self._apply_skill_selection(r.get("skill_used"))
-            if not calls:
-                result, empty = self._handle_empty_calls(text, empty)
-                if result is not None:
-                    return result
-                continue
-            empty = 0
-            self._append_assistant_turn(text, calls)
-            if len(self._trace) - self._resume_boundary_trace_len >= STUCK_MIN and self._stuck():
-                stuck_result = await self._handle_stuck()
-                if stuck_result is not None:
-                    return stuck_result
-                continue
-            self._maybe_show_skill_gate()
-            filtered_calls = self._filter_by_confidence(calls)
-            if not filtered_calls:
-                self.history.append({"role": "user", "content": "All proposed tools had low confidence. Rethink approach."})
-                continue
-            direct_result = await self._execute_tool_calls(filtered_calls, i)
-            if direct_result is not None:
-                return direct_result
-        return "Stopped: internal error (loop exited without a result)"
+        return await loop.run_loop(self)
 
     def _llm_failure_result(self) -> str | None:
         reason = self._last_llm_error or "error"
@@ -986,102 +839,13 @@ class PenzerAgent:
             self.history.append({"role": "user", "content": "[Skill gate] No skills matched. Check YOUR SKILLS first."})
 
     def _check_stop_conditions(self, i: int) -> str | None:
-        """Iteration/time/token/shutdown/resource limits. Returns a
-        terminal result if the loop should stop now, else None."""
-        elapsed = time.time() - self._run_start_time
-        if elapsed > MAX_RUNTIME_SECONDS:
-            self._belief["goal_progress"] = "failed"
-            reason = f"time budget exceeded ({MAX_RUNTIME_SECONDS}s)"
-            self._record_step("give_up", f"Stopping: {reason}.", reason="stop_condition", stop_reason=reason)
-            self._persist_all()
-            save_history(self.history)
-            return f"Stopped: {reason}. Use resume to continue."
-        if i >= self._max_iter:
-            if self._can_extend_iterations():
-                self._max_iter += ITER_EXTENSION_SIZE
-                elapsed = int(time.time() - self._run_start_time)
-                self._record_step("extend",
-                    f"Hit the iteration budget but still making progress — extending by {ITER_EXTENSION_SIZE} "
-                    f"({elapsed}s elapsed of {MAX_RUNTIME_SECONDS}s budget).")
-            else:
-                if not self._budget_prompted:
-                    self._budget_prompted = True
-                    details = {
-                        "iteration": self._iteration,
-                        "max_iter": self._max_iter,
-                        "message": "Iteration budget reached. Resume to continue.",
-                    }
-                    try:
-                        if self.on_budget_prompt(details):
-                            self._max_iter += ITER_EXTENSION_SIZE
-                            self._record_step("extend", f"Iteration budget extended by {ITER_EXTENSION_SIZE} on request.")
-                            return None
-                    except Exception:
-                        logger.exception("on_budget_prompt callback raised")
-                reason, has_specific_reason = "iteration limit reached", False
-                if time.time() - self._run_start_time > MAX_RUNTIME_SECONDS:
-                    reason, has_specific_reason = f"time budget exceeded ({MAX_RUNTIME_SECONDS}s)", True
-                elif self._iteration >= ABSOLUTE_MAX_ITER:
-                    reason, has_specific_reason = "absolute iteration ceiling reached", True
-                elif self._trace and not any(t["success"] for t in self._trace[-3:]):
-                    reason, has_specific_reason = "stopped making progress", True
-                self._belief["goal_progress"] = "failed"
-                self._record_step("give_up", f"Stopping: {reason}.", reason="stop_condition", stop_reason=reason)
-                self._persist_all()
-                return f"Stopped: {reason}" if has_specific_reason else "Iteration limit reached. Use resume to continue."
-        if self._shutdown:
-            self._persist_all()
-            save_history(self.history)
-            return "Interrupted"
-        try:
-            ok, msg = self._monitor.check()
-        except MemoryError:
-            # FIX #7: Better error classification
-            self._record_step("give_up", "Stopping: out of memory",
-                               reason="out_of_memory", stop_reason="out of memory")
-            self._persist_all()
-            save_history(self.history)
-            return "Out of memory — stopping run"
-        except Exception as exc:
-            logger.error("Resource monitor crashed: %s", exc, exc_info=True)
-            self._record_step("give_up", f"Stopping: resource monitor unavailable ({type(exc).__name__})",
-                               reason="resource_monitor_unavailable", stop_reason=f"resource monitor unavailable")
-            self._persist_all()
-            save_history(self.history)
-            return f"Internal error: resource monitor unavailable ({type(exc).__name__})"
-        if not ok:
-            self._persist_all()
-            save_history(self.history)
-            return f"Resource limit: {msg}"
-        tokens_used = getattr(self.llm, "token_estimate", 0) - self._tokens_before_run
-        if tokens_used > MAX_TOKENS_PER_RUN:
-            self._record_step("give_up", f"Stopping: token budget exceeded ({tokens_used}/{MAX_TOKENS_PER_RUN} tokens).",
-                               reason="token_budget", stop_reason=f"token budget exceeded ({tokens_used} tokens)")
-            self._persist_all()
-            return f"Stopped: token budget exceeded ({tokens_used} tokens)"
-        return None
+        return loop.check_stop_conditions(self, i)
 
     async def _pre_iteration_tasks(self, i: int) -> None:
-        if len(self.history) > TRIM_AT and not self._trimming:
-            self._spawn_background(self._trim(), "trim")
-        self._safe_status("Planning next action…" if i == 0 else "Choosing next action…")
-        if (i + 1) % 5 == 0:
-            self._system_prompt = build_system_prompt(
-                core_skills=self._active_skills,
-                memory_context=get_relevant_memories(self._goal, n=3, deep=self._is_complex_task),
-                extra=self._prompt_extra, goal=self._goal,
-                plugin_tools=self.get_plugin_tool_descriptions(),
-            )
-        if (i + 1) % CHECKPOINT_EVERY == 0:
-            await self._checkpoint(i)
+        await loop.pre_iteration_tasks(self, i)
 
     def _apply_belief_updates(self, r: dict) -> None:
-        """Optional fields — omitted means "unchanged", so they persist
-        across turns instead of getting cleared when not restated."""
-        if r.get("assumptions"):
-            self._belief["assumptions"] = [str(a)[:120] for a in r["assumptions"]][:5]
-        if r.get("unknowns"):
-            self._belief["unknowns"] = [str(u)[:120] for u in r["unknowns"]][:5]
+        loop.apply_belief_updates(self, r)
 
     def _looks_like_malformed_tool_payload(self, text: str) -> bool:
         stripped = text.strip()
@@ -1332,17 +1096,17 @@ class PenzerAgent:
                                tool=c["name"], args=c.get("arguments", {}))
             if self._requires_verification(c["name"], c.get("arguments", {})):
                 self._mark_plan_step("execute", "running", f"mutating_tool:{c['name']}")
-        journal_keys = {
-            c.get("id", f"{i}:{index}:{c.get('name', 'tool')}"): c
-            for index, c in enumerate(filtered_calls)
-        }
-        for key, call in journal_keys.items():
+        def journal_tool_started(index: int, call: dict) -> None:
+            key = call.get("id") or f"{i}:{index}:{call.get('name', 'tool')}"
             append_event("tool_started", self._run_id, {
                 "idempotency_key": key,
                 "tool_name": call.get("name"),
                 "tool_input": call.get("arguments", {}),
             })
-        results = await execution.run_speculative(self, filtered_calls)
+
+        results = await execution.run_speculative(
+            self, filtered_calls, on_start=journal_tool_started,
+        )
         if any(self._is_error(raw) and not self._is_timeout(raw) for raw, _ in results):
             fallback_results = []
             for call, (raw, elapsed) in zip(filtered_calls, results):
@@ -1352,11 +1116,11 @@ class PenzerAgent:
                 else:
                     fallback_results.append((raw, elapsed))
             results = fallback_results
-        for c, (raw, elapsed) in zip(filtered_calls, results):
+        for index, (c, (raw, elapsed)) in enumerate(zip(filtered_calls, results)):
             name  = c["name"]
             ok    = not self._is_error(raw)
             append_event("tool_finished" if ok else "tool_blocked", self._run_id, {
-                "idempotency_key": c.get("id", f"{i}:{name}"),
+                "idempotency_key": c.get("id") or f"{i}:{index}:{name}",
                 "tool_name": name,
                 "success": ok,
                 "error_type": self._categorize_error(raw) if not ok else None,
@@ -1586,30 +1350,10 @@ class PenzerAgent:
         return None
 
     def _msgs(self, step: int) -> list[dict]:
-        if step == 0 or not self._trace:
-            return self._bounded_history()
-        t = self._trace[-1]
-        recent = " -> ".join(f"{s['tool']}({'ok' if s['success'] else 'x'})" for s in self._trace[-5:])
-        skills_line = f"ACTIVE SKILLS: {', '.join(self._matched_skills)}\n" if self._matched_skills else ""
-        plan_line = self._skill_plan_summary()
-        wm_line   = self._working_mem_summary()
-        status    = "ok" if t["success"] else f"error: {t['error_type']}"
-        inj = (
-            f"[ReflAct {step}] GOAL: {self._goal}\n{skills_line}"
-            f"{plan_line + chr(10) if plan_line else ''}{self._belief_summary()}\n"
-            f"{wm_line + chr(10) if wm_line else ''}"
-            f"LAST: {t['tool']} -> {status} ({t['elapsed_sec']}s) | {t['result'][:100]}\n"
-            f"RECENT: {recent}\n\nGiven belief state, working memory, and skill plan — execute next pending step."
-        )
-        return self._bounded_history() + [{"role": "user", "content": inj}]
+        return context.build_messages(self, step)
 
     def _bounded_history(self) -> list[dict]:
-        """FIX #5: Keep first + checkpoint + recent, better history retention"""
-        if len(self.history) <= _MAX_LLM_HISTORY_MESSAGES:
-            return self.history
-        first_user = next((message for message in self.history if message.get("role") == "user"), None)
-        recent = self.history[-_MAX_LLM_HISTORY_MESSAGES:]
-        return ([first_user] if first_user and first_user not in recent else []) + recent
+        return context.bounded_history(self)
 
     # ------------------------------------------------------------------
     # Tool dispatch delegates -> execution.py (kept out of this file

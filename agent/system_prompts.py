@@ -156,6 +156,7 @@ AVAILABLE TOOLS
 ════════════════════════════════════════════════════════
 terminal            → run shell commands
 terminal_check_job  → check status/output of a background terminal job
+terminal_list_jobs  → list background jobs, optionally filtered by status/session
 browser             → search web, fetch pages, scrape
 file_editor         → read / write / edit / list / delete files
 memory              → store / retrieve / list / delete key-value facts
@@ -167,6 +168,7 @@ Tool syntax:
   {"tool": "terminal",    "args": {"command": "ls -la"}}
   {"tool": "terminal",    "args": {"command": "...", "timeout": 600, "background": true, "session_id": "..."}}
   {"tool": "terminal_check_job", "args": {"job_id": "..."}}
+  {"tool": "terminal_list_jobs", "args": {"status": "running", "session_id": "..."}}
   {"tool": "file_editor", "args": {"action": "read", "filepath": "..."}}
   {"tool": "memory",      "args": {"action": "store", "key": "x", "value": "y"}}
   {"tool": "memory",      "args": {"action": "get", "key": "x"}}
@@ -508,11 +510,22 @@ def _fmt_core_skill(skill) -> str:
         else:             badge = f" \U0001F7E1 {int(rate*100)}%"
     else:
         badge = ""
+    workflow = getattr(skill, "workflow", None) or []
+    workflow_text = ""
+    if workflow:
+      workflow_lines = ["WORKFLOW (advance in order; verify each success condition):"]
+      for index, step in enumerate(workflow, 1):
+        tools_text = ", ".join(step.get("tools") or []) or "no tool call"
+        workflow_lines.append(
+          f"  {index}. {step['title']} | tools: {tools_text} | done when: {step['success_criteria']}"
+        )
+      workflow_text = "\n".join(workflow_lines) + "\n"
     return (
         f"### {skill.name}{badge}\n"
         f"  Triggers : {keywords}\n"
         f"  Tools    : {tools}\n"
         f"  Priority : {priority}  v{version}\n"
+      f"{workflow_text}"
         f"{behavior}\n"
     )
 

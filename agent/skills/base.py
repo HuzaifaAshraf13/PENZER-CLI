@@ -15,3 +15,4 @@ class Skill:
     core:           bool  = False
     version:        str   = "1.0"
     generated_at:   Optional[str] = None
+    workflow:       List[dict] = field(default_factory=list)

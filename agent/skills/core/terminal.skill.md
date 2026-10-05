@@ -13,7 +13,17 @@ keywords: [terminal, bash, shell, command, execute, run, script, python, timeout
            macos, windows, dry-run, cleanup, temp, tmp, network route, network routes,
            network interfaces, dns lookup, internet connection, ip address, traceroute,
            network diagnostics]
-tools: [terminal, terminal_check_job, terminal_kill, run_bash, run_python]
+tools: [terminal, terminal_check_job, terminal_list_jobs, terminal_kill, run_bash, run_python]
+workflow:
+  - title: Establish the execution context and assess command risk
+    tools: [terminal]
+    success_criteria: The working directory and platform are known when relevant, and the command's side effects and approval needs are understood.
+  - title: Choose execution mode and run the smallest targeted command
+    tools: [terminal, run_bash, run_python]
+    success_criteria: The command completes or returns a background job ID, with its status and output available.
+  - title: Verify the result and report evidence
+    tools: [terminal, terminal_check_job, terminal_list_jobs]
+    success_criteria: The exit status or job status and relevant output support the reported outcome; changes are verified when the command mutates state.
 agent_behavior: |
   STEP 0 — SELF-ASSESS RISK (before picking anything)
     Before calling terminal, silently rate what you're about to run:
@@ -67,6 +77,7 @@ agent_behavior: |
     Inline Python code      → terminal(code=...)
     Reuse a working context → terminal(..., session_id="name")
     Check a backgrounded job → terminal_check_job(job_id=...)
+    Find background jobs     → terminal_list_jobs(status="running", session_id="...")
     Stop a stuck job        → terminal_kill(job_id=...)
     Tool call shapes:
       {"tool": "terminal", "args": {"command": "ls -la"}}
@@ -74,6 +85,7 @@ agent_behavior: |
       {"tool": "terminal", "args": {"command": "...", "background": true, "workflow": "testing"}}
       {"tool": "terminal", "args": {"command": "...", "session_id": "build"}}
       {"tool": "terminal_check_job", "args": {"job_id": "..."}}
+      {"tool": "terminal_list_jobs", "args": {"status": "running", "session_id": "..."}}
       {"tool": "terminal_kill", "args": {"job_id": "..."}}
   STEP 1b — DURATION CHECK (long-running commands)
     terminal defaults to a 60s timeout. Anything that legitimately runs

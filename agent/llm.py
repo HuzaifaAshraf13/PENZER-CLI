@@ -38,6 +38,16 @@ def _detect_provider(url: str) -> str:
     return "openai_compatible"
 
 
+def _provider_preferences(provider: str) -> dict[str, str]:
+    """Return optional OpenRouter routing preferences without changing defaults."""
+    if provider != "openrouter":
+        return {}
+    sort = os.getenv("OPENROUTER_PROVIDER_SORT", "").strip().lower()
+    if sort not in {"price", "throughput", "latency"}:
+        sort = "latency" if os.getenv("PENZER_PROFILE", "balanced").lower() == "fast" else ""
+    return {"sort": sort} if sort else {}
+
+
 class LLMModel:
     """Universal async LLM model – handles any provider."""
 
@@ -85,6 +95,9 @@ class LLMModel:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        provider_preferences = _provider_preferences(self.provider)
+        if provider_preferences:
+            payload["provider"] = provider_preferences
         # For OpenRouter, we may want to include extra headers, but it works with the standard format.
         r = await self.client.post(
             f"{base}/chat/completions",

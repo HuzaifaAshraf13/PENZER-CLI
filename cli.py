@@ -26,12 +26,13 @@ warnings.filterwarnings("ignore", category=Warning, module="requests")
 from typing import Any, Callable
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.cells import cell_len
 from logger import get_logger, console as console
 from version import get_version, check_for_update, perform_update
 from tools.executor import format_execution_state, kill_all_running, set_live_hooks
 from config import PROFILE_OPTIONS, get_profile_settings, validate_config
 from agent.activity_timeline import ActivityTimeline, set_activity_timeline, get_activity_timeline
-from ui.terminal import InteractiveTerminal, normalize_command
+from ui.terminal import InteractiveTerminal, is_supported_command, normalize_command
 
 warnings.filterwarnings("ignore", message=".*authlib.*deprecated.*", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*doesn't match a supported version.*", category=Warning)
@@ -96,8 +97,19 @@ class LiveStatusView:
         self.events: list[str] = []
         self._lock = threading.Lock()
         self.current_skill = ""
+        self.task_goal = ""
+        self.plan: list[dict[str, Any]] = []
         self.timeline = ActivityTimeline()
         set_activity_timeline(self.timeline)
+
+    def begin_task(self, goal: str) -> None:
+        with self._lock:
+            self.task_goal = " ".join(str(goal or "").split())
+            self.plan = []
+
+    def update_plan(self, plan: list[dict]) -> None:
+        with self._lock:
+            self.plan = [dict(step) for step in plan]
 
     def _clean(self, text: str) -> str:
         text = str(text or "").strip()
@@ -137,8 +149,44 @@ class LiveStatusView:
         with self._lock:
             current = self.current
             if self.current_skill:
-                return f"{self.current_skill} · {current}"
-            return f"● {current}"
+                current = f"{self.current_skill} · {current}"
+            task_goal = self.task_goal
+            plan = [dict(step) for step in self.plan]
+
+        parts = []
+        if task_goal:
+            parts.append(f"Task: {self._short_label(task_goal, 52)}")
+        if plan:
+            completed = sum(step.get("status") in {"done", "success"} for step in plan)
+            active = next(
+                (step for step in plan if step.get("status") in {"running", "blocked", "failed"}),
+                None,
+            )
+            plan_text = f"Plan {completed}/{len(plan)}"
+            if active and active.get("title"):
+                plan_text += f" · {self._short_label(active['title'], 32)}"
+            parts.append(plan_text)
+        parts.append(f"Now: {self._short_label(current, 52)}")
+
+        try:
+            max_width = max(1, os.get_terminal_size().columns - 1)
+        except OSError:
+            max_width = 79
+        separator_width = cell_len(" · ") * (len(parts) - 1)
+        available = max_width - separator_width
+        if available <= 0:
+            return self._short_label(" · ".join(parts), max_width)
+        weights = [0.4, 0.32, 0.28] if len(parts) == 3 else [0.55, 0.45]
+        weights = weights[-len(parts):]
+        weight_total = sum(weights)
+        widths = [int(available * weight / weight_total) for weight in weights]
+        widths[-1] = available - sum(widths[:-1])
+        fitted = [
+            part if cell_len(part) <= width else self._short_label(part, width)
+            for part, width in zip(parts, widths)
+        ]
+        line = " · ".join(fitted)
+        return line if cell_len(line) <= max_width else self._short_label(line, max_width)
 
     def status_line(self) -> str:
         return self.render()
@@ -166,9 +214,21 @@ class LiveStatusView:
 
     def _short_label(self, text: str, max_chars: int = 40) -> str:
         clean = " ".join(str(text or "").split())
-        if len(clean) <= max_chars:
+        if cell_len(clean) <= max_chars:
             return clean
-        return clean[: max_chars - 1].rstrip() + "…"
+        if max_chars <= 0:
+            return ""
+        if max_chars == 1:
+            return "…"
+        result = ""
+        width = 0
+        for character in clean:
+            character_width = cell_len(character)
+            if width + character_width > max_chars - 1:
+                break
+            result += character
+            width += character_width
+        return result.rstrip() + "…"
 
     def _activity_label(self, event: dict[str, Any]) -> str:
         event_type = event.get("event_type", "activity")
@@ -315,6 +375,7 @@ def build_help_text() -> str:
         "• [dark_red]memory[/dark_red]    Show saved facts and memory state",
         "• [dark_red]checkpoints[/dark_red] Show saved checkpoints",
         "• [dark_red]activity[/dark_red]  Show the execution activity drawer",
+        "• [dark_red]jobs[/dark_red]      List background jobs; optionally filter by status",
         "• [dark_red]resume[/dark_red]    Resume last interrupted task",
         "• [dark_red]profile[/dark_red]   Show or switch the current CLI profile",
         "• [dark_red]benchmark[/dark_red]  Show a lightweight quality summary",
@@ -679,12 +740,19 @@ def _sigint_handler(signum, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
-def _render_activity_event(terminal_ui: InteractiveTerminal, event: dict[str, Any]) -> None:
+def _render_activity_event(
+    terminal_ui: InteractiveTerminal,
+    event: dict[str, Any],
+    status_view: LiveStatusView | None = None,
+) -> None:
     """Render low-frequency lifecycle events while a task is executing."""
     rendered = terminal_ui.format_event(event)
     if not rendered:
         return
     terminal_ui.set_status(terminal_ui.event_status(event))
+    if status_view is not None:
+        status_view.update(rendered)
+        rendered = status_view.status_line()
     try:
         sys.stdout.write("\r\033[2K\r")
         sys.stdout.write(rendered)
@@ -768,6 +836,9 @@ async def main(task: str | None = None, json_mode: bool = False):
                 console.print("\n[dim]Session cleared. Memory retained.[/dim]")
                 break
             if not user_input:
+                continue
+            if user_input.startswith("/") and not is_supported_command(user_input):
+                console.print("[yellow]Unknown command. Run /help to see available commands.[/yellow]")
                 continue
             user_input = normalize_command(user_input)
             if user_input.lower() in ("exit", "quit"):
@@ -862,6 +933,18 @@ async def main(task: str | None = None, json_mode: bool = False):
                         console.print(f"[dark_red]{idx}.[/dark_red] {cp.get('goal','')} — {cp.get('belief','')} @ {cp.get('timestamp','')}")
                 else:
                     console.print("[dim]No checkpoints saved yet.[/dim]")
+                continue
+            if user_input.lower().startswith("jobs"):
+                parts = user_input.split()
+                allowed_statuses = {"running", "success", "failed", "killed", "finished"}
+                if len(parts) > 2 or (len(parts) == 2 and parts[1].lower() not in allowed_statuses):
+                    console.print("[yellow]Usage: /jobs [running|success|failed|killed|finished][/yellow]")
+                    continue
+                from tools.terminal.tool import terminal_list_jobs_direct
+                status = parts[1].lower() if len(parts) == 2 else None
+                result = terminal_list_jobs_direct(status=status)
+                jobs = result.get("data", {}).get("jobs", [])
+                console.print(InteractiveTerminal.format_jobs(jobs))
                 continue
             if user_input.lower() == "resume":
                 from session.memory import load_last_run
@@ -963,11 +1046,12 @@ async def main(task: str | None = None, json_mode: bool = False):
             calls_before  = getattr(agent.llm, "call_count", 0)
             tokens_before = getattr(agent.llm, "token_estimate", 0)
             status_view = LiveStatusView()
+            status_view.begin_task(user_input)
             terminal_ui.begin_turn()
             turn_elapsed = "0s"
             terminal_ui.set_status("RUNNING")
             status_view.timeline.set_stream_handler(
-                lambda event: _render_activity_event(terminal_ui, event)
+                lambda event: _render_activity_event(terminal_ui, event, status_view)
             )
             # FIX 1: console.status() hides the cursor and takes over
             # terminal rendering while active. On long-running tool calls
@@ -989,12 +1073,10 @@ async def main(task: str | None = None, json_mode: bool = False):
                 # that updates in place. No spinner, no noisy timeline, no internal
                 # logger spam.
                 last_rendered = ""
+                previous_plan_callback = agent.on_plan
 
-                def _on_status(msg: str) -> None:
+                def _render_status_line() -> None:
                     nonlocal last_rendered
-                    if not msg:
-                        return
-                    status_view.update(msg)
                     rendered = status_view.status_line()
                     if rendered == last_rendered:
                         return
@@ -1007,7 +1089,18 @@ async def main(task: str | None = None, json_mode: bool = False):
                     except Exception:
                         pass
 
+                def _on_status(msg: str) -> None:
+                    if not msg:
+                        return
+                    status_view.update(msg)
+                    _render_status_line()
+
+                def _on_plan(plan: list[dict]) -> None:
+                    status_view.update_plan(plan)
+                    _render_status_line()
+
                 agent.on_status = _on_status
+                agent.on_plan = _on_plan
                 noisy_streams: set[str] = set()
 
                 def _on_output(label: str, line: str) -> None:
@@ -1057,6 +1150,8 @@ async def main(task: str | None = None, json_mode: bool = False):
                 continue
             finally:
                 _current_task = None
+                if "previous_plan_callback" in locals():
+                    agent.on_plan = previous_plan_callback
                 set_live_hooks(None, None, None)
                 turn_elapsed = terminal_ui.turn_elapsed()
                 terminal_ui.end_turn()

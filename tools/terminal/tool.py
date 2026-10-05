@@ -5,99 +5,12 @@ Handles bash commands, Python code, multi-line scripts, and background processes
 
 import os
 import asyncio
-import subprocess
-import time
-import uuid
 import shlex
-import sys
-from pathlib import Path
 
 from tools.executor import approve_background_command, execute, get_change_log
-from tools.sandbox import build_sandbox_command
 from tools.standards import success, error, warning
 from config import get_profile_settings
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_JOB_ROOT = PROJECT_ROOT / "logs" / "jobs"
-_JOB_ROOT.mkdir(parents=True, exist_ok=True)
-
-_cwd = os.getcwd()
-_SESSION_CWDS: dict[str, str] = {}
-_JOB_REGISTRY: dict[str, dict] = {}
-
-
-def _resolve_workdir(session_id: str | None, workdir: str | None) -> str:
-    if workdir:
-        target = os.path.abspath(os.path.expanduser(workdir))
-        if session_id:
-            _SESSION_CWDS[session_id] = target
-        return target
-
-    if session_id and session_id in _SESSION_CWDS:
-        return _SESSION_CWDS[session_id]
-
-    return _cwd
-
-
-def _set_session_workdir(session_id: str | None, target: str) -> None:
-    if session_id:
-        _SESSION_CWDS[session_id] = target
-    else:
-        global _cwd
-        _cwd = target
-
-
-def _read_job_tail(log_path: Path, max_chars: int = 4000) -> str:
-    try:
-        if not log_path.exists():
-            return ""
-        content = log_path.read_text(encoding="utf-8", errors="replace")
-        return content[-max_chars:] if len(content) > max_chars else content
-    except Exception:
-        return ""
-
-
-def _start_background_job(payload: str, effective_workdir: str, mode: str, workflow: str, session_id: str | None) -> dict:
-    job_id = uuid.uuid4().hex[:12]
-    log_path = _JOB_ROOT / f"{job_id}.log"
-    try:
-        with log_path.open("w", encoding="utf-8") as fh:
-            command = ["bash", "-c", payload]
-            if mode == "python":
-                command = [sys.executable, "-c", payload]
-            proc = subprocess.Popen(
-                build_sandbox_command(command, effective_workdir),
-                cwd=effective_workdir,
-                stdout=fh,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
-            )
-        record = {
-            "job_id": job_id,
-            "workflow": workflow,
-            "session_id": session_id,
-            "cwd": effective_workdir,
-            "mode": mode,
-            "command": payload[:400],
-            "pid": proc.pid,
-            "status": "running",
-            "started_at": time.time(),
-            "log_path": str(log_path),
-            "proc": proc,
-        }
-        _JOB_REGISTRY[job_id] = record
-        return success(data={
-            "job_id": job_id,
-            "pid": proc.pid,
-            "status": "running",
-            "workflow": workflow,
-            "cwd": effective_workdir,
-            "session_id": session_id,
-            "log_path": str(log_path),
-        })
-    except Exception as exc:
-        return error(f"Could not start background job: {exc}")
+from . import jobs, session
 
 
 async def _terminal_impl(
@@ -149,7 +62,7 @@ async def _terminal_impl(
         return error("Empty input provided")
 
     workflow = (workflow or "general").strip() or "general"
-    effective_workdir = _resolve_workdir(session_id, workdir)
+    effective_workdir = session.resolve_workdir(session_id, workdir)
 
     # Handle cd — persist working directory per session
     leading_cd = None
@@ -167,7 +80,7 @@ async def _terminal_impl(
         if not os.path.isdir(target):
             return error(f"No such directory: {target}")
         if "&&" not in payload and ";" not in payload and "||" not in payload and "|" not in payload and "\n" not in payload:
-            _set_session_workdir(session_id, target)
+            session.set_workdir(session_id, target)
             return success(data={"cwd": target, "session_id": session_id})
 
     # Background process
@@ -179,7 +92,7 @@ async def _terminal_impl(
         )
         if not approved:
             return warning(message=reason)
-        result = _start_background_job(payload, effective_workdir, mode, workflow, session_id)
+        result = jobs.start_job(payload, effective_workdir, mode, workflow, session_id)
         if result.get("status") == "success":
             result["data"]["mode"] = "background"
             result["data"]["workflow"] = workflow
@@ -206,7 +119,7 @@ async def _terminal_impl(
         if isinstance(result.get("data"), dict):
             result["data"]["workflow"] = workflow
         if result.get("status") == "success" and leading_cd is not None:
-            _set_session_workdir(session_id, target)
+            session.set_workdir(session_id, target)
             if isinstance(result.get("data"), dict):
                 result["data"]["cwd"] = target
         return result
@@ -268,81 +181,25 @@ async def terminal(
 
 def terminal_check_job_direct(job_id: str) -> dict:
     """Return the status and recent output for a background terminal job."""
-    if not job_id:
-        return error("Provide a job_id")
+    return jobs.check_job(job_id)
 
-    record = _JOB_REGISTRY.get(job_id)
-    if record is None:
-        log_path = _JOB_ROOT / f"{job_id}.log"
-        if log_path.exists():
-            return success(data={
-                "job_id": job_id,
-                "status": "finished",
-                "workflow": "unknown",
-                "log_path": str(log_path),
-                "output_tail": _read_job_tail(log_path),
-            })
-        return error(f"Unknown job_id: {job_id}")
 
-    proc = record.get("proc")
-    if proc is not None:
-        rc = proc.poll()
-        status = "running" if rc is None else ("success" if rc == 0 else "failed")
-        record["status"] = status
-        if rc is not None:
-            record["returncode"] = rc
-    else:
-        status = record.get("status", "finished")
-
-    log_path = Path(record.get("log_path", _JOB_ROOT / f"{job_id}.log"))
-    output_tail = _read_job_tail(log_path)
-    return success(data={
-        "job_id": job_id,
-        "status": status,
-        "workflow": record.get("workflow", "general"),
-        "session_id": record.get("session_id"),
-        "pid": record.get("pid"),
-        "cwd": record.get("cwd"),
-        "command": record.get("command"),
-        "returncode": record.get("returncode"),
-        "output_tail": output_tail,
-    })
+def terminal_list_jobs_direct(status: str = None, session_id: str = None) -> dict:
+    """List background jobs with optional status and session filters."""
+    return jobs.list_jobs(status=status, session_id=session_id)
 
 
 def terminal_kill_direct(job_id: str) -> dict:
     """Terminate a background terminal job by id."""
-    if not job_id:
-        return error("Provide a job_id")
-
-    record = _JOB_REGISTRY.get(job_id)
-    if record is None:
-        return error(f"Unknown job_id: {job_id}")
-
-    proc = record.get("proc")
-    if proc is None:
-        return success(data={"job_id": job_id, "killed": False, "status": "not_running"})
-
-    try:
-        if proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(proc.pid), 15)
-            except Exception:
-                proc.terminate()
-        record["status"] = "killed"
-        record["killed"] = True
-        return success(data={
-            "job_id": job_id,
-            "killed": True,
-            "status": "killed",
-            "pid": proc.pid,
-            "workflow": record.get("workflow", "general"),
-        })
-    except Exception as exc:
-        return error(f"Could not kill job {job_id}: {exc}")
+    return jobs.kill_job(job_id)
 
 
 def terminal_check_job(job_id: str) -> dict:
     return terminal_check_job_direct(job_id)
+
+
+def terminal_list_jobs(status: str = None, session_id: str = None) -> dict:
+    return terminal_list_jobs_direct(status=status, session_id=session_id)
 
 
 def terminal_kill(job_id: str) -> dict:
